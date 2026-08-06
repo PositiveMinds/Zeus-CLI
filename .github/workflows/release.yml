@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag the release should be published as"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -95,5 +100,6 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
           files: dist/*
           generate_release_notes: true
