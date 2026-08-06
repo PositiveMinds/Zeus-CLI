@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["zeus contributors"]
-repository = "https://github.com/example/zeus"
+repository = "https://github.com/PositiveMinds/Zeus-CLI"
 
 [workspace.dependencies]
 zeus-agent = { path = "crates/zeus-agent" }

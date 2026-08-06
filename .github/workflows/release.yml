@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: .exe
+            archive: zip
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ""
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            ext: ""
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            ext: ""
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: cargo build --release --package zeus-cli --target ${{ matrix.target }}
+
+      - name: Build (non-Windows)
+        if: matrix.os != 'windows-latest'
+        run: cargo build --release --package zeus-cli --target ${{ matrix.target }}
+
+      - name: Assemble (Windows, zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/zeus${{ matrix.ext }}"
+          $staging = "zeus-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item $bin -Destination $staging
+          Compress-Archive -Path "$staging/*" -DestinationPath "$staging.zip"
+
+      - name: Assemble (Unix, tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          $bin = "target/${{ matrix.target }}/release/zeus${{ matrix.ext }}"
+          $staging = "zeus-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "$bin" "$staging/"
+          tar -czf "zeus-${{ matrix.target }}.tar.gz" "$staging"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeus-${{ matrix.target }}
+          path: zeus-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
