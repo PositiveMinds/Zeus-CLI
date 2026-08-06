@@ -1,0 +1,23 @@
+[package]
+name = "zeus-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Provider-agnostic LLM interface for zeus"
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+zeus-config = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }

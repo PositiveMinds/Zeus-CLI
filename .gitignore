@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Agent local overrides (personal / machine-specific)
+**/.agent/settings.local.toml
+settings.local.toml
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Logs and local caches (if ever checked in by mistake)
+*.log
+
+# Local smoke-test home
+/tmp-agent-home/
+
+# Machine-local agent state (checkpoints, sessions)
+**/.agent/
+.claude/
+**/zeus-home/
+
+# Standalone UI/design prototypes (not part of the zeus project)
+/supercode ui/
+*.webp

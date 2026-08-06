@@ -1,0 +1,15 @@
+[package]
+name = "zeus-logging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Structured logging for zeus (console + ~/.zeus/logs/)"
+
+[dependencies]
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

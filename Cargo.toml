@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zeus-agent",
+    "crates/zeus-cli",
+    "crates/zeus-config",
+    "crates/zeus-example-plugin",
+    "crates/zeus-fs",
+    "crates/zeus-logging",
+    "crates/zeus-provider",
+]
+default-members = ["crates/zeus-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["zeus contributors"]
+repository = "https://github.com/example/zeus"
+
+[workspace.dependencies]
+zeus-agent = { path = "crates/zeus-agent" }
+zeus-config = { path = "crates/zeus-config" }
+zeus-fs = { path = "crates/zeus-fs" }
+zeus-logging = { path = "crates/zeus-logging" }
+zeus-provider = { path = "crates/zeus-provider" }
+
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tempfile = "3"

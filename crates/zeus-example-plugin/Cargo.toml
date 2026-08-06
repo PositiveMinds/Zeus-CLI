@@ -1,0 +1,16 @@
+[package]
+name = "zeus-example-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Example native plugin proving the zeus plugin FFI ABI works end to end — not shipped, used to test the loader against a real compiled dylib"
+publish = false
+
+[lib]
+# cdylib: a dynamically loadable native library (.dll/.so/.dylib), the only
+# crate-type the plugin loader (libloading) can load at runtime. No rlib —
+# this crate is never linked into another Rust binary directly.
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = { workspace = true }
