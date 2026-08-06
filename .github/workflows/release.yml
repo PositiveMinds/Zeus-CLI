@@ -66,8 +66,8 @@ jobs:
       - name: Assemble (Unix, tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
-          $bin = "target/${{ matrix.target }}/release/zeus${{ matrix.ext }}"
-          $staging = "zeus-${{ matrix.target }}"
+          bin="target/${{ matrix.target }}/release/zeus"
+          staging="zeus-${{ matrix.target }}"
           mkdir -p "$staging"
           cp "$bin" "$staging/"
           tar -czf "zeus-${{ matrix.target }}.tar.gz" "$staging"
