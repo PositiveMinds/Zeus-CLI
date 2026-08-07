@@ -99,11 +99,9 @@ jobs:
 
       - name: Create release (public mirror)
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
-        uses: softprops/action-gh-release@v2
-        with:
-          repository: PositiveMinds/Zeus-CLI-releases
-          tag_name: ${{ inputs.tag }}
-          name: ${{ inputs.tag }}
-          body: "Prebuilt binaries for Zeus ${{ inputs.tag }}. Install from the mirror repo README."
-          files: dist/*
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          gh release create "${{ inputs.tag }}" dist/* \
+            --repo PositiveMinds/Zeus-CLI-releases \
+            --title "${{ inputs.tag }}" \
+            --notes "Prebuilt binaries for Zeus ${{ inputs.tag }}."
