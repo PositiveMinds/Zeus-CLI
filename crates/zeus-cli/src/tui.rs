@@ -139,8 +139,9 @@ enum PickerEntry {
 }
 
 /// One row in the provider picker: a non-selectable group header (paid /
-/// free / local) or a selectable provider. Flat list like `PickerEntry` so a
-/// single index drives keyboard and mouse selection.
+/// free / local), a selectable provider, or a selectable model belonging to
+/// that provider. Flat list so a single index drives keyboard and mouse
+/// selection.
 enum ProviderEntry {
     Header(String),
     Provider {
@@ -151,6 +152,12 @@ enum ProviderEntry {
         /// key, or env key present) — false means "needs a key" and Enter
         /// jumps to `KeyEntry` instead of switching.
         ready: bool,
+    },
+    Model {
+        provider: String,
+        model: ModelInfo,
+        /// Tagged free (heuristic on the model id) vs paid.
+        free: bool,
     },
 }
 
@@ -172,7 +179,8 @@ fn picker_move(entries: &[PickerEntry], selected: usize, dir: isize) -> usize {
     }
 }
 
-/// Same navigation for the provider picker, skipping its group headers.
+/// Same navigation for the provider picker, skipping its group headers but
+/// allowing both provider and model rows to be selected.
 fn provider_picker_move(entries: &[ProviderEntry], selected: usize, dir: isize) -> usize {
     let len = entries.len() as isize;
     if len == 0 {
@@ -181,7 +189,7 @@ fn provider_picker_move(entries: &[ProviderEntry], selected: usize, dir: isize) 
     let mut idx = selected as isize;
     loop {
         idx = (idx + dir).rem_euclid(len);
-        if matches!(entries[idx as usize], ProviderEntry::Provider { .. }) {
+        if !matches!(entries[idx as usize], ProviderEntry::Header(_)) {
             return idx as usize;
         }
     }
@@ -330,11 +338,30 @@ fn apply_provider_picker_choice(
     }
 }
 
+/// Free-vs-paid tag for a fetched model id. Generous free heuristic — matches
+/// the common free/low-cost tiers across providers (opencodezen's
+/// deepseek-v4-flash-free, gemini flash, gpt mini, lite/nano variants, and
+/// openrouter's `:free` suffixes) so as many genuinely free models as possible
+/// surface as green in the picker.
+fn is_free_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    const FREE_SUBSTRINGS: &[&str] = &[
+        "free", "flash", "mini", "lite", "nano", "tiny", "light", "small", "1b", "3b", "8b",
+    ];
+    FREE_SUBSTRINGS.iter().any(|s| id.contains(s))
+}
+
 /// Build grouped provider-picker entries: Local, Free, then Paid. Each group
 /// gets a header row; providers carry their kind, default model, and whether
 /// they're immediately usable (local kind, stored key, or env key set). The
-/// caller's current provider's row is preselected.
-fn provider_picker_entries(config: &Config, current: &str) -> (Vec<ProviderEntry>, usize) {
+/// caller's current provider's row is preselected. Reachable providers have
+/// their real models appended underneath (tagged free/paid); providers that
+/// can't list models (no key, server down) still show as a switchable row.
+async fn provider_picker_entries(
+    config: &Config,
+    current: &str,
+    current_model: &str,
+) -> (Vec<ProviderEntry>, usize) {
     let group_of = |kind: &str| -> &'static str {
         if matches!(kind, "ollama" | "lmstudio" | "llamacpp") {
             "Local"
@@ -346,6 +373,7 @@ fn provider_picker_entries(config: &Config, current: &str) -> (Vec<ProviderEntry
     };
     let mut names: Vec<&String> = config.providers.providers.keys().collect();
     names.sort();
+    let models = list_models_by_provider(config).await;
     let mut entries = Vec::new();
     let mut selected = 0;
     for group in ["Local", "Free", "Paid"] {
@@ -375,6 +403,21 @@ fn provider_picker_entries(config: &Config, current: &str) -> (Vec<ProviderEntry
                 model: cfg.default_model.clone().unwrap_or_default(),
                 ready,
             });
+            // Models for this provider, if reachable, right under its row.
+            if let Some((_, provider_models)) =
+                models.iter().find(|(n, _)| n == (name as &String))
+            {
+                for m in provider_models {
+                    if m.id == current_model && name.as_str() == current {
+                        selected = entries.len();
+                    }
+                    entries.push(ProviderEntry::Model {
+                        provider: name.to_string(),
+                        model: m.clone(),
+                        free: is_free_model(&m.id),
+                    });
+                }
+            }
         }
     }
     (entries, selected)
@@ -384,7 +427,7 @@ fn provider_picker_entries(config: &Config, current: &str) -> (Vec<ProviderEntry
 /// providers (with live key/local status), switch the active one, or set a
 /// cloud key for the session. Mirrors the plain-REPL handler, but pushes
 /// messages into the transcript instead of printing to stdout.
-fn handle_provider_tui(
+async fn handle_provider_tui(
     arg: &str,
     config: &Config,
     agent_slot: &mut Option<Agent>,
@@ -394,7 +437,8 @@ fn handle_provider_tui(
     match parts.as_slice() {
         // `/provider` with no args — open the grouped picker popup.
         [] => {
-            let (entries, selected) = provider_picker_entries(config, &state.provider);
+            let (entries, selected) =
+                provider_picker_entries(config, &state.provider, &state.model).await;
             if entries.is_empty() {
                 state.push_error("no providers configured — see config.toml / providers.toml");
             } else {
@@ -1173,6 +1217,7 @@ fn render_provider_picker(
     f: &mut Frame,
     area: Rect,
     current_provider: &str,
+    current_model: &str,
     entries: &[ProviderEntry],
     selected: usize,
 ) -> Rect {
@@ -1232,6 +1277,27 @@ fn render_provider_picker(
                     Span::styled(key_note, theme::amber()),
                 ]))
             }
+            ProviderEntry::Model { model, free, .. } => {
+                let is_current = model.id == current_model;
+                let tag = if is_current {
+                    "✓ ".to_string()
+                } else {
+                    "   ".to_string()
+                };
+                let tier = if *free {
+                    Span::styled("free", theme::green().add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled("paid", theme::amber().add_modifier(Modifier::BOLD))
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(tag, theme::green().add_modifier(Modifier::BOLD)),
+                    Span::styled(model.name.clone(), theme::text()),
+                    Span::raw("  "),
+                    tier,
+                    Span::styled(format!("  ·  {}", model.id), theme::faint()),
+                ]))
+            }
         })
         .collect();
     let list = List::new(items).highlight_style(
@@ -1276,7 +1342,14 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
 
     let provider_picker_area =
         if let Mode::ProviderPicker { entries, selected } = &state.mode {
-            Some(render_provider_picker(f, area, &state.provider, entries, *selected))
+            Some(render_provider_picker(
+                f,
+                area,
+                &state.provider,
+                &state.model,
+                entries,
+                *selected,
+            ))
         } else {
             None
         };
@@ -1504,17 +1577,16 @@ async fn handle_key(
             }
             KeyCode::Enter => {
                 let Mode::ProviderPicker { entries, selected } = &state.mode else { unreachable!() };
-                let chosen = match entries.get(*selected) {
+                match entries.get(*selected) {
                     Some(ProviderEntry::Provider { name, ready, .. }) => {
-                        Some((name.clone(), *ready))
+                        let (name, ready) = (name.clone(), *ready);
+                        apply_provider_picker_choice(name, ready, config, agent_slot, state);
                     }
-                    _ => None,
-                };
-                match chosen {
-                    Some((name, ready)) => {
-                        apply_provider_picker_choice(name, ready, config, agent_slot, state)
+                    Some(ProviderEntry::Model { provider, model, .. }) => {
+                        let (provider, model_id) = (provider.clone(), model.id.clone());
+                        apply_picker_choice(provider, model_id, state, agent_slot, config);
                     }
-                    None => state.mode = Mode::Chat,
+                    _ => state.mode = Mode::Chat,
                 }
             }
             KeyCode::Esc => {
@@ -1727,7 +1799,7 @@ async fn handle_key(
                         }
                     }
                     "provider" => {
-                        handle_provider_tui(arg, config, agent_slot, state);
+                        handle_provider_tui(arg, config, agent_slot, state).await;
                     }
                     "session" => state.push_info(format!("session={}", state.session_id)),
                     "agents" => {
@@ -1859,8 +1931,26 @@ fn handle_mouse(ev: MouseEvent, state: &mut AppState, agent_slot: &mut Option<Ag
                     {
                         let row = (ev.row - area.y) as usize;
                         let Mode::ProviderPicker { entries, .. } = &state.mode else { unreachable!() };
-                        if let Some(ProviderEntry::Provider { name, ready, .. }) = entries.get(row) {
-                            apply_provider_picker_choice(name.clone(), *ready, config, agent_slot, state);
+                        match entries.get(row) {
+                            Some(ProviderEntry::Provider { name, ready, .. }) => {
+                                apply_provider_picker_choice(
+                                    name.clone(),
+                                    *ready,
+                                    config,
+                                    agent_slot,
+                                    state,
+                                );
+                            }
+                            Some(ProviderEntry::Model { provider, model, .. }) => {
+                                apply_picker_choice(
+                                    provider.clone(),
+                                    model.id.clone(),
+                                    state,
+                                    agent_slot,
+                                    config,
+                                );
+                            }
+                            _ => {}
                         }
                     }
                 }
