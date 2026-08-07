@@ -97,11 +97,16 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create release (public mirror)
+      - name: Create/Update release (public mirror)
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT }}
         run: |
-          gh release create "${{ inputs.tag }}" dist/* \
-            --repo PositiveMinds/Zeus-CLI-releases \
-            --title "${{ inputs.tag }}" \
-            --notes "Prebuilt binaries for Zeus ${{ inputs.tag }}."
+          if gh release view "${{ inputs.tag }}" --repo PositiveMinds/Zeus-CLI-releases >/dev/null 2>&1; then
+            gh release upload "${{ inputs.tag }}" dist/* \
+              --repo PositiveMinds/Zeus-CLI-releases --clobber
+          else
+            gh release create "${{ inputs.tag }}" dist/* \
+              --repo PositiveMinds/Zeus-CLI-releases \
+              --title "${{ inputs.tag }}" \
+              --notes "Prebuilt binaries for Zeus ${{ inputs.tag }}."
+          fi
