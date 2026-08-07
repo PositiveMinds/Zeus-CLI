@@ -104,5 +104,6 @@ jobs:
         with:
           repository: PositiveMinds/Zeus-CLI-releases
           tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          body: "Prebuilt binaries for Zeus ${{ inputs.tag }}. Install from the mirror repo README."
           files: dist/*
-          generate_release_notes: true
