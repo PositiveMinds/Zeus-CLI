@@ -795,7 +795,55 @@ async fn resolve_model(
 }
 
 /// Best-effort model list across every configured provider, grouped by
-/// provider name — backs the `/model` picker's multi-provider view. A
+/// Describe every configured provider for `/provider` (and the TUI's
+/// provider picker): name, kind, default model, and whether it's usable
+/// right now — a cloud provider needs its `api_key_env` key present,
+/// a local kind is assumed ready (the model picker live-probes reachability
+/// separately). Backs the slash command so `/provider` lists *everything*
+/// that's configured, not just the ones currently reachable.
+pub(crate) fn describe_providers(config: &Config) -> Vec<String> {
+    let mut names: Vec<&String> = config.providers.providers.keys().collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let Some(cfg) = config.providers.get(name) else { continue };
+        let model = cfg.default_model.as_deref().unwrap_or("");
+        let local = matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp");
+        let status = if local {
+            "local".to_string()
+        } else if let Some(var) = &cfg.api_key_env {
+            if std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false) {
+                "key set".to_string()
+            } else {
+                format!("no key (${var})")
+            }
+        } else {
+            "ready".to_string()
+        };
+        out.push(format!("  {name:<11} kind={:<10} model={:<18} {status}", cfg.kind, model));
+    }
+    out
+}
+
+/// Persist the default provider (and optionally model) to the active
+/// settings.toml layer — so a `/provider` switch survives restarts. Returns
+/// the path written, for the confirm message.
+pub(crate) fn persist_default_provider(config: &Config, provider: &str, model: Option<&str>) -> Result<PathBuf> {
+    let path = settings_file_path(config, false);
+    let mut doc = load_toml_or_empty(&path)?;
+    set_toml_path(&mut doc, &["model", "provider"], toml::Value::String(provider.to_string()));
+    if let Some(m) = model {
+        set_toml_path(&mut doc, &["model", "model"], toml::Value::String(m.to_string()));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("create settings dir")?;
+    }
+    let text = toml::to_string_pretty(&doc).context("serialize settings")?;
+    std::fs::write(&path, text).context("write settings file")?;
+    Ok(path)
+}
+
+/// provider_name — backs the `/model` picker's multi-provider view. A
 /// provider that's unreachable, misconfigured, or slow to respond (bounded
 /// by a short timeout) is silently skipped rather than blocking the whole
 /// picker on one bad entry, same "best effort" spirit as MCP server connect.
@@ -1262,6 +1310,7 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("autocompact", "toggle auto-compaction: /autocompact on|off"),
     ("context", "show token usage against the model's context window"),
     ("model", "switch model (opens a picker), or /model <name> directly"),
+    ("provider", "list providers, switch (<name>), or set a session key: /provider key <name> <KEY>"),
     ("mode", "set agent mode: /mode build|plan|auto (Tab also cycles)"),
     ("session", "show the current session id"),
     ("agents", "list the specialist-agents roster grouped by department (/agents count)"),
@@ -1282,6 +1331,71 @@ fn print_repl_help_lines() -> String {
 
 fn print_repl_help() {
     println!("{}", print_repl_help_lines());
+}
+
+/// The `/provider` slash command (plain REPL): list all configured providers,
+/// switch the active one (persisting the choice), or set a cloud API key for
+/// this session. Mirrors Claude Code's `/login`-style flow — the key is kept
+/// in-process (an env var) and never written to disk.
+async fn handle_provider_slash(arg: &str, config: &Config, agent: &mut Agent) {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        // `/provider` — show current + full configured roster.
+        [] => {
+            println!("current provider: {} / model: {}", agent.provider_id(), agent.model());
+            println!("Configured providers:");
+            for line in describe_providers(config) {
+                println!("{line}");
+            }
+            println!("Use /provider <name> to switch, /provider key <name> <KEY> to set a key.");
+        }
+        // `/provider key <name> <KEY>` — set the env var for this session.
+        ["key", name, key] => {
+            let cfg = match config.providers.get(name) {
+                Some(c) => c,
+                None => {
+                    eprintln!("unknown provider '{name}' — see /provider for the list");
+                    return;
+                }
+            };
+            let var = match &cfg.api_key_env {
+                Some(v) => v.clone(),
+                None => {
+                    eprintln!("provider '{name}' ({}) doesn't use an API key env var", cfg.kind);
+                    return;
+                }
+            };
+            std::env::set_var(&var, *key);
+            println!(
+                "key set for '{name}' (this session only). Persist it by setting {var} in your shell."
+            );
+        }
+        // `/provider key` with no args — usage hint, not a provider switch.
+        ["key"] => eprintln!("usage: /provider key <name> <KEY>"),
+        // `/provider <name>` — switch the active provider + persist default.
+        [name] => {
+            match create_provider(name, &config.providers) {
+                Ok(handle) => {
+                    agent.set_provider(handle);
+                    let model = config
+                        .providers
+                        .get(name)
+                        .and_then(|c| c.default_model.clone())
+                        .unwrap_or_else(|| agent.model().to_string());
+                    agent.set_model(model.clone());
+                    match persist_default_provider(config, name, Some(&model)) {
+                        Ok(path) => println!(
+                            "switched to provider: {name} (model: {model}) — saved to {}",
+                            path.display()
+                        ),
+                        Err(e) => eprintln!("switched to provider {name}, but saving default failed: {e:#}"),
+                    }
+                }
+                Err(e) => eprintln!("couldn't switch to '{name}': {e:#}"),
+            }
+        }
+        _ => eprintln!("usage: /provider | /provider <name> | /provider key <name> <KEY>"),
+    }
 }
 
 /// Every slash name the REPL currently recognizes, with a one-line
@@ -1410,6 +1524,7 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                         println!("switched to model: {arg}");
                     }
                 }
+                "provider" => handle_provider_slash(arg, config, &mut agent).await,
                 "session" => println!("session={}", agent.session_id()),
                 "agents" => {
                     if arg.to_ascii_lowercase() == "count" {
@@ -1985,7 +2100,7 @@ fn cmd_doctor(config: &Config) -> Result<()> {
     println!("  [x] Logging (console + ~/.zeus/logs)");
     println!("  [x] Provider abstraction (chat/stream/list/embeddings/count_tokens)");
     println!("  [x] Providers: ollama, lmstudio, llamacpp");
-    println!("  [x] Cloud providers: openai, grok, openrouter, opencodezen, gemini (OpenAI-compatible), anthropic");
+    println!("  [x] Cloud providers: openai, grok, openrouter, opencodezen, deepseek, gemini (OpenAI-compatible), anthropic");
     println!("  [x] Local-provider auto-detection + reachability fallback");
     println!();
     println!("Phase 2 — Safety Core:");

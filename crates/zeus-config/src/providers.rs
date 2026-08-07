@@ -122,7 +122,15 @@ prompt_cache = false
 kind = "opencodezen"
 base_url = "https://opencode.ai/zen/v1"
 api_key_env = "OPENCODE_API_KEY"
-default_model = "glm-4.6-free"
+default_model = "deepseek-v4-flash-free"
+embeddings = false
+prompt_cache = true
+
+[providers.deepseek]
+kind = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+default_model = "deepseek-chat"
 embeddings = false
 prompt_cache = true
 
@@ -176,14 +184,98 @@ prompt_cache = true
                 kind: "opencodezen".into(),
                 base_url: Some("https://opencode.ai/zen/v1".into()),
                 api_key_env: Some("OPENCODE_API_KEY".into()),
-                default_model: Some("glm-4.6-free".into()),
+                default_model: Some("deepseek-v4-flash-free".into()),
                 headers: HashMap::new(),
                 embeddings: false,
                 prompt_cache: true,
             },
         );
+        providers.insert(
+            "deepseek".into(),
+            ProviderConfig {
+                kind: "deepseek".into(),
+                base_url: Some("https://api.deepseek.com/v1".into()),
+                api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                default_model: Some("deepseek-chat".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: true,
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            ProviderConfig {
+                kind: "anthropic".into(),
+                base_url: Some("https://api.anthropic.com".into()),
+                api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                default_model: Some("claude-sonnet-4-20250514".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: true,
+            },
+        );
+        providers.insert(
+            "gemini".into(),
+            ProviderConfig {
+                kind: "gemini".into(),
+                base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai".into()),
+                api_key_env: Some("GEMINI_API_KEY".into()),
+                default_model: Some("gemini-2.0-flash".into()),
+                headers: HashMap::new(),
+                embeddings: true,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "grok".into(),
+            ProviderConfig {
+                kind: "grok".into(),
+                base_url: Some("https://api.x.ai/v1".into()),
+                api_key_env: Some("XAI_API_KEY".into()),
+                default_model: Some("grok-3".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "openrouter".into(),
+            ProviderConfig {
+                kind: "openrouter".into(),
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                api_key_env: Some("OPENROUTER_API_KEY".into()),
+                default_model: Some("openrouter/auto".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "lmstudio".into(),
+            ProviderConfig {
+                kind: "lmstudio".into(),
+                base_url: Some("http://127.0.0.1:1234/v1".into()),
+                api_key_env: None,
+                default_model: Some("local-model".into()),
+                headers: HashMap::new(),
+                embeddings: true,
+                prompt_cache: true,
+            },
+        );
+        providers.insert(
+            "llamacpp".into(),
+            ProviderConfig {
+                kind: "llamacpp".into(),
+                base_url: Some("http://127.0.0.1:8080/v1".into()),
+                api_key_env: None,
+                default_model: Some("local-model".into()),
+                headers: HashMap::new(),
+                embeddings: true,
+                prompt_cache: true,
+            },
+        );
         Self { providers }
-    }
+}
 }
 
 #[cfg(test)]

@@ -93,6 +93,7 @@ pub fn create_from_config(name: &str, cfg: &ProviderConfig) -> Result<ProviderHa
         // gateways; openai/grok are first-party; gemini exposes an
         // OpenAI-compatible route under `/v1beta/openai`.
         "openai" => cloud_openai_compat(name, cfg, "https://api.openai.com/v1"),
+        "deepseek" => cloud_openai_compat(name, cfg, "https://api.deepseek.com/v1"),
         "grok" => cloud_openai_compat(name, cfg, "https://api.x.ai/v1"),
         "openrouter" => cloud_openai_compat(name, cfg, "https://openrouter.ai/api/v1"),
         "opencodezen" => cloud_openai_compat(name, cfg, "https://opencode.ai/zen/v1"),

@@ -18,8 +18,8 @@
 //! justified because waiting on a human is inherently slow anyway.
 
 use crate::{
-    build_agent, expand_slash_command, known_slash_commands, list_models_by_provider,
-    print_repl_help_lines,
+    build_agent, describe_providers, expand_slash_command, known_slash_commands,
+    list_models_by_provider, persist_default_provider, print_repl_help_lines,
 };
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -187,6 +187,81 @@ fn apply_picker_choice(
     }
     agent.set_model(model_id.clone());
     state.model = model_id;
+}
+
+/// The `/provider` slash command inside the TUI: list all configured
+/// providers (with live key/local status), switch the active one, or set a
+/// cloud key for the session. Mirrors the plain-REPL handler, but pushes
+/// messages into the transcript instead of printing to stdout.
+fn handle_provider_tui(
+    arg: &str,
+    config: &Config,
+    agent_slot: &mut Option<Agent>,
+    state: &mut AppState,
+) {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    match parts.as_slice() {
+        [] => {
+            state.push_info(format!(
+                "current: {} / {}",
+                state.provider, state.model
+            ));
+            state.push_info("configured providers:");
+            for line in describe_providers(config) {
+                state.push_info(line);
+            }
+            state.push_info("/provider <name> to switch · /provider key <name> <KEY> to set a key");
+        }
+        ["key", name, key] => {
+            let cfg = match config.providers.get(name) {
+                Some(c) => c,
+                None => {
+                    state.push_error(format!("unknown provider '{name}' — see /provider"));
+                    return;
+                }
+            };
+            let var = match &cfg.api_key_env {
+                Some(v) => v.clone(),
+                None => {
+                    state.push_error(format!("provider '{name}' ({}) has no API key env var", cfg.kind));
+                    return;
+                }
+            };
+            std::env::set_var(&var, *key);
+            state.push_info(format!(
+                "key set for '{name}' (this session). Persist by setting {var} in your shell."
+            ));
+        }
+        ["key"] => state.push_error("usage: /provider key <name> <KEY>"),
+        [name] => match create_provider(name, &config.providers) {
+            Ok(handle) => {
+                if let Some(agent) = agent_slot.as_mut() {
+                    agent.set_provider(handle);
+                }
+                let model = config
+                    .providers
+                    .get(name)
+                    .and_then(|c| c.default_model.clone())
+                    .unwrap_or_else(|| state.model.clone());
+                if let Some(agent) = agent_slot.as_mut() {
+                    agent.set_model(model.clone());
+                }
+                state.provider = name.to_string();
+                state.model = model.clone();
+                match persist_default_provider(config, name, Some(&model)) {
+                    Ok(path) => state.push_info(format!(
+                        "switched to provider: {name} (model: {model}) — saved to {}",
+                        path.display()
+                    )),
+                    Err(e) => state.push_info(format!(
+                        "switched to provider {name}, but saving default failed: {e:#}"
+                    )),
+                }
+            }
+            Err(e) => state.push_error(format!("couldn't switch to '{name}': {e:#}")),
+        },
+        _ => state.push_error("usage: /provider | /provider <name> | /provider key <name> <KEY>"),
+    }
 }
 
 /// Plan mode is read-only (research/propose, no mutating tool calls —
@@ -869,7 +944,7 @@ fn render_model_picker(
     inner
 }
 
-fn render(f: &mut Frame, state: &mut AppState) {
+fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     let area = f.area();
 
     // Frame the whole app with a SuperCode-style header bar on top and a
@@ -881,7 +956,7 @@ fn render(f: &mut Frame, state: &mut AppState) {
         Constraint::Length(1),
     ])
     .split(area);
-    render_header_bar(f, rows[0], state);
+    render_header_bar(f, rows[0], state, config);
 
     let matches = state.command_matches();
     if state.transcript.is_empty() && state.current_reply.is_empty() {
@@ -903,7 +978,7 @@ fn render(f: &mut Frame, state: &mut AppState) {
 /// SuperCode-style breadcrumb header: `supercode · chat · <model>` on the
 /// left with a green left-rule, status (`ready`/`busy · type to chat`) on
 /// the right, separated by a horizontal rule.
-fn render_header_bar(f: &mut Frame, area: Rect, state: &AppState) {
+fn render_header_bar(f: &mut Frame, area: Rect, state: &AppState, config: &Config) {
     let status_right = if state.busy {
         "busy · esc to interrupt"
     } else {
@@ -916,6 +991,9 @@ fn render_header_bar(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(" · ", theme::faint()),
         Span::styled("chat", theme::text()),
         Span::styled(" · ", theme::faint()),
+        Span::styled(provider_dot(config, &state.provider), provider_status_style(config, &state.provider)),
+        Span::styled(state.provider.clone(), theme::text().add_modifier(Modifier::BOLD)),
+        Span::styled(" / ", theme::faint()),
         Span::styled(state.model.clone(), theme::text()),
         Span::styled(" · ", theme::faint()),
         Span::styled(format!("session={}", state.session_id), theme::muted()),
@@ -945,6 +1023,38 @@ fn render_header_bar(f: &mut Frame, area: Rect, state: &AppState) {
         width: area.width,
         height: 1,
     });
+}
+
+/// A leading status glyph for a provider in the header: green dot when it
+/// actually has a key (cloud) or is a local kind, amber dot when a cloud
+/// provider is missing its key.
+fn provider_dot(config: &Config, provider: &str) -> &'static str {
+    if provider_status_ok(config, provider) {
+        "●"
+    } else {
+        "●"
+    }
+}
+
+fn provider_status_ok(config: &Config, provider: &str) -> bool {
+    let Some(cfg) = config.providers.get(provider) else {
+        return false;
+    };
+    if matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp") {
+        true
+    } else if let Some(var) = &cfg.api_key_env {
+        std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false)
+    } else {
+        true
+    }
+}
+
+fn provider_status_style(config: &Config, provider: &str) -> Style {
+    if provider_status_ok(config, provider) {
+        theme::green()
+    } else {
+        theme::amber()
+    }
 }
 
 /// SuperCode-style bottom status bar: mode chip + git branch + connected,
@@ -1225,6 +1335,9 @@ async fn handle_key(
                             state.push_info(format!("switched to model: {arg}"));
                         }
                     }
+                    "provider" => {
+                        handle_provider_tui(arg, config, agent_slot, state);
+                    }
                     "session" => state.push_info(format!("session={}", state.session_id)),
                     "agents" => {
                         if arg.to_ascii_lowercase() == "count" {
@@ -1371,7 +1484,7 @@ async fn run_app<B: Backend>(
         }
     });
 
-    terminal.draw(|f| render(f, &mut state))?;
+        terminal.draw(|f| render(f, &mut state, config))?;
     sync_cursor_visibility(terminal, &state);
 
     loop {
@@ -1416,7 +1529,7 @@ async fn run_app<B: Backend>(
         if state.quit {
             break;
         }
-        terminal.draw(|f| render(f, &mut state))?;
+terminal.draw(|f| render(f, &mut state, config))?;
         sync_cursor_visibility(terminal, &state);
     }
     Ok(())
