@@ -1,7 +1,7 @@
 @echo off
 rem Zeus installer for Windows cmd
 rem Usage:
-rem   curl -L https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI/main/install.bat | cmd
+rem   curl -L https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI-releases/main/install.bat | cmd
 rem
 rem Downloads the latest zeus release, installs it under %LOCALAPPDATA%\zeus,
 rem and adds it to the user PATH.

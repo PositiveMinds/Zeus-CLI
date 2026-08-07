@@ -1,6 +1,6 @@
 # Zeus installer for Windows (PowerShell)
 # Usage:
-#   irm https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI-releases/main/install.ps1 | iex
 #
 # Downloads the latest zeus release, installs it under %LOCALAPPDATA%\zeus,
 # and adds it to the user PATH.
@@ -18,7 +18,19 @@ $target = "x86_64-pc-windows-msvc"
 function Invoke-ZeusApi([string]$Path) {
     $headers = @{ "Accept" = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
     if ($env:GITHUB_TOKEN) { $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN" }
-    return Invoke-RestMethod -Uri "https://api.github.com$Path" -Headers $headers
+    try {
+        return Invoke-RestMethod -Uri "https://api.github.com$Path" -Headers $headers
+    } catch {
+        $status = $_.Exception.Response.StatusCode.value__
+        $msg = "GitHub request failed ($Path). "
+        if ($status -eq 404) {
+            $msg += "No Zeus release has been published yet, or the release was not found. " +
+                    "Check https://github.com/$RepoOwner/$RepoName/releases for available versions."
+        } else {
+            $msg += "HTTP $status - $($_.Exception.Message)"
+        }
+        throw $msg
+    }
 }
 
 Write-Host "Installing zeus for target: $target" -ForegroundColor Cyan
