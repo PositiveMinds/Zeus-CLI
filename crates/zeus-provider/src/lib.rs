@@ -17,7 +17,6 @@ mod download;
 mod error;
 mod heuristics;
 mod local_models;
-mod mock;
 mod ollama;
 mod openai_compat;
 mod registry;
@@ -28,7 +27,6 @@ pub use detect::{detect_local_provider, is_provider_reachable, is_reachable};
 pub use download::download_hf_file;
 pub use error::{ProviderError, Result};
 pub use local_models::{scan_local_models, LocalModelFile};
-pub use mock::MockProvider;
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use registry::{create_default, create_provider, ProviderHandle};
@@ -44,7 +42,7 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 /// Core model provider abstraction. All backends implement this trait.
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
-    /// Provider id (e.g. "ollama", "openai", "mock").
+    /// Provider id (e.g. "ollama", "openai", "anthropic").
     fn id(&self) -> &str;
 
     /// Non-streaming chat completion.

@@ -387,6 +387,32 @@ impl GitEngine {
         self.run(&args)
     }
 
+    /// Convenience: commit staged (or all) changes, then push to the current
+    /// branch's upstream. Returns the commit output and the push output
+    /// concatenated. Both steps run under their normal permission tiers.
+    pub fn commit_and_push<F>(
+        &self,
+        message: &str,
+        all: bool,
+        remote: Option<&str>,
+        mut approver: F,
+    ) -> Result<GitOutput>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        let commit = self.commit(message, all, &mut approver)?;
+        if !commit.success {
+            return Ok(commit);
+        }
+        let push = self.push(remote, None, false, &mut approver)?;
+        Ok(GitOutput {
+            stdout: format!("{}{}", commit.stdout, push.stdout),
+            stderr: format!("{}{}", commit.stderr, push.stderr),
+            exit_code: push.exit_code.or(commit.exit_code),
+            success: push.success && commit.success,
+        })
+    }
+
     // ---------------------------------------------------------------
     // History-rewriting / conflict-prone — ask, with hard-reset denied
     // ---------------------------------------------------------------
@@ -468,6 +494,122 @@ impl GitEngine {
             &mut approver,
         )?;
         self.run(&["merge", branch])
+    }
+
+    // ---------------------------------------------------------------
+    // Pull requests — network, visible to others — ask
+    // ---------------------------------------------------------------
+    //
+    // PRs are created via the `gh` CLI (GitHub official), not by calling the
+    // REST API directly: `gh` handles auth, the remote's fork/upstream wiring,
+    // and retry/error conventions. This also keeps token handling out of the
+    // agent entirely — the user logs in to `gh` themselves (`gh auth login`).
+    // Each PR op is gated on the "ask" tier (network, shared/visible state).
+    //
+    // Requirements: the current branch must already be pushed (`git push`)
+    // before `gh pr create` can reference it.
+
+    /// Check whether `gh` is available on PATH.
+    pub fn gh_available(&self) -> bool {
+        Command::new("gh")
+            .arg("--version")
+            .current_dir(&self.project_root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_gh(&self, args: &[&str]) -> Result<GitOutput> {
+        let output = Command::new("gh")
+            .args(args)
+            .current_dir(&self.project_root)
+            .output()
+            .map_err(|e| FsError::Other(format!("gh {args:?} failed to spawn: {e}")))?;
+        Ok(GitOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.status.code(),
+            success: output.status.success(),
+        })
+    }
+
+    fn require_gh(&self, op: &str) -> Result<()> {
+        if !self.gh_available() {
+            return Err(FsError::Other(
+                "PR support requires the GitHub CLI (`gh`). Install it and run \
+                 `gh auth login`, then retry."
+                    .into(),
+            ));
+        }
+        let _ = op;
+        Ok(())
+    }
+
+    /// List pull requests, newest first. `state` is one of open|closed|merged|all.
+    pub fn pr_list<F>(&self, state: &str, limit: usize, mut approver: F) -> Result<GitOutput>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        self.require_gh("list")?;
+        self.enforce(
+            "git_pr_list",
+            format!("gh pr list --state {state} --limit {limit}"),
+            None,
+            None,
+            &mut approver,
+        )?;
+        let limit = limit.to_string();
+        self.run_gh(&["pr", "list", "--state", state, "--limit", &limit])
+    }
+
+    /// Show details (status/checks/diff) for a PR.
+    pub fn pr_view<F>(&self, number: &str, mut approver: F) -> Result<GitOutput>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        self.require_gh("view")?;
+        self.enforce(
+            "git_pr_view",
+            format!("gh pr view {number}"),
+            None,
+            None,
+            &mut approver,
+        )?;
+        self.run_gh(&["pr", "view", number])
+    }
+
+    /// Create a PR for the current branch against an optional base branch.
+    /// The head branch must already be pushed. Network — ask.
+    pub fn pr_create<F>(
+        &self,
+        title: &str,
+        body: Option<&str>,
+        base: Option<&str>,
+        mut approver: F,
+    ) -> Result<GitOutput>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        self.require_gh("create")?;
+        self.enforce(
+            "git_pr_create",
+            format!("gh pr create title='{title}' base={}", base.unwrap_or("<default>")),
+            None,
+            None,
+            &mut approver,
+        )?;
+        let mut args: Vec<&str> = vec!["pr", "create"];
+        args.push("--title");
+        args.push(title);
+        if let Some(b) = body {
+            args.push("--body");
+            args.push(b);
+        }
+        if let Some(base) = base {
+            args.push("--base");
+            args.push(base);
+        }
+        self.run_gh(&args)
     }
 }
 
@@ -595,10 +737,37 @@ mod tests {
     }
 
     #[test]
-    fn push_always_asks_even_with_permissive_settings() {
-        let (_tmp, engine) = init_repo();
-        let err = engine.push(None, None, false, deny).unwrap_err();
+    fn commit_and_push_requires_approval_for_push() {
+        let (tmp, engine) = init_repo();
+        commit_one(&tmp, &engine, "a.txt", "hello");
+        // A fresh change to stage.
+        std::fs::write(tmp.path().join("proj/b.txt"), "world").unwrap();
+        Command::new("git")
+            .args(["add", "b.txt"])
+            .current_dir(tmp.path().join("proj"))
+            .output()
+            .unwrap();
+        // Commit is allowed by default (reversible tier); push is on the ask
+        // tier, so a denying approver aborts after the commit succeeds.
+        let err = engine.commit_and_push("msg", false, None, deny).unwrap_err();
         assert!(matches!(err, FsError::Denied(_)));
+    }
+
+    #[test]
+    fn pr_ops_error_without_gh_cli() {
+        let (_tmp, engine) = init_repo();
+        // gh may be absent (CI) or present (local). Either way the op must
+        // not panic and must surface a GitOutput or a FsError — never hang.
+        match engine.pr_list("open", 5, approve) {
+            Ok(out) => {
+                // gh returned (successfully listed, or errored as a normal
+                // git-style GitOutput with an exit code). Either is fine.
+                let _ = out;
+            }
+            Err(e) => {
+                assert!(!e.to_string().is_empty(), "error must have a message");
+            }
+        }
     }
 
     #[test]

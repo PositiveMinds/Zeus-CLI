@@ -2,7 +2,6 @@
 
 use crate::anthropic::AnthropicProvider;
 use crate::error::{ProviderError, Result};
-use crate::mock::MockProvider;
 use crate::ollama::OllamaProvider;
 use crate::openai_compat::OpenAiCompatProvider;
 use crate::ModelProvider;
@@ -57,10 +56,6 @@ fn resolve_headers(cfg: &ProviderConfig) -> HashMap<String, String> {
 }
 
 /// Create a provider by name from the providers file.
-///
-/// Phase 1 implements `mock` fully and stubs remote kinds with a clear error
-/// unless `kind == "mock"`. OpenAI-compatible HTTP clients land in a later slice;
-/// the registry already routes by `kind`.
 pub fn create_provider(name: &str, file: &ProvidersFile) -> Result<ProviderHandle> {
     let cfg = file
         .get(name)
@@ -70,10 +65,6 @@ pub fn create_provider(name: &str, file: &ProvidersFile) -> Result<ProviderHandl
 
 pub fn create_from_config(name: &str, cfg: &ProviderConfig) -> Result<ProviderHandle> {
     match cfg.kind.as_str() {
-        "mock" => {
-            info!(provider = name, "using mock provider");
-            Ok(Arc::new(MockProvider::new(name)))
-        }
         "ollama" => {
             let base_url = cfg
                 .base_url
@@ -146,12 +137,12 @@ fn cloud_openai_compat(
     Ok(Arc::new(p))
 }
 
-/// Prefer configured default provider; fall back to mock for bootstrapping.
+/// Create a provider from its config.
 pub fn create_default(provider_name: &str, file: &ProvidersFile) -> Result<ProviderHandle> {
     match create_provider(provider_name, file) {
         Ok(p) => Ok(p),
         // A provider that fails to construct (e.g. missing API key) surfaces as
-        // a real error unless we explicitly asked for mock. No silent swap.
+        // a real error. No silent swap.
         Err(e) => Err(e),
     }
 }
@@ -162,11 +153,12 @@ mod tests {
     use zeus_config::ProvidersFile;
 
     #[test]
-    fn creates_mock() {
+    fn mock_kind_is_rejected() {
         let file = ProvidersFile::builtin_defaults();
-        let p = create_provider("mock", &file).unwrap();
-        assert_eq!(p.id(), "mock");
-        assert!(p.supports_prompt_cache());
+        match create_provider("mock", &file) {
+            Ok(_) => panic!("expected mock provider to be unsupported"),
+            Err(err) => assert!(matches!(err, ProviderError::NotFound(_))),
+        }
     }
 
     #[test]
@@ -182,8 +174,8 @@ mod tests {
     fn cloud_kind_without_key_errors_instead_of_falling_back() {
         let file = ProvidersFile::builtin_defaults();
         // "openai" is a real OpenAI-compatible client now; without a key it
-        // must surface a MissingApiKey error — NOT silently swap to mock,
-        // which would hide a misconfigured remote provider.
+        // must surface a MissingApiKey error — not silently fall back to a
+        // fake provider, which would hide a misconfigured remote provider.
         match create_provider("openai", &file) {
             Ok(_) => panic!("expected MissingApiKey for unconfigured openai"),
             Err(err) => assert!(matches!(err, ProviderError::MissingApiKey(_))),

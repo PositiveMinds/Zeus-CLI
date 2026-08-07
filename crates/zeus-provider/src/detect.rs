@@ -1,8 +1,8 @@
 //! Local-provider auto-detection: a quick reachability probe so the CLI can
 //! notice "the configured default (e.g. Ollama) isn't actually running" and
-//! either switch to another local server that *is* running, or fall back to
-//! mock with a clear message — instead of hanging or failing with an opaque
-//! connection error deep inside the first real chat call.
+//! either switch to another local server that *is* running, or fail with a
+//! clear message — instead of hanging or failing with an opaque connection
+//! error deep inside the first real chat call.
 
 use std::time::Duration;
 use zeus_config::{ProviderConfig, ProvidersFile};
@@ -13,7 +13,7 @@ const LOCAL_KIND_PRIORITY: &[&str] = &["ollama", "lmstudio", "llamacpp"];
 
 /// The lightweight endpoint to hit for a quick "is anything listening and
 /// answering HTTP here" check — not a full chat request. `None` for kinds
-/// this module doesn't know how to probe (cloud providers, mock); callers
+/// this module doesn't know how to probe (cloud providers); callers
 /// should treat that as "assume reachable, not our job to check."
 fn local_probe_url(cfg: &ProviderConfig) -> Option<String> {
     let base = cfg.base_url.as_deref()?.trim_end_matches('/');
@@ -37,7 +37,7 @@ pub async fn is_reachable(url: &str, timeout: Duration) -> bool {
 }
 
 /// Reachability check for a specific configured provider. Kinds this module
-/// doesn't probe (cloud APIs, mock) are assumed reachable — checking them is
+/// doesn't probe (cloud APIs) are assumed reachable — checking them is
 /// out of scope here; their own request will surface a real error if not.
 pub async fn is_provider_reachable(cfg: &ProviderConfig, timeout: Duration) -> bool {
     match local_probe_url(cfg) {
@@ -91,7 +91,7 @@ mod tests {
             local_probe_url(&cfg("llamacpp", Some("http://127.0.0.1:8080/v1/"))),
             Some("http://127.0.0.1:8080/v1/models".to_string())
         );
-        assert_eq!(local_probe_url(&cfg("mock", None)), None);
+        assert_eq!(local_probe_url(&cfg("anthropic", Some("https://api.anthropic.com"))), None);
         assert_eq!(local_probe_url(&cfg("openai", Some("https://api.openai.com/v1"))), None);
     }
 
@@ -116,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_local_kind_is_assumed_reachable_without_probing() {
-        assert!(is_provider_reachable(&cfg("mock", None), Duration::from_millis(100)).await);
+        assert!(is_provider_reachable(&cfg("anthropic", Some("https://ai.io")), Duration::from_millis(100)).await);
         assert!(
             is_provider_reachable(
                 &cfg("openai", Some("https://api.openai.com/v1")),

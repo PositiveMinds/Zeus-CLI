@@ -16,7 +16,7 @@ pub struct ProvidersFile {
 /// One model provider endpoint configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderConfig {
-    /// Provider kind: ollama | lmstudio | llamacpp | openai | anthropic | gemini | grok | openrouter | mock
+    /// Provider kind: ollama | lmstudio | llamacpp | openai | anthropic | gemini | grok | openrouter
     pub kind: String,
     /// Base URL (required for local and OpenAI-compatible endpoints).
     #[serde(default)]
@@ -139,12 +139,6 @@ base_url = "http://127.0.0.1:8080/v1"
 default_model = "local-model"
 embeddings = true
 prompt_cache = true
-
-[providers.mock]
-kind = "mock"
-default_model = "mock-model"
-embeddings = true
-prompt_cache = true
 "#;
         std::fs::write(path, body).map_err(ConfigError::Io)?;
         Ok(())
@@ -162,18 +156,6 @@ prompt_cache = true
                 headers: HashMap::new(),
                 embeddings: true,
                 prompt_cache: false,
-            },
-        );
-        providers.insert(
-            "mock".into(),
-            ProviderConfig {
-                kind: "mock".into(),
-                base_url: None,
-                api_key_env: None,
-                default_model: Some("mock-model".into()),
-                headers: HashMap::new(),
-                embeddings: true,
-                prompt_cache: true,
             },
         );
         providers.insert(
@@ -213,7 +195,7 @@ mod tests {
     fn load_missing_returns_defaults() {
         let file = ProvidersFile::load(Path::new("/no/such/providers.toml")).unwrap();
         assert!(file.get("ollama").is_some());
-        assert!(file.get("mock").is_some());
+        assert!(file.get("openai").is_some());
     }
 
     #[test]

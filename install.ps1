@@ -76,4 +76,4 @@ Write-Host "Installed zeus." -ForegroundColor Green
 Write-Host "Open a new terminal and run:"
 Write-Host "  zeus init" -ForegroundColor Cyan
 Write-Host "  zeus doctor" -ForegroundColor Cyan
-Write-Host "  zeus chat 'hello' --provider mock" -ForegroundColor Cyan
+Write-Host "  zeus chat 'hello'" -ForegroundColor Cyan

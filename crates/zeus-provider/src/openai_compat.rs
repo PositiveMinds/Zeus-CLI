@@ -506,7 +506,7 @@ let resp = self
     async fn count_tokens(&self, request: TokenCountRequest) -> Result<TokenCountResponse> {
         // Neither LM Studio nor llama-server expose a free-standing tokenize
         // endpoint we can rely on being present across versions; fall back
-        // to the same approximate heuristic as the mock/Ollama providers,
+        // to the same approximate heuristic as the Ollama provider
         // honestly marked `approximate: true`.
         Ok(TokenCountResponse {
             tokens: estimate_messages(&request.messages, &request.tools),

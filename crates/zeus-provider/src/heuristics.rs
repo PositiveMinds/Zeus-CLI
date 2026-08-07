@@ -1,6 +1,6 @@
 //! Shared approximate token-counting heuristic. Used by any backend that
-//! doesn't expose a real tokenizer/count endpoint (the mock provider, and
-//! local servers like Ollama that don't have a free tokenize call).
+//! doesn't expose a real tokenizer/count endpoint (e.g. local servers like
+//! Ollama that don't have a free tokenize call).
 
 use crate::types::{Message, ToolSpec};
 

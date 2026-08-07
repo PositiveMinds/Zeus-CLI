@@ -67,7 +67,7 @@ enum Commands {
         action: ConfigCmd,
     },
 
-    /// One-shot chat with the configured (or mock) provider
+    /// One-shot chat with the configured provider
     Chat {
         /// User message
         message: String,
@@ -349,6 +349,14 @@ enum GitCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Commit (all changes by default) and push to the current branch's upstream
+    CommitAndPush {
+        message: String,
+        #[arg(short, long)]
+        all: bool,
+        #[arg(long)]
+        remote: Option<String>,
+    },
     /// git reset (mode=hard is denied by a built-in safety rule)
     Reset {
         #[arg(value_enum)]
@@ -363,6 +371,23 @@ enum GitCmd {
     Rebase { onto: String },
     /// Merge a branch into the current one
     Merge { branch: String },
+    /// List pull requests (needs `gh` CLI)
+    PrList {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value = "open")]
+        state: String,
+    },
+    /// Show a pull request (needs `gh` CLI)
+    PrView { number: String },
+    /// Create a pull request for the current branch (needs `gh` CLI; branch must be pushed)
+    PrCreate {
+        title: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        base: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -701,8 +726,8 @@ fn parse_toml_scalar(s: &str) -> toml::Value {
 /// one (`provider: None`, using the configured default), and that default
 /// is a local server kind (Ollama/LM Studio/llama.cpp) that isn't actually
 /// running right now, this auto-detects another local server that *is*
-/// running rather than failing with an opaque connection error — or falls
-/// back to mock with a clear message if none are. An explicit `--provider`
+/// running rather than failing with an opaque connection error. If none are
+/// reachable it returns a clear, actionable error. An explicit `--provider`
 /// is always respected as-is; auto-detection only kicks in for the default.
 async fn resolve_provider(
     config: &Config,
@@ -725,8 +750,10 @@ async fn resolve_provider(
                         });
                     }
                     None => {
-                        info!(provider = %name, "no local model server detected; falling back to mock provider");
-                        return Ok(std::sync::Arc::new(zeus_provider::MockProvider::new("mock")));
+                        info!(provider = %name, "no reachable model server detected");
+                        return Err(anyhow::anyhow!(
+                            "no model provider is reachable. Start a local server (ollama/lmstudio/llamacpp) or configure a cloud provider and set its API key, then run `zeus config set core.default.provider <name>` (or pass `--provider <name>`)"
+                        ));
                     }
                 }
             }
@@ -1914,6 +1941,12 @@ fn cmd_git(config: &Config, action: GitCmd, yes: bool) -> Result<()> {
             force,
             approver(yes),
         )?),
+        GitCmd::CommitAndPush { message, all, remote } => report_git(engine.commit_and_push(
+            &message,
+            all,
+            remote.as_deref(),
+            approver(yes),
+        )?),
         GitCmd::Reset { mode, target } => {
             report_git(engine.reset(mode.into(), target.as_deref(), approver(yes))?)
         }
@@ -1921,6 +1954,11 @@ fn cmd_git(config: &Config, action: GitCmd, yes: bool) -> Result<()> {
         GitCmd::CherryPick { target } => report_git(engine.cherry_pick(&target, approver(yes))?),
         GitCmd::Rebase { onto } => report_git(engine.rebase(&onto, approver(yes))?),
         GitCmd::Merge { branch } => report_git(engine.merge(&branch, approver(yes))?),
+        GitCmd::PrList { limit, state } => report_git(engine.pr_list(&state, limit, approver(yes))?),
+        GitCmd::PrView { number } => report_git(engine.pr_view(&number, approver(yes))?),
+        GitCmd::PrCreate { title, body, base } => {
+            report_git(engine.pr_create(&title, body.as_deref(), base.as_deref(), approver(yes))?)
+        }
     }
 }
 
@@ -1946,8 +1984,8 @@ fn cmd_doctor(config: &Config) -> Result<()> {
     println!("  [x] Config (global / project / local layering)");
     println!("  [x] Logging (console + ~/.zeus/logs)");
     println!("  [x] Provider abstraction (chat/stream/list/embeddings/count_tokens)");
-    println!("  [x] Providers: mock, ollama, lmstudio, llamacpp");
-    println!("  [ ] Providers not yet implemented: openai/anthropic/gemini/grok/openrouter (NotConfigured stub)");
+    println!("  [x] Providers: ollama, lmstudio, llamacpp");
+    println!("  [x] Cloud providers: openai, grok, openrouter, opencodezen, gemini (OpenAI-compatible), anthropic");
     println!("  [x] Local-provider auto-detection + reachability fallback");
     println!();
     println!("Phase 2 — Safety Core:");
@@ -1968,14 +2006,15 @@ fn cmd_doctor(config: &Config) -> Result<()> {
     println!("Phase 5 — Git & Review:");
     println!("  [x] Git integration (zeus git ..., 24 operations, tiered permissions)");
     println!("  [x] AI commit messages + diff review (composed from git_diff + git_commit — no special code needed)");
-    println!("  [ ] PR support (future)");
+    println!("  [x] PR support (git pr create/list/view via gh CLI)");
     println!();
     println!("Next: Phase 6 — Code Intelligence");
-    match create_default("mock", &config.providers) {
-        Ok(_) => println!("doctor: mock provider OK"),
+    let default_provider = config.settings.model.provider.clone();
+    match create_default(&default_provider, &config.providers) {
+        Ok(_) => println!("doctor: provider '{default_provider}' OK"),
         Err(e) => {
-            error!(?e, "mock provider failed");
-            bail!("mock provider failed: {e}");
+            error!(provider = %default_provider, error = ?e, "default provider failed");
+            bail!("default provider '{default_provider}' failed: {e}");
         }
     }
     Ok(())

@@ -1,5 +1,5 @@
 //! Ollama HTTP provider — talks to a local `ollama serve` instance
-//! (default `http://127.0.0.1:11434`). First real (non-mock) backend.
+//! (default `http://127.0.0.1:11434`).
 
 use crate::error::{ProviderError, Result};
 use crate::heuristics::estimate_messages;
@@ -455,7 +455,7 @@ impl ModelProvider for OllamaProvider {
 
     async fn count_tokens(&self, request: TokenCountRequest) -> Result<TokenCountResponse> {
         // Ollama has no free-standing tokenize endpoint across all server
-        // versions; fall back to the same approximate heuristic as the mock
+        // versions; fall back to the same approximate heuristic as other
         // provider, honestly marked `approximate: true`.
         Ok(TokenCountResponse {
             tokens: estimate_messages(&request.messages, &request.tools),

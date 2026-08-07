@@ -33,7 +33,7 @@ del "%TEMP%\zeus-%TARGET%.zip" 2>nul
 echo.
 echo Installed zeus. Verify:
 echo   %INSTALL_DIR%\zeus.exe doctor
-echo   %INSTALL_DIR%\zeus.exe chat "hello" --provider mock
+echo   %INSTALL_DIR%\zeus.exe chat "hello"
 echo.
 echo Add %INSTALL_DIR% to your user PATH to run just "zeus":
 setx Path "%INSTALL_DIR%;%PATH%" >nul

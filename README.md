@@ -55,8 +55,8 @@ cargo run -p zeus-cli -- init --with-project
 cargo run -p zeus-cli -- doctor
 cargo run -p zeus-cli -- config show
 
-# Offline chat (mock provider)
-cargo run -p zeus-cli -- chat "hello" --provider mock
+# One-shot chat with your configured provider (e.g. local Ollama)
+cargo run -p zeus-cli -- chat "hello" --provider ollama
 
 # Safe file ops (permission prompts; use --yes to auto-approve this process only)
 cargo run -p zeus-cli -- write notes.txt "hello" --yes
@@ -97,7 +97,7 @@ crates/
   zeus-cli/       # binary
   zeus-config/    # paths + layered TOML
   zeus-logging/   # tracing + file logs
-  zeus-provider/  # ModelProvider trait + mock
+  zeus-provider/  # ModelProvider trait + real backends
   zeus-fs/        # permission gate, file ops, checkpoints, search
 ```
 
@@ -112,7 +112,7 @@ crates/
 
 ## Cloud providers & modes
 
-Besides a local Ollama/LM-Studio-style provider and the offline `mock`, zeus
+Besides a local Ollama/LM-Studio-style provider, zeus
 supports cloud LLMs via OpenAI-compatible and native Anthropic routes:
 
 - **OpenAI-compatible**: OpenAI, Grok (x.ai), OpenRouter, OpenCode Zen, Gemini
@@ -122,7 +122,7 @@ supports cloud LLMs via OpenAI-compatible and native Anthropic routes:
 
 API keys come from an env var named by `api_key_env`, or an embedded
 `header` value; a missing key surfaces a clear error instead of silently
-falling back to the mock provider.
+failing at runtime.
 
 ## Agent modes
 
