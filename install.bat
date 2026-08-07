@@ -7,7 +7,7 @@ rem Downloads the latest zeus release, installs it under %LOCALAPPDATA%\zeus,
 rem and adds it to the user PATH.
 
 setlocal
-set "REPO=PositiveMinds/Zeus-CLI"
+set "REPO=PositiveMinds/Zeus-CLI-releases"
 set "INSTALL_DIR=%LOCALAPPDATA%\zeus"
 set "TARGET=x86_64-pc-windows-msvc"
 

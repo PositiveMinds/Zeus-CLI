@@ -16,16 +16,18 @@ Built from [AI_Coding_Agent_Blueprint_Database_Free.md](./AI_Coding_Agent_Bluepr
 ## Install
 
 Prebuilt binaries for Windows, macOS (Apple Silicon + Intel), and Linux x86_64
-are attached to each [release](https://github.com/PositiveMinds/Zeus-CLI/releases).
+are attached to each [release](https://github.com/PositiveMinds/Zeus-CLI-releases).
+The binaries are published from the private source repo to this public mirror, so
+no Rust toolchain is required to install.
 
 **PowerShell** (Windows 10/11):
 ```powershell
-irm https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI-releases/main/install.ps1 | iex
 ```
 
 **cmd** (Windows):
 ```batch
-curl -L https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI/main/install.bat | cmd
+curl -L https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI-releases/main/install.bat | cmd
 ```
 
 Either installer puts `zeus` in `%LOCALAPPDATA%\zeus` and adds it to your user

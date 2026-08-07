@@ -8,7 +8,7 @@
 $ErrorActionPreference = "Stop"
 
 $RepoOwner = "PositiveMinds"
-$RepoName = "Zeus-CLI"
+$RepoName = "Zeus-CLI-releases"
 $InstallDir = Join-Path $env:LOCALAPPDATA "zeus"
 $BinFile = Join-Path $InstallDir "zeus.exe"
 
