@@ -11,7 +11,7 @@ use zeus_agent::{
     BackgroundTaskRegistry, ContextManager, ExpandResult, HookRunner, McpClient, SessionStore,
     SlashCommands, TerminalRunner, ToolManager,
 };
-use zeus_config::Config;
+use zeus_config::{Config, KeysFile};
 use zeus_fs::{
     ApprovalDecision, CopyOptions, EditOptions, GitEngine, PermissionGate, PermissionRequest,
     ReadOptions, ResetMode, SearchOptions, Workspace, WriteOptions,
@@ -804,6 +804,7 @@ async fn resolve_model(
 pub(crate) fn describe_providers(config: &Config) -> Vec<String> {
     let mut names: Vec<&String> = config.providers.providers.keys().collect();
     names.sort();
+    let stored = KeysFile::load(&config.global.keys_toml).unwrap_or_default();
     let mut out = Vec::new();
     for name in names {
         let Some(cfg) = config.providers.get(name) else { continue };
@@ -811,6 +812,8 @@ pub(crate) fn describe_providers(config: &Config) -> Vec<String> {
         let local = matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp");
         let status = if local {
             "local".to_string()
+        } else if stored.get(name).is_some() || cfg.headers.contains_key("Authorization") {
+            "key stored".to_string()
         } else if let Some(var) = &cfg.api_key_env {
             if std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false) {
                 "key set".to_string()
@@ -1310,7 +1313,7 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("autocompact", "toggle auto-compaction: /autocompact on|off"),
     ("context", "show token usage against the model's context window"),
     ("model", "switch model (opens a picker), or /model <name> directly"),
-    ("provider", "list providers, switch (<name>), or set a session key: /provider key <name> <KEY>"),
+    ("provider", "list providers, switch (<name>), or persist a key: /provider key <name> <KEY>"),
     ("mode", "set agent mode: /mode build|plan|auto (Tab also cycles)"),
     ("session", "show the current session id"),
     ("agents", "list the specialist-agents roster grouped by department (/agents count)"),
@@ -1349,7 +1352,8 @@ async fn handle_provider_slash(arg: &str, config: &Config, agent: &mut Agent) {
             }
             println!("Use /provider <name> to switch, /provider key <name> <KEY> to set a key.");
         }
-        // `/provider key <name> <KEY>` — set the env var for this session.
+        // `/provider key <name> <KEY>` — persist the key to ~/.zeus/keys.toml
+        // and apply it to the in-memory provider config right away.
         ["key", name, key] => {
             let cfg = match config.providers.get(name) {
                 Some(c) => c,
@@ -1358,16 +1362,25 @@ async fn handle_provider_slash(arg: &str, config: &Config, agent: &mut Agent) {
                     return;
                 }
             };
-            let var = match &cfg.api_key_env {
-                Some(v) => v.clone(),
-                None => {
-                    eprintln!("provider '{name}' ({}) doesn't use an API key env var", cfg.kind);
+            let mut keys = match KeysFile::load(&config.global.keys_toml) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("couldn't read key store: {e:#}");
                     return;
                 }
             };
-            std::env::set_var(&var, *key);
+            keys.keys.insert(name.to_string(), key.to_string());
+            if let Err(e) = keys.save(&config.global.keys_toml) {
+                eprintln!("couldn't save key store: {e:#}");
+                return;
+            }
+            // Apply immediately to the running session.
+            if let Some(var) = &cfg.api_key_env {
+                std::env::set_var(var, *key);
+            }
             println!(
-                "key set for '{name}' (this session only). Persist it by setting {var} in your shell."
+                "key saved for '{name}' in {} — persistent across restarts.",
+                config.global.keys_toml.display()
             );
         }
         // `/provider key` with no args — usage hint, not a provider switch.

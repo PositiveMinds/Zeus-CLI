@@ -9,8 +9,10 @@ mod paths;
 mod providers;
 mod settings;
 mod error;
+mod keys;
 
 pub use error::{ConfigError, Result};
+pub use keys::KeysFile;
 pub use paths::{ensure_global_dirs, global_home, project_agent_dir, GlobalPaths, ProjectPaths};
 pub use providers::{ProviderConfig, ProvidersFile};
 pub use settings::{
@@ -40,7 +42,9 @@ impl Config {
         let global = GlobalPaths::discover()?;
         ensure_global_dirs(&global)?;
 
-        let providers = ProvidersFile::load(&global.providers_toml)?;
+        let mut providers = ProvidersFile::load(&global.providers_toml)?;
+        let keys = KeysFile::load(&global.keys_toml)?;
+        providers.inject_keys(&keys);
 
         let mut stack = SettingsStack::new();
         stack.push_file(SettingsLayer::Global, &global.settings_toml)?;

@@ -61,6 +61,17 @@ impl ProvidersFile {
         self.providers.get(name)
     }
 
+    /// Inject stored keys as embedded `Authorization: Bearer ...` headers so
+    /// a key persisted in `keys.toml` is used without any extra wiring.
+    pub fn inject_keys(&mut self, keys: &crate::KeysFile) {
+        for (name, key) in &keys.keys {
+            if let Some(cfg) = self.providers.get_mut(name) {
+                cfg.headers
+                    .insert("Authorization".to_string(), format!("Bearer {key}"));
+            }
+        }
+    }
+
     pub fn write_defaults_if_missing(path: &Path) -> Result<()> {
         if path.exists() {
             return Ok(());

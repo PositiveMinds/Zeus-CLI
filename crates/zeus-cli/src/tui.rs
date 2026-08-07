@@ -38,7 +38,7 @@ use std::io;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use zeus_agent::{personas_by_department, Agent, AgentEvent, TurnResult};
-use zeus_config::Config;
+use zeus_config::{Config, KeysFile};
 use zeus_fs::{ApprovalDecision, PermissionRequest};
 use zeus_provider::{create_provider, ModelInfo};
 
@@ -220,16 +220,25 @@ fn handle_provider_tui(
                     return;
                 }
             };
-            let var = match &cfg.api_key_env {
-                Some(v) => v.clone(),
-                None => {
-                    state.push_error(format!("provider '{name}' ({}) has no API key env var", cfg.kind));
+            let mut keys = match KeysFile::load(&config.global.keys_toml) {
+                Ok(k) => k,
+                Err(e) => {
+                    state.push_error(format!("couldn't read key store: {e:#}"));
                     return;
                 }
             };
-            std::env::set_var(&var, *key);
+            keys.keys.insert(name.to_string(), key.to_string());
+            if let Err(e) = keys.save(&config.global.keys_toml) {
+                state.push_error(format!("couldn't save key store: {e:#}"));
+                return;
+            }
+            // Apply immediately to the running session.
+            if let Some(var) = &cfg.api_key_env {
+                std::env::set_var(var, *key);
+            }
             state.push_info(format!(
-                "key set for '{name}' (this session). Persist by setting {var} in your shell."
+                "key saved for '{name}' in {} — persistent across restarts.",
+                config.global.keys_toml.display()
             ));
         }
         ["key"] => state.push_error("usage: /provider key <name> <KEY>"),
@@ -1041,6 +1050,8 @@ fn provider_status_ok(config: &Config, provider: &str) -> bool {
         return false;
     };
     if matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp") {
+        true
+    } else if cfg.headers.contains_key("Authorization") {
         true
     } else if let Some(var) = &cfg.api_key_env {
         std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false)
