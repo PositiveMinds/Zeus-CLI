@@ -21,6 +21,7 @@ mod ollama;
 mod openai_compat;
 mod registry;
 mod types;
+mod unconfigured;
 
 pub use anthropic::AnthropicProvider;
 pub use detect::{detect_local_provider, is_provider_reachable, is_reachable};
@@ -31,6 +32,7 @@ pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use registry::{create_default, create_provider, ProviderHandle};
 pub use types::*;
+pub use unconfigured::UnconfiguredProvider;
 
 use async_trait::async_trait;
 use futures::Stream;

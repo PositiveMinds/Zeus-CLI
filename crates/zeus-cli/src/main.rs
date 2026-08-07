@@ -19,12 +19,13 @@ use zeus_fs::{
 use zeus_logging::{init as init_logging, LoggingOptions};
 use zeus_provider::{
     create_default, create_provider, ChatRequest, Message, ModelProvider, StreamEvent,
+    UnconfiguredProvider,
 };
 use std::io::{self, IsTerminal, Read as IoRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1075,7 +1076,29 @@ async fn build_agent(
             .and_then(|c| c.default_model.clone())
             .unwrap_or_else(|| config.settings.model.model.clone())
     });
+    build_agent_with_provider(config, provider, model, session).await
+}
 
+/// Variant used by the interactive REPL/TUI when no provider is ready at
+/// startup: it wires an `UnconfiguredProvider` placeholder so the UI still
+/// launches and the user can set providers/keys in-app via `/provider`.
+async fn build_agent_unconfigured(config: &Config) -> Result<Agent> {
+    let provider: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::new(
+        UnconfiguredProvider {
+            requested: Some(config.settings.model.provider.clone()),
+        },
+    );
+    build_agent_with_provider(config, provider, config.settings.model.model.clone(), None).await
+}
+
+/// Construct an Agent around an already-resolved provider — shared by the
+/// normal and fallback paths.
+async fn build_agent_with_provider(
+    config: &Config,
+    provider: std::sync::Arc<dyn ModelProvider>,
+    model: String,
+    session: Option<String>,
+) -> Result<Agent> {
     let (model, models_list) = resolve_model(&*provider, model).await;
     let window = models_list
         .and_then(|models| models.into_iter().find(|m| m.id == model))
@@ -1438,7 +1461,13 @@ fn known_slash_commands(config: &Config) -> Vec<(String, String)> {
 /// raw-mode/alternate-screen handling only makes sense against a real
 /// console.
 async fn cmd_repl(config: &Config, yes: bool) -> Result<()> {
-    let agent = build_agent(config, None, None, None).await?;
+    let agent = match build_agent(config, None, None, None).await {
+        Ok(a) => a,
+        Err(err) => {
+            warn!(error = %err, "no provider ready at startup; launching interactive session in setup mode");
+            build_agent_unconfigured(config).await?
+        }
+    };
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
         return tui::run(config, agent, yes).await;
     }
