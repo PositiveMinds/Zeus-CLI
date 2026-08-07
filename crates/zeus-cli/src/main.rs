@@ -1460,14 +1460,21 @@ fn known_slash_commands(config: &Config) -> Vec<(String, String)> {
 /// for anything else (piped input, scripted invocations, tests) — the TUI's
 /// raw-mode/alternate-screen handling only makes sense against a real
 /// console.
-async fn cmd_repl(config: &Config, yes: bool) -> Result<()> {
-    let agent = match build_agent(config, None, None, None).await {
-        Ok(a) => a,
+/// Build an agent, falling back to the `UnconfiguredProvider` setup-mode
+/// variant when no provider is ready — used by interactive sessions so they
+/// can always launch/clear without a configured key.
+pub(crate) async fn build_agent_repl(config: &Config) -> Result<Agent> {
+    match build_agent(config, None, None, None).await {
+        Ok(a) => Ok(a),
         Err(err) => {
             warn!(error = %err, "no provider ready at startup; launching interactive session in setup mode");
-            build_agent_unconfigured(config).await?
+            build_agent_unconfigured(config).await
         }
-    };
+    }
+}
+
+async fn cmd_repl(config: &Config, yes: bool) -> Result<()> {
+    let agent = build_agent_repl(config).await?;
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
         return tui::run(config, agent, yes).await;
     }
@@ -1519,11 +1526,11 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
             match cmd {
                 "help" => print_repl_help(),
                 "clear" => {
-                    agent = build_agent(config, None, None, None).await?;
+                    agent = build_agent_repl(config).await?;
                     println!("cleared — new session={}", agent.session_id());
                 }
                 "new" => {
-                    agent = build_agent(config, None, None, None).await?;
+                    agent = build_agent_repl(config).await?;
                     println!("new session started — session={}", agent.session_id());
                 }
                 "compact" => match agent.compact_now().await {

@@ -18,8 +18,8 @@
 //! justified because waiting on a human is inherently slow anyway.
 
 use crate::{
-    build_agent, describe_providers, expand_slash_command, known_slash_commands,
-    list_models_by_provider, persist_default_provider, print_repl_help_lines,
+    build_agent_repl, expand_slash_command, known_slash_commands, list_models_by_provider,
+    persist_default_provider, print_repl_help_lines,
 };
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -28,6 +28,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -119,6 +120,12 @@ enum Mode {
     Chat,
     Approval(ApprovalRequestMsg),
     ModelPicker { entries: Vec<PickerEntry>, selected: usize },
+    /// Grouped provider picker (paid / free / local) — arrow keys to move,
+    /// Enter to select. Selecting a provider without a key opens `KeyEntry`.
+    ProviderPicker { entries: Vec<ProviderEntry>, selected: usize },
+    /// Pasting an API key for the named provider. Enter saves it (persisted
+    /// to keys.toml, env var set, provider switched) and returns to Chat.
+    KeyEntry { provider: String },
 }
 
 /// One row in the model picker: a non-selectable provider-group header, or
@@ -129,6 +136,22 @@ enum Mode {
 enum PickerEntry {
     Header(String),
     Model { provider: String, model: ModelInfo },
+}
+
+/// One row in the provider picker: a non-selectable group header (paid /
+/// free / local) or a selectable provider. Flat list like `PickerEntry` so a
+/// single index drives keyboard and mouse selection.
+enum ProviderEntry {
+    Header(String),
+    Provider {
+        name: String,
+        kind: String,
+        model: String,
+        /// True when the provider can be used right now (local kind, stored
+        /// key, or env key present) — false means "needs a key" and Enter
+        /// jumps to `KeyEntry` instead of switching.
+        ready: bool,
+    },
 }
 
 /// Moves `selected` one step in the given direction (`1` or `-1`), skipping
@@ -144,6 +167,21 @@ fn picker_move(entries: &[PickerEntry], selected: usize, dir: isize) -> usize {
     loop {
         idx = (idx + dir).rem_euclid(len);
         if matches!(entries[idx as usize], PickerEntry::Model { .. }) {
+            return idx as usize;
+        }
+    }
+}
+
+/// Same navigation for the provider picker, skipping its group headers.
+fn provider_picker_move(entries: &[ProviderEntry], selected: usize, dir: isize) -> usize {
+    let len = entries.len() as isize;
+    if len == 0 {
+        return 0;
+    }
+    let mut idx = selected as isize;
+    loop {
+        idx = (idx + dir).rem_euclid(len);
+        if matches!(entries[idx as usize], ProviderEntry::Provider { .. }) {
             return idx as usize;
         }
     }
@@ -189,6 +227,159 @@ fn apply_picker_choice(
     state.model = model_id;
 }
 
+/// Persist an API key for a provider (to `~/.zeus/keys.toml`), apply it as
+/// the provider's env var for the running session, then switch the agent to
+/// that provider's default model. Pushes a transcript line on success/failure.
+fn persist_key_and_switch(
+    provider: &str,
+    key: &str,
+    config: &Config,
+    agent_slot: &mut Option<Agent>,
+    state: &mut AppState,
+) {
+    let mut keys = match KeysFile::load(&config.global.keys_toml) {
+        Ok(k) => k,
+        Err(e) => {
+            state.push_error(format!("couldn't read key store: {e:#}"));
+            return;
+        }
+    };
+    keys.keys.insert(provider.to_string(), key.to_string());
+    if let Err(e) = keys.save(&config.global.keys_toml) {
+        state.push_error(format!("couldn't save key store: {e:#}"));
+        return;
+    }
+    if let Some(cfg) = config.providers.get(provider) {
+        if let Some(var) = &cfg.api_key_env {
+            std::env::set_var(var, key);
+        }
+    }
+    match create_provider(provider, &config.providers) {
+        Ok(handle) => {
+            if let Some(agent) = agent_slot.as_mut() {
+                agent.set_provider(handle);
+            }
+            let model = config
+                .providers
+                .get(provider)
+                .and_then(|c| c.default_model.clone())
+                .unwrap_or_else(|| state.model.clone());
+            if let Some(agent) = agent_slot.as_mut() {
+                agent.set_model(model.clone());
+            }
+            state.provider = provider.to_string();
+            state.model = model.clone();
+            let saved = config.global.keys_toml.display();
+            match persist_default_provider(config, provider, Some(&model)) {
+                Ok(path) => state.push_info(format!(
+                    "key saved for '{provider}' ({saved}) — switched to {provider} / {model} (default saved to {})",
+                    path.display()
+                )),
+                Err(e) => state.push_info(format!(
+                    "key saved for '{provider}' ({saved}) — switched to {provider} / {model}, but saving default failed: {e:#}"
+                )),
+            }
+        }
+        Err(e) => state.push_error(format!("couldn't switch to '{provider}': {e:#}")),
+    }
+}
+
+/// Apply a provider-picker choice. Ready providers switch immediately; a
+/// provider that needs a key opens the `KeyEntry` paste screen instead.
+fn apply_provider_picker_choice(
+    name: String,
+    ready: bool,
+    config: &Config,
+    agent_slot: &mut Option<Agent>,
+    state: &mut AppState,
+) {
+    if ready {
+        state.mode = Mode::Chat;
+        let Some(cfg) = config.providers.get(&name) else {
+            state.push_error(format!("unknown provider '{name}'"));
+            return;
+        };
+        let model = cfg
+            .default_model
+            .clone()
+            .unwrap_or_else(|| state.model.clone());
+        match create_provider(&name, &config.providers) {
+            Ok(handle) => {
+                if let Some(agent) = agent_slot.as_mut() {
+                    agent.set_provider(handle);
+                    agent.set_model(model.clone());
+                }
+                state.provider = name.clone();
+                state.model = model.clone();
+                match persist_default_provider(config, &name, Some(&model)) {
+                    Ok(path) => state.push_info(format!(
+                        "switched to provider: {name} (model: {model}) — saved to {}",
+                        path.display()
+                    )),
+                    Err(e) => state.push_info(format!(
+                        "switched to provider {name}, but saving default failed: {e:#}"
+                    )),
+                }
+            }
+            Err(e) => state.push_error(format!("couldn't switch to '{name}': {e:#}")),
+        }
+    } else {
+        state.input.clear();
+        state.cursor = 0;
+        state.mode = Mode::KeyEntry { provider: name };
+    }
+}
+
+/// Build grouped provider-picker entries: Local, Free, then Paid. Each group
+/// gets a header row; providers carry their kind, default model, and whether
+/// they're immediately usable (local kind, stored key, or env key set). The
+/// caller's current provider's row is preselected.
+fn provider_picker_entries(config: &Config, current: &str) -> (Vec<ProviderEntry>, usize) {
+    let group_of = |kind: &str| -> &'static str {
+        if matches!(kind, "ollama" | "lmstudio" | "llamacpp") {
+            "Local"
+        } else if kind == "opencodezen" {
+            "Free"
+        } else {
+            "Paid"
+        }
+    };
+    let mut names: Vec<&String> = config.providers.providers.keys().collect();
+    names.sort();
+    let mut entries = Vec::new();
+    let mut selected = 0;
+    for group in ["Local", "Free", "Paid"] {
+        let members: Vec<&&String> = names
+            .iter()
+            .filter(|n| {
+                config
+                    .providers
+                    .get(*n)
+                    .map(|c| group_of(&c.kind) == group)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        entries.push(ProviderEntry::Header(group.to_string()));
+        for name in members {
+            let Some(cfg) = config.providers.get(name) else { continue };
+            let ready = provider_status_ok(config, name);
+            if name.as_str() == current && ready {
+                selected = entries.len();
+            }
+            entries.push(ProviderEntry::Provider {
+                name: name.to_string(),
+                kind: cfg.kind.clone(),
+                model: cfg.default_model.clone().unwrap_or_default(),
+                ready,
+            });
+        }
+    }
+    (entries, selected)
+}
+
 /// The `/provider` slash command inside the TUI: list all configured
 /// providers (with live key/local status), switch the active one, or set a
 /// cloud key for the session. Mirrors the plain-REPL handler, but pushes
@@ -201,16 +392,14 @@ fn handle_provider_tui(
 ) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     match parts.as_slice() {
+        // `/provider` with no args — open the grouped picker popup.
         [] => {
-            state.push_info(format!(
-                "current: {} / {}",
-                state.provider, state.model
-            ));
-            state.push_info("configured providers:");
-            for line in describe_providers(config) {
-                state.push_info(line);
+            let (entries, selected) = provider_picker_entries(config, &state.provider);
+            if entries.is_empty() {
+                state.push_error("no providers configured — see config.toml / providers.toml");
+            } else {
+                state.mode = Mode::ProviderPicker { entries, selected };
             }
-            state.push_info("/provider <name> to switch · /provider key <name> <KEY> to set a key");
         }
         ["key", name, key] => {
             let cfg = match config.providers.get(name) {
@@ -335,6 +524,8 @@ struct AppState {
     /// frame — used to map a mouse click's row back to a model index. `None`
     /// whenever the picker isn't open.
     model_picker_area: Option<Rect>,
+    /// Same for the provider picker popup.
+    provider_picker_area: Option<Rect>,
 }
 
 /// Project-root facts shown in the SuperCode-style "directory" header panel.
@@ -363,6 +554,7 @@ impl AppState {
             dir,
             command_selected: 0,
             model_picker_area: None,
+            provider_picker_area: None,
         }
     }
 
@@ -687,6 +879,27 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
+    if let Mode::KeyEntry { provider } = &state.mode {
+        let line = Line::from(vec![
+            Span::styled("[api key] ", theme::amber().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("paste API key for {provider}:"),
+                theme::text().add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), rows[0]);
+        let key_line = if state.input.is_empty() {
+            Line::from(Span::styled(
+                "sk-… (ctrl+v to paste, then enter)",
+                placeholder_style(),
+            ))
+        } else {
+            Line::from(Span::raw(state.input.clone()))
+        };
+        f.render_widget(Paragraph::new(key_line), rows[1]);
+        return;
+    }
+
     let prompt_style = if state.busy { theme::faint() } else { theme::green() };
     let input_line = if state.busy {
         Line::from(vec![
@@ -953,6 +1166,84 @@ fn render_model_picker(
     inner
 }
 
+/// The `/provider` popup: providers grouped into Local / Free / Paid headers
+/// with a status dot (green = ready, amber = needs a key) and a hint that
+/// selecting a key-less provider opens the paste prompt.
+fn render_provider_picker(
+    f: &mut Frame,
+    area: Rect,
+    current_provider: &str,
+    entries: &[ProviderEntry],
+    selected: usize,
+) -> Rect {
+    let width = area.width.saturating_sub(6).min(76).max(36);
+    let height = (entries.len() as u16 + 4).min(area.height.saturating_sub(4)).max(8);
+    let popup = centered_rect(width, height, area);
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style())
+        .style(Style::default().bg(theme::PANEL))
+        .title(Line::from(vec![
+            Span::styled(" select provider ", theme::green().add_modifier(Modifier::BOLD)),
+        ]))
+        .title_bottom(Line::from(
+            Span::styled(
+                " ↑/↓ navigate · enter select (or paste key) · esc dismiss ",
+                theme::faint(),
+            ),
+        )
+        .alignment(Alignment::Center));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|entry| match entry {
+            ProviderEntry::Header(name) => ListItem::new(Line::from(Span::styled(
+                format!(" {} ", name.to_uppercase()),
+                theme::green().add_modifier(Modifier::BOLD),
+            ))),
+            ProviderEntry::Provider {
+                name,
+                kind,
+                model,
+                ready,
+            } => {
+                let is_current = name == current_provider;
+                let dot = if *ready { theme::green() } else { theme::amber() };
+                let dot_label = if *ready { "●" } else { "◌" };
+                let status = if is_current { " (current)" } else { "" };
+                let key_note = if *ready {
+                    String::new()
+                } else {
+                    "  needs key".to_string()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(dot_label, dot.add_modifier(Modifier::BOLD)),
+                    Span::raw("  "),
+                    Span::styled(name.clone(), theme::text().add_modifier(Modifier::BOLD)),
+                    Span::styled(status, theme::green()),
+                    Span::raw("  "),
+                    Span::styled(kind.clone(), theme::muted()),
+                    Span::styled(format!(" / {model}"), theme::faint()),
+                    Span::styled(key_note, theme::amber()),
+                ]))
+            }
+        })
+        .collect();
+    let list = List::new(items).highlight_style(
+        Style::default().bg(theme::SURFACE).fg(theme::GREEN).add_modifier(Modifier::BOLD),
+    );
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected.min(entries.len().saturating_sub(1))));
+    f.render_stateful_widget(list, inner, &mut list_state);
+
+    inner
+}
+
 fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     let area = f.area();
 
@@ -982,6 +1273,14 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
         None
     };
     state.model_picker_area = picker_area;
+
+    let provider_picker_area =
+        if let Mode::ProviderPicker { entries, selected } = &state.mode {
+            Some(render_provider_picker(f, area, &state.provider, entries, *selected))
+        } else {
+            None
+        };
+    state.provider_picker_area = provider_picker_area;
 }
 
 /// SuperCode-style breadcrumb header: `supercode · chat · <model>` on the
@@ -1193,6 +1492,87 @@ async fn handle_key(
         return Ok(());
     }
 
+    if let Mode::ProviderPicker { .. } = &state.mode {
+        match key.code {
+            KeyCode::Up => {
+                let Mode::ProviderPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                *selected = provider_picker_move(entries, *selected, -1);
+            }
+            KeyCode::Down => {
+                let Mode::ProviderPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                *selected = provider_picker_move(entries, *selected, 1);
+            }
+            KeyCode::Enter => {
+                let Mode::ProviderPicker { entries, selected } = &state.mode else { unreachable!() };
+                let chosen = match entries.get(*selected) {
+                    Some(ProviderEntry::Provider { name, ready, .. }) => {
+                        Some((name.clone(), *ready))
+                    }
+                    _ => None,
+                };
+                match chosen {
+                    Some((name, ready)) => {
+                        apply_provider_picker_choice(name, ready, config, agent_slot, state)
+                    }
+                    None => state.mode = Mode::Chat,
+                }
+            }
+            KeyCode::Esc => {
+                state.mode = Mode::Chat;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if let Mode::KeyEntry { .. } = &state.mode {
+        match key.code {
+            KeyCode::Enter => {
+                let Mode::KeyEntry { provider } = std::mem::replace(&mut state.mode, Mode::Chat)
+                    else { unreachable!() };
+                let key = std::mem::take(&mut state.input);
+                state.cursor = 0;
+                let key = key.trim().to_string();
+                if key.is_empty() {
+                    state.push_error(format!("no key entered for '{provider}' — key not saved"));
+                    return Ok(());
+                }
+                persist_key_and_switch(&provider, &key, config, agent_slot, state);
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                state.mode = Mode::Chat;
+                state.input.clear();
+                state.cursor = 0;
+                return Ok(());
+            }
+            KeyCode::Backspace => {
+                if state.cursor > 0 {
+                    remove_char_at(&mut state.input, state.cursor - 1);
+                    state.cursor -= 1;
+                }
+            }
+            KeyCode::Left => {
+                if state.cursor > 0 {
+                    state.cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if state.cursor < char_count(&state.input) {
+                    state.cursor += 1;
+                }
+            }
+            KeyCode::Home => state.cursor = 0,
+            KeyCode::End => state.cursor = char_count(&state.input),
+            KeyCode::Char(c) => {
+                insert_char_at(&mut state.input, state.cursor, c);
+                state.cursor += 1;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if state.busy {
             if let Some(tx) = cancel_tx.as_ref() {
@@ -1269,7 +1649,7 @@ async fn handle_key(
                 match cmd {
                     "help" => state.push_info(print_repl_help_lines()),
                     "clear" => {
-                        let agent = build_agent(config, None, None, None).await?;
+                        let agent = build_agent_repl(config).await?;
                         apply_agent_mode(&agent, state.agent_mode);
                         state.session_id = agent.session_id().to_string();
                         state.model = agent.model().to_string();
@@ -1435,35 +1815,65 @@ async fn handle_key(
 /// the highlight without applying. Only meaningful while the picker is
 /// open — mouse events are otherwise ignored.
 fn handle_mouse(ev: MouseEvent, state: &mut AppState, agent_slot: &mut Option<Agent>, config: &Config) {
-    if !matches!(state.mode, Mode::ModelPicker { .. }) {
-        return;
-    }
-    let Some(area) = state.model_picker_area else {
-        return;
-    };
-
-    match ev.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if ev.column >= area.x
-                && ev.column < area.x + area.width
-                && ev.row >= area.y
-                && ev.row < area.y + area.height
-            {
-                let row = (ev.row - area.y) as usize;
-                let Mode::ModelPicker { entries, .. } = &state.mode else { unreachable!() };
-                if let Some(PickerEntry::Model { provider, model }) = entries.get(row) {
-                    let (provider, model_id) = (provider.clone(), model.id.clone());
-                    apply_picker_choice(provider, model_id, state, agent_slot, config);
+    match state.mode {
+        Mode::ModelPicker { .. } => {
+            let Some(area) = state.model_picker_area else {
+                return;
+            };
+            match ev.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if ev.column >= area.x
+                        && ev.column < area.x + area.width
+                        && ev.row >= area.y
+                        && ev.row < area.y + area.height
+                    {
+                        let row = (ev.row - area.y) as usize;
+                        let Mode::ModelPicker { entries, .. } = &state.mode else { unreachable!() };
+                        if let Some(PickerEntry::Model { provider, model }) = entries.get(row) {
+                            let (provider, model_id) = (provider.clone(), model.id.clone());
+                            apply_picker_choice(provider, model_id, state, agent_slot, config);
+                        }
+                    }
                 }
+                MouseEventKind::ScrollUp => {
+                    let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                    *selected = picker_move(entries, *selected, -1);
+                }
+                MouseEventKind::ScrollDown => {
+                    let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                    *selected = picker_move(entries, *selected, 1);
+                }
+                _ => {}
             }
         }
-        MouseEventKind::ScrollUp => {
-            let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
-            *selected = picker_move(entries, *selected, -1);
-        }
-        MouseEventKind::ScrollDown => {
-            let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
-            *selected = picker_move(entries, *selected, 1);
+        Mode::ProviderPicker { .. } => {
+            let Some(area) = state.provider_picker_area else {
+                return;
+            };
+            match ev.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if ev.column >= area.x
+                        && ev.column < area.x + area.width
+                        && ev.row >= area.y
+                        && ev.row < area.y + area.height
+                    {
+                        let row = (ev.row - area.y) as usize;
+                        let Mode::ProviderPicker { entries, .. } = &state.mode else { unreachable!() };
+                        if let Some(ProviderEntry::Provider { name, ready, .. }) = entries.get(row) {
+                            apply_provider_picker_choice(name.clone(), *ready, config, agent_slot, state);
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    let Mode::ProviderPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                    *selected = provider_picker_move(entries, *selected, -1);
+                }
+                MouseEventKind::ScrollDown => {
+                    let Mode::ProviderPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                    *selected = provider_picker_move(entries, *selected, 1);
+                }
+                _ => {}
+            }
         }
         _ => {}
     }
@@ -1505,6 +1915,14 @@ async fn run_app<B: Backend>(
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         handle_key(key, &mut state, &mut agent_slot, &mut turn_handle, &mut cancel_tx, &ui_tx, config, yes).await?;
                     }
+                    Event::Paste(text) => {
+                        if let Mode::KeyEntry { .. } = state.mode {
+                            for c in text.chars() {
+                                insert_char_at(&mut state.input, state.cursor, c);
+                                state.cursor += 1;
+                            }
+                        }
+                    }
                     Event::Mouse(mouse) => handle_mouse(mouse, &mut state, &mut agent_slot, config),
                     _ => {}
                 }
@@ -1529,7 +1947,7 @@ async fn run_app<B: Backend>(
                     }
                     Err(join_err) => {
                         state.push_error(format!("internal error: {join_err}"));
-                        let agent = build_agent(config, None, None, None).await?;
+                        let agent = build_agent_repl(config).await?;
                         apply_agent_mode(&agent, state.agent_mode);
                         agent_slot = Some(agent);
                     }
@@ -1626,14 +2044,26 @@ fn sync_cursor_visibility<B: Backend>(terminal: &mut Terminal<B>, state: &AppSta
 pub async fn run(config: &Config, agent: Agent, yes: bool) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+    .context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("init terminal")?;
 
     let result = run_app(&mut terminal, config, agent, yes).await;
 
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )
+    .ok();
     terminal.show_cursor().ok();
 
     result
