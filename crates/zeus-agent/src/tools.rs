@@ -15,8 +15,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use zeus_fs::{
-    ApprovalDecision, CopyOptions, EditOptions, GitEngine, GitOutput, PermissionGate,
-    PermissionRequest, ReadOptions, ResetMode, SearchOptions, Workspace, WriteOptions,
+    ApprovalDecision, CopyOptions, DeviceEngine, EditOptions, GitEngine, GitOutput, IndexEngine,
+    PermissionGate, PermissionRequest, PlatformEngine, PlatformOutput, ReadOptions, ResetMode,
+    SearchOptions, SymbolIndex, Workspace, WriteOptions, filter_out_own_index, word_boundary,
 };
 use zeus_provider::ToolSpec;
 
@@ -45,10 +46,10 @@ impl ToolResult {
 /// `dispatch_with_approver` match arms below — every name here must have a
 /// handler, and vice versa.
 pub fn builtin_tool_specs() -> Vec<ToolSpec> {
-    vec![
+    let mut specs = vec![
         ToolSpec {
             name: "read".into(),
-            description: "Read a project file (line-numbered output).".into(),
+            description: "Read a project file (line-numbered output). The result is prefixed with the exact line window shown (e.g. lines 1-500 of 3200) — if it says the file continues, pass offset=<next line> to keep reading; never treat a partial read as the whole file.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -166,11 +167,76 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bg_stop".into(),
-            description: "Stop a running background task by id.".into(),
+            description: "Stop a running (or paused) background task by id.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": { "id": {"type": "integer"} },
                 "required": ["id"]
+            }),
+        },
+        ToolSpec {
+            name: "bg_pause".into(),
+            description: "Suspend a running background task in place (freezes it without killing the process); resume it later with bg_resume using the same id.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "id": {"type": "integer"} },
+                "required": ["id"]
+            }),
+        },
+        ToolSpec {
+            name: "bg_resume".into(),
+            description: "Continue a previously-paused background task, exactly where it stopped.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "id": {"type": "integer"} },
+                "required": ["id"]
+            }),
+        },
+        // --- Verification: tests + visual (browser) ---
+        ToolSpec {
+            name: "test".into(),
+            description: "Run the project's test suite. Auto-detects the test runner from the repo (cargo test / npm|pnpm|yarn test / python -m pytest / go test / make test); pass an explicit `command` to override when a targeted run is needed (single test, extra flags). Bounded by timeout_secs (default 300). Returns the exit code plus a parsed pass/fail summary — treat a nonzero exit as a failing suite and read the stderr below it.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Explicit test command to run instead of auto-detection"},
+                    "timeout_secs": {"type": "integer"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "browser".into(),
+            description: "Open a URL in the user's default web browser so the running app can be visually inspected. Use AFTER starting a dev server (bash background=true + bg_output). Accepts http(s):// URLs and localhost:port-style addresses (http:// scheme is added automatically for bare host:port). The human looks at the page — tell them what to check and ask what they see.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "url": {"type": "string"} },
+                "required": ["url"]
+            }),
+        },
+        ToolSpec {
+            name: "device".into(),
+            description: "Test on an Android device via adb — over USB debugging or wireless (adb connect). Actions: devices (list USB+wireless), connect <host:port> (wireless debug), disconnect <host:port>, install <apk_path>, uninstall <package>, launch <package> [activity] (start the app), screenshot [out] (PNG into the project), screenrecord [out] [seconds] (MP4 screen capture, 1-30s, default 10), logcat [filter] [max_lines] (bounded crash/console dump), logcat_clear (reset the buffer), shell <command> (arbitrary device shell — the escape hatch), pair <host_port> <code> (wireless pairing), info (model / Android version / SDK), reverse [local_port] [device_port] (expose a host port on the device — needed for app/webview debugging), forward [local_port] [device_port] (expose a device port on the host), input <event> (UI automation: tap/swipe/keyevent/type), pull <remote> [out] (copy a file off the device), push <out> <remote> (copy a file onto the device). Requires the Android platform-tools `adb` on PATH and a device authorized for debugging.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["devices", "connect", "disconnect", "install", "uninstall", "launch", "screenshot", "screenrecord", "logcat", "logcat_clear", "shell", "pair", "info", "reverse", "forward", "input", "pull", "push"]},
+                    "target": {"type": "string", "description": "host:port for connect/disconnect"},
+                    "path": {"type": "string", "description": "APK path for install"},
+                    "package": {"type": "string", "description": "app package for uninstall/launch"},
+                    "activity": {"type": "string", "description": "optional activity (relative or fully-qualified) for launch"},
+                    "command": {"type": "string", "description": "device shell command for action=shell"},
+                    "filter": {"type": "string", "description": "logcat filter for action=logcat"},
+                    "max_lines": {"type": "integer", "description": "logcat tail length (default 200)"},
+                    "out": {"type": "string", "description": "output path relative to project root (screenshot/screenrecord/pull) or local file to push"},
+                    "seconds": {"type": "integer", "description": "screenrecord duration in seconds (1-30, default 10)"},
+                    "host_port": {"type": "string", "description": "host:port for wireless pairing"},
+                    "code": {"type": "string", "description": "6-digit pairing code for action=pair"},
+                    "local_port": {"type": "integer", "description": "host-side port for reverse/forward"},
+                    "device_port": {"type": "integer", "description": "device-side port for reverse/forward"},
+                    "event": {"type": "string", "description": "input event for action=input, e.g. 'tap 540 1200' or 'swipe 100 500 300 500 200' or 'text hello' or 'keyevent 4'"},
+                    "remote": {"type": "string", "description": "device path for pull/push"}
+                },
+                "required": ["action"]
             }),
         },
         // --- Git: read-only ---
@@ -380,6 +446,801 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "required": ["branch"]
             }),
         },
+        // --- Phase 6: Code Intelligence (database-free symbol index) ---
+        ToolSpec {
+            name: "code_index".into(),
+            description: "Scan the project's source files and write .agent/index.json (symbol index). Run before code_symbols/code_defs when no index exists yet.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "force": {"type": "boolean"} }
+            }),
+        },
+        ToolSpec {
+            name: "code_symbols".into(),
+            description: "Look up symbols (functions/structs/classes/enums/...) in the project index by name (substring, case-insensitive). Returns kind, file, line.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "name": {"type": "string"} },
+                "required": ["name"]
+            }),
+        },
+        ToolSpec {
+            name: "code_defs".into(),
+            description: "Go-to-definition: same as code_symbols but reports the matching definitions only, suitable for 'where is X defined?'.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "name": {"type": "string"} },
+                "required": ["name"]
+            }),
+        },
+        ToolSpec {
+            name: "code_refs".into(),
+            description: "Find references to a symbol across the project (and configured extra project roots) via ripgrep. Word-boundary matching, file:line:text output.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "max": {"type": "integer"}
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolSpec {
+            name: "code_rename".into(),
+            description: "Propose a reference-update plan for renaming symbol `old` to `new` (word-boundary). Reports each file and the affected lines. It never writes — applying the edits is left to a separate review step.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "old": {"type": "string"},
+                    "new": {"type": "string"}
+                },
+                "required": ["old", "new"]
+            }),
+        },
+    ];
+    specs.extend(platform_tool_specs());
+    specs
+}
+
+/// Tool specs for the platform-CLI integrations (gh/supabase/vercel/aws/…).
+/// Kept separate so the file stays navigable. Names must match the
+/// `do_platform` dispatch arms exactly.
+pub fn platform_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        // --- GitHub ---
+        ToolSpec {
+            name: "gh_issue_list".into(),
+            description: "List GitHub issues (state=open/closed).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "state": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "label": {"type": "string"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "gh_issue_view".into(),
+            description: "View a single GitHub issue.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "number": {"type": "string"} },
+                "required": ["number"]
+            }),
+        },
+        ToolSpec {
+            name: "gh_issue_create".into(),
+            description: "Create a GitHub issue (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "label": {"type": "string"}
+                },
+                "required": ["title"]
+            }),
+        },
+        ToolSpec {
+            name: "gh_issue_close".into(),
+            description: "Close a GitHub issue (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "number": {"type": "string"} },
+                "required": ["number"]
+            }),
+        },
+        ToolSpec {
+            name: "gh_pr_list".into(),
+            description: "List GitHub pull requests (state=open/closed).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "state": {"type": "string"},
+                    "limit": {"type": "integer"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "gh_pr_view".into(),
+            description: "View a single GitHub pull request.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "number": {"type": "string"} },
+                "required": ["number"]
+            }),
+        },
+        ToolSpec {
+            name: "gh_pr_create".into(),
+            description: "Create a GitHub pull request (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "base": {"type": "string"}
+                },
+                "required": ["title"]
+            }),
+        },
+        ToolSpec {
+            name: "gh_pr_merge".into(),
+            description: "Merge a GitHub pull request (requires approval). method=merge/squash/rebase.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": {"type": "string"},
+                    "method": {"type": "string"},
+                    "delete_branch": {"type": "boolean"}
+                },
+                "required": ["number"]
+            }),
+        },
+        ToolSpec {
+            name: "gh_release_list".into(),
+            description: "List GitHub releases.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "limit": {"type": "integer"} }
+            }),
+        },
+        ToolSpec {
+            name: "gh_release_create".into(),
+            description: "Create a GitHub release (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "tag": {"type": "string"},
+                    "title": {"type": "string"},
+                    "notes": {"type": "string"}
+                },
+                "required": ["tag"]
+            }),
+        },
+        ToolSpec {
+            name: "gh_workflow_list".into(),
+            description: "List GitHub Actions workflows.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "gh_workflow_run".into(),
+            description: "Trigger a GitHub Actions workflow (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "workflow": {"type": "string"},
+                    "ref": {"type": "string"}
+                },
+                "required": ["workflow"]
+            }),
+        },
+        ToolSpec {
+            name: "gh_run_list".into(),
+            description: "List GitHub Actions runs.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "workflow": {"type": "string"},
+                    "limit": {"type": "integer"}
+                }
+            }),
+        },
+        // --- Supabase ---
+        ToolSpec {
+            name: "supabase_login".into(),
+            description: "Log in to Supabase (opens browser, requires approval).".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "supabase_link".into(),
+            description: "Link the project to a Supabase remote (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "project_ref": {"type": "string"} }
+            }),
+        },
+        ToolSpec {
+            name: "supabase_projects_list".into(),
+            description: "List Supabase projects.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "supabase_status".into(),
+            description: "Show local Supabase dev service status.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "supabase_db_push".into(),
+            description: "Push local migrations to the linked remote database (requires approval).".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "supabase_db_diff".into(),
+            description: "Generate a DB diff against the linked remote.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string"},
+                    "linked": {"type": "boolean"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "supabase_functions_list".into(),
+            description: "List Supabase Edge Functions.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "supabase_functions_deploy".into(),
+            description: "Deploy a Supabase Edge Function (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "function": {"type": "string"},
+                    "project_ref": {"type": "string"},
+                    "no_verify_jwt": {"type": "boolean"}
+                },
+                "required": ["function"]
+            }),
+        },
+        // --- Vercel ---
+        ToolSpec {
+            name: "vercel_whoami".into(),
+            description: "Show the logged-in Vercel user.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "vercel_projects_list".into(),
+            description: "List Vercel projects.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "vercel_env_list".into(),
+            description: "List Vercel environment variables.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "env": {"type": "string"},
+                    "project": {"type": "string"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "vercel_deploy".into(),
+            description: "Deploy to Vercel (requires approval). prod=true deploys to production.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "prod": {"type": "boolean"},
+                    "target": {"type": "string"},
+                    "project": {"type": "string"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "vercel_logs".into(),
+            description: "Show Vercel deployment logs.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "deployment": {"type": "string"},
+                    "project": {"type": "string"},
+                    "follow": {"type": "boolean"}
+                }
+            }),
+        },
+        // --- Docker ---
+        ToolSpec {
+            name: "docker_ps".into(),
+            description: "List docker containers (all=true includes stopped).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "all": {"type": "boolean"} }
+            }),
+        },
+        ToolSpec {
+            name: "docker_images".into(),
+            description: "List docker images.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "docker_compose_up".into(),
+            description: "docker compose up (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "services": {"type": "array", "items": {"type": "string"}},
+                    "detached": {"type": "boolean"},
+                    "build": {"type": "boolean"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "docker_compose_down".into(),
+            description: "docker compose down (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "volumes": {"type": "boolean"} }
+            }),
+        },
+        ToolSpec {
+            name: "docker_compose_logs".into(),
+            description: "docker compose logs.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string"},
+                    "follow": {"type": "boolean"}
+                }
+            }),
+        },
+        // --- Kubernetes ---
+        ToolSpec {
+            name: "k8s_get".into(),
+            description: "kubectl get resources (pods/services/deployments/…).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "resource": {"type": "string"},
+                    "name": {"type": "string"},
+                    "namespace": {"type": "string"},
+                    "all_namespaces": {"type": "boolean"}
+                },
+                "required": ["resource"]
+            }),
+        },
+        ToolSpec {
+            name: "k8s_logs".into(),
+            description: "kubectl logs for a pod.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pod": {"type": "string"},
+                    "container": {"type": "string"},
+                    "namespace": {"type": "string"},
+                    "follow": {"type": "boolean"}
+                },
+                "required": ["pod"]
+            }),
+        },
+        ToolSpec {
+            name: "k8s_apply".into(),
+            description: "kubectl apply -f a manifest (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "namespace": {"type": "string"}
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: "k8s_rollout_status".into(),
+            description: "kubectl rollout status for a deployment.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "resource": {"type": "string"},
+                    "namespace": {"type": "string"}
+                },
+                "required": ["resource"]
+            }),
+        },
+        // --- Terraform ---
+        ToolSpec {
+            name: "tf_init".into(),
+            description: "terraform init (requires approval).".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "tf_validate".into(),
+            description: "terraform validate.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "tf_plan".into(),
+            description: "terraform plan (optionally -out=<file>).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "out": {"type": "string"} }
+            }),
+        },
+        ToolSpec {
+            name: "tf_apply".into(),
+            description: "terraform apply (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plan_file": {"type": "string"},
+                    "auto_approve": {"type": "boolean"}
+                }
+            }),
+        },
+        // --- CircleCI ---
+        ToolSpec {
+            name: "circleci_validate".into(),
+            description: "circleci config validate.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "config": {"type": "string"} }
+            }),
+        },
+        ToolSpec {
+            name: "circleci_builds".into(),
+            description: "List CircleCI builds for a project.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "branch": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["project"]
+            }),
+        },
+        // --- AWS ---
+        ToolSpec {
+            name: "aws_whoami".into(),
+            description: "Show the active AWS identity (sts get-caller-identity).".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "aws_s3_ls".into(),
+            description: "List S3 buckets or objects under a prefix.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": {"type": "string"} }
+            }),
+        },
+        ToolSpec {
+            name: "aws_s3_sync".into(),
+            description: "Sync files to/from S3 (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "dest": {"type": "string"}
+                },
+                "required": ["source", "dest"]
+            }),
+        },
+        ToolSpec {
+            name: "aws_ecr_login".into(),
+            description: "Print an ECR docker login token (requires approval).".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "aws_lambda_list".into(),
+            description: "List AWS Lambda functions.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "aws_lambda_invoke".into(),
+            description: "Invoke an AWS Lambda function (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "function": {"type": "string"},
+                    "payload": {"type": "string"}
+                },
+                "required": ["function"]
+            }),
+        },
+        ToolSpec {
+            name: "aws_ecs_list_clusters".into(),
+            description: "List ECS clusters.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "aws_ecs_force_deploy".into(),
+            description: "Force a new deployment of an ECS service (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "string"},
+                    "service": {"type": "string"}
+                },
+                "required": ["cluster", "service"]
+            }),
+        },
+        // --- AWS SAM / CloudFormation ---
+        ToolSpec {
+            name: "sam_build".into(),
+            description: "sam build (requires approval).".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "sam_deploy".into(),
+            description: "sam deploy (requires approval). guided=true for interactive prompts.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "guided": {"type": "boolean"},
+                    "stack_name": {"type": "string"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "cloudformation_describe".into(),
+            description: "aws cloudformation describe-stacks for a stack.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "stack": {"type": "string"} },
+                "required": ["stack"]
+            }),
+        },
+        ToolSpec {
+            name: "cloudformation_deploy".into(),
+            description: "aws cloudformation deploy a template to a stack (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "template": {"type": "string"},
+                    "stack": {"type": "string"}
+                },
+                "required": ["template", "stack"]
+            }),
+        },
+        // --- Azure ---
+        ToolSpec {
+            name: "az_whoami".into(),
+            description: "Show the active Azure account.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "az_webapp_list".into(),
+            description: "List Azure App Service web apps.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "az_webapp_deploy".into(),
+            description: "Deploy to an Azure web app (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "resource_group": {"type": "string"},
+                    "source": {"type": "string"}
+                },
+                "required": ["name", "resource_group", "source"]
+            }),
+        },
+        ToolSpec {
+            name: "az_functionapp_deploy".into(),
+            description: "Deploy an Azure Functions app (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "resource_group": {"type": "string"},
+                    "source": {"type": "string"}
+                },
+                "required": ["name", "resource_group", "source"]
+            }),
+        },
+        // --- Google Cloud ---
+        ToolSpec {
+            name: "gcloud_whoami".into(),
+            description: "Show the active gcloud config/account.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "gcloud_app_deploy".into(),
+            description: "Deploy to Google App Engine (requires approval).".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "gcloud_run_deploy".into(),
+            description: "Deploy a container image to Cloud Run (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string"},
+                    "image": {"type": "string"},
+                    "region": {"type": "string"}
+                },
+                "required": ["service", "image"]
+            }),
+        },
+        ToolSpec {
+            name: "gcloud_run_services".into(),
+            description: "List Cloud Run services.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        // --- Helm ---
+        ToolSpec {
+            name: "helm_list".into(),
+            description: "helm list releases.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "namespace": {"type": "string"} }
+            }),
+        },
+        ToolSpec {
+            name: "helm_status".into(),
+            description: "helm status for a release.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "release": {"type": "string"},
+                    "namespace": {"type": "string"}
+                },
+                "required": ["release"]
+            }),
+        },
+        ToolSpec {
+            name: "helm_install".into(),
+            description: "helm install a chart (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "release": {"type": "string"},
+                    "chart": {"type": "string"},
+                    "namespace": {"type": "string"}
+                },
+                "required": ["release", "chart"]
+            }),
+        },
+        ToolSpec {
+            name: "helm_upgrade".into(),
+            description: "helm upgrade a release (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "release": {"type": "string"},
+                    "chart": {"type": "string"},
+                    "namespace": {"type": "string"}
+                },
+                "required": ["release", "chart"]
+            }),
+        },
+        ToolSpec {
+            name: "helm_uninstall".into(),
+            description: "helm uninstall a release (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "release": {"type": "string"},
+                    "namespace": {"type": "string"}
+                },
+                "required": ["release"]
+            }),
+        },
+        // --- Fly.io ---
+        ToolSpec {
+            name: "fly_whoami".into(),
+            description: "Show the logged-in Fly.io user.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "fly_apps_list".into(),
+            description: "List Fly.io apps.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "fly_deploy".into(),
+            description: "Deploy to Fly.io (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "image": {"type": "string"},
+                    "app": {"type": "string"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "fly_status".into(),
+            description: "Show Fly.io app status.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "app": {"type": "string"} },
+                "required": ["app"]
+            }),
+        },
+        // --- Railway ---
+        ToolSpec {
+            name: "railway_whoami".into(),
+            description: "Show the logged-in Railway user.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "railway_status".into(),
+            description: "Show Railway project status.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "railway_up".into(),
+            description: "Deploy to Railway (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "detach": {"type": "boolean"} }
+            }),
+        },
+        // --- Render ---
+        ToolSpec {
+            name: "render_whoami".into(),
+            description: "Show the logged-in Render user.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "render_services".into(),
+            description: "List Render services.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "render_deploy".into(),
+            description: "Trigger a deploy for a Render service (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "service_id": {"type": "string"} },
+                "required": ["service_id"]
+            }),
+        },
+        // --- Netlify ---
+        ToolSpec {
+            name: "netlify_whoami".into(),
+            description: "Show the logged-in Netlify user.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "netlify_sites".into(),
+            description: "List Netlify sites.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "netlify_deploy".into(),
+            description: "Deploy to Netlify (requires approval). prod=true deploys to production.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "dir": {"type": "string"},
+                    "prod": {"type": "boolean"},
+                    "site": {"type": "string"}
+                },
+                "required": ["dir"]
+            }),
+        },
+        // --- Firebase ---
+        ToolSpec {
+            name: "firebase_projects".into(),
+            description: "List Firebase projects.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "firebase_deploy".into(),
+            description: "Deploy to Firebase Hosting / Functions (requires approval).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "only": {"type": "string"} }
+            }),
+        },
+        ToolSpec {
+            name: "firebase_functions".into(),
+            description: "List Firebase Functions.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
     ]
 }
 
@@ -392,6 +1253,8 @@ pub struct ToolManager {
     mcp_clients: Vec<McpClient>,
     plugins: Vec<LoadedPlugin>,
     git: GitEngine,
+    platform: PlatformEngine,
+    device: DeviceEngine,
     cancel: Arc<AtomicBool>,
     /// Plan mode: read-only research/proposal, no mutating tool calls. Set
     /// via `set_plan_mode`; enforced centrally in `dispatch_with_approver`
@@ -407,9 +1270,14 @@ pub struct ToolManager {
 fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
-        "read"
+            "read"
             | "grep"
             | "glob"
+            | "code_index"
+            | "code_symbols"
+            | "code_defs"
+            | "code_refs"
+            | "code_rename"
             | "bg_list"
             | "bg_output"
             | "git_status"
@@ -454,6 +1322,14 @@ impl ToolManager {
             workspace.project_root.clone(),
             PermissionGate::new(workspace.settings.clone(), workspace.project_root.clone()),
         );
+        let platform = PlatformEngine::new(
+            workspace.project_root.clone(),
+            PermissionGate::new(workspace.settings.clone(), workspace.project_root.clone()),
+        );
+        let device = DeviceEngine::new(
+            workspace.project_root.clone(),
+            PermissionGate::new(workspace.settings.clone(), workspace.project_root.clone()),
+        );
         Self {
             workspace,
             terminal,
@@ -462,6 +1338,8 @@ impl ToolManager {
             mcp_clients,
             plugins,
             git,
+            platform,
+            device,
             cancel,
             plan_mode: AtomicBool::new(false),
         }
@@ -581,9 +1459,19 @@ impl ToolManager {
             "copy" => self.do_copy(&args, approver),
             "grep" => self.do_grep(&args),
             "glob" => self.do_glob(&args),
+            "code_index" => self.do_code_index(&args),
+            "code_symbols" => self.do_code_symbols(&args),
+            "code_defs" => self.do_code_defs(&args),
+            "code_refs" => self.do_code_refs(&args),
+            "code_rename" => self.do_code_rename(&args),
             "bash" => self.do_bash(&args, approver),
+            "test" => self.do_test(&args, approver),
+            "browser" => self.do_browser(&args),
+            "device" => self.do_device(&args, approver),
             "bg_list" => self.do_bg_list(),
             "bg_output" => self.do_bg_output(&args),
+            "bg_pause" => self.do_bg_pause(&args),
+            "bg_resume" => self.do_bg_resume(&args),
             "bg_stop" => self.do_bg_stop(&args),
             "git_status" => git_result(self.git.status()),
             "git_diff" => self.do_git_diff(&args),
@@ -610,6 +1498,88 @@ impl ToolManager {
             "git_cherry_pick" => self.do_git_cherry_pick(&args, approver),
             "git_rebase" => self.do_git_rebase(&args, approver),
             "git_merge" => self.do_git_merge(&args, approver),
+            "gh_issue_list" => self.do_platform("gh_issue_list", &args, approver),
+            "gh_issue_view" => self.do_platform("gh_issue_view", &args, approver),
+            "gh_issue_create" => self.do_platform("gh_issue_create", &args, approver),
+            "gh_issue_close" => self.do_platform("gh_issue_close", &args, approver),
+            "gh_pr_list" => self.do_platform("gh_pr_list", &args, approver),
+            "gh_pr_view" => self.do_platform("gh_pr_view", &args, approver),
+            "gh_pr_create" => self.do_platform("gh_pr_create", &args, approver),
+            "gh_pr_merge" => self.do_platform("gh_pr_merge", &args, approver),
+            "gh_release_list" => self.do_platform("gh_release_list", &args, approver),
+            "gh_release_create" => self.do_platform("gh_release_create", &args, approver),
+            "gh_workflow_list" => self.do_platform("gh_workflow_list", &args, approver),
+            "gh_workflow_run" => self.do_platform("gh_workflow_run", &args, approver),
+            "gh_run_list" => self.do_platform("gh_run_list", &args, approver),
+            "supabase_login" => self.do_platform("supabase_login", &args, approver),
+            "supabase_link" => self.do_platform("supabase_link", &args, approver),
+            "supabase_projects_list" => self.do_platform("supabase_projects_list", &args, approver),
+            "supabase_status" => self.do_platform("supabase_status", &args, approver),
+            "supabase_db_push" => self.do_platform("supabase_db_push", &args, approver),
+            "supabase_db_diff" => self.do_platform("supabase_db_diff", &args, approver),
+            "supabase_functions_list" => self.do_platform("supabase_functions_list", &args, approver),
+            "supabase_functions_deploy" => self.do_platform("supabase_functions_deploy", &args, approver),
+            "vercel_whoami" => self.do_platform("vercel_whoami", &args, approver),
+            "vercel_projects_list" => self.do_platform("vercel_projects_list", &args, approver),
+            "vercel_env_list" => self.do_platform("vercel_env_list", &args, approver),
+            "vercel_deploy" => self.do_platform("vercel_deploy", &args, approver),
+            "vercel_logs" => self.do_platform("vercel_logs", &args, approver),
+            "docker_ps" => self.do_platform("docker_ps", &args, approver),
+            "docker_images" => self.do_platform("docker_images", &args, approver),
+            "docker_compose_up" => self.do_platform("docker_compose_up", &args, approver),
+            "docker_compose_down" => self.do_platform("docker_compose_down", &args, approver),
+            "docker_compose_logs" => self.do_platform("docker_compose_logs", &args, approver),
+            "k8s_get" => self.do_platform("k8s_get", &args, approver),
+            "k8s_logs" => self.do_platform("k8s_logs", &args, approver),
+            "k8s_apply" => self.do_platform("k8s_apply", &args, approver),
+            "k8s_rollout_status" => self.do_platform("k8s_rollout_status", &args, approver),
+            "tf_init" => self.do_platform("tf_init", &args, approver),
+            "tf_validate" => self.do_platform("tf_validate", &args, approver),
+            "tf_plan" => self.do_platform("tf_plan", &args, approver),
+            "tf_apply" => self.do_platform("tf_apply", &args, approver),
+            "circleci_validate" => self.do_platform("circleci_validate", &args, approver),
+            "circleci_builds" => self.do_platform("circleci_builds", &args, approver),
+            "aws_whoami" => self.do_platform("aws_whoami", &args, approver),
+            "aws_s3_ls" => self.do_platform("aws_s3_ls", &args, approver),
+            "aws_s3_sync" => self.do_platform("aws_s3_sync", &args, approver),
+            "aws_ecr_login" => self.do_platform("aws_ecr_login", &args, approver),
+            "aws_lambda_list" => self.do_platform("aws_lambda_list", &args, approver),
+            "aws_lambda_invoke" => self.do_platform("aws_lambda_invoke", &args, approver),
+            "aws_ecs_list_clusters" => self.do_platform("aws_ecs_list_clusters", &args, approver),
+            "aws_ecs_force_deploy" => self.do_platform("aws_ecs_force_deploy", &args, approver),
+            "sam_build" => self.do_platform("sam_build", &args, approver),
+            "sam_deploy" => self.do_platform("sam_deploy", &args, approver),
+            "cloudformation_describe" => self.do_platform("cloudformation_describe", &args, approver),
+            "cloudformation_deploy" => self.do_platform("cloudformation_deploy", &args, approver),
+            "az_whoami" => self.do_platform("az_whoami", &args, approver),
+            "az_webapp_list" => self.do_platform("az_webapp_list", &args, approver),
+            "az_webapp_deploy" => self.do_platform("az_webapp_deploy", &args, approver),
+            "az_functionapp_deploy" => self.do_platform("az_functionapp_deploy", &args, approver),
+            "gcloud_whoami" => self.do_platform("gcloud_whoami", &args, approver),
+            "gcloud_app_deploy" => self.do_platform("gcloud_app_deploy", &args, approver),
+            "gcloud_run_deploy" => self.do_platform("gcloud_run_deploy", &args, approver),
+            "gcloud_run_services" => self.do_platform("gcloud_run_services", &args, approver),
+            "helm_list" => self.do_platform("helm_list", &args, approver),
+            "helm_status" => self.do_platform("helm_status", &args, approver),
+            "helm_install" => self.do_platform("helm_install", &args, approver),
+            "helm_upgrade" => self.do_platform("helm_upgrade", &args, approver),
+            "helm_uninstall" => self.do_platform("helm_uninstall", &args, approver),
+            "fly_whoami" => self.do_platform("fly_whoami", &args, approver),
+            "fly_apps_list" => self.do_platform("fly_apps_list", &args, approver),
+            "fly_deploy" => self.do_platform("fly_deploy", &args, approver),
+            "fly_status" => self.do_platform("fly_status", &args, approver),
+            "railway_whoami" => self.do_platform("railway_whoami", &args, approver),
+            "railway_status" => self.do_platform("railway_status", &args, approver),
+            "railway_up" => self.do_platform("railway_up", &args, approver),
+            "render_whoami" => self.do_platform("render_whoami", &args, approver),
+            "render_services" => self.do_platform("render_services", &args, approver),
+            "render_deploy" => self.do_platform("render_deploy", &args, approver),
+            "netlify_whoami" => self.do_platform("netlify_whoami", &args, approver),
+            "netlify_sites" => self.do_platform("netlify_sites", &args, approver),
+            "netlify_deploy" => self.do_platform("netlify_deploy", &args, approver),
+            "firebase_projects" => self.do_platform("firebase_projects", &args, approver),
+            "firebase_deploy" => self.do_platform("firebase_deploy", &args, approver),
+            "firebase_functions" => self.do_platform("firebase_functions", &args, approver),
             other => {
                 if let Some(rest) = other.strip_prefix("mcp__") {
                     self.do_mcp_call(rest, args, approver)
@@ -716,16 +1686,58 @@ impl ToolManager {
             })
     }
 
+    fn opt_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+        args.get(key).and_then(|v| v.as_str())
+    }
+
+    fn usize_arg(args: &Value, key: &str) -> Option<usize> {
+        args.get(key)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    fn opt_bool_arg(args: &Value, key: &str) -> Option<bool> {
+        args.get(key).and_then(|v| v.as_bool())
+    }
+
+    fn str_array_arg(args: &Value, key: &str) -> Vec<String> {
+        args.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    }
+
     fn do_read(&self, args: &Value) -> Result<ToolResult> {
         let path = Self::str_arg(args, "path")?;
         let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
         let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-        match self
-            .workspace
-            .files
-            .read(Path::new(path), ReadOptions { offset, limit })
-        {
-            Ok(r) => Ok(ToolResult::ok(r.content)),
+        // Default-bounded read so an unguarded look at a huge generated file
+        // can't fill the context — and the header below always states the
+        // visible window, so a partial read is never mistaken for the file.
+        let eff_limit = limit.unwrap_or(1500);
+        let start = offset.unwrap_or(0);
+        match self.workspace.files.read(
+            Path::new(path),
+            ReadOptions {
+                offset,
+                limit: Some(eff_limit),
+            },
+        ) {
+            Ok(r) => {
+                let visible_end = (start + eff_limit).min(r.total_lines);
+                let header = if visible_end < r.total_lines {
+                    format!(
+                        "[read {path}: lines {}-{} of {} — NOT the whole file; pass offset={visible_end} to continue]\n",
+                        r.start_line, visible_end, r.total_lines
+                    )
+                } else {
+                    format!(
+                        "[read {path}: full contents, lines {}-{} of {}]\n",
+                        r.start_line, visible_end, r.total_lines
+                    )
+                };
+                Ok(ToolResult::ok(format!("{header}{}", r.content)))
+            }
             Err(e) => Ok(ToolResult::err(e.to_string())),
         }
     }
@@ -839,11 +1851,17 @@ impl ToolManager {
             path: None,
         }) {
             Ok(hits) => {
-                let text = hits
+                let capped = max_matches > 0 && hits.len() >= max_matches;
+                let mut text = hits
                     .iter()
                     .map(|h| format!("{}:{}:{}", h.path.display(), h.line, h.text))
                     .collect::<Vec<_>>()
                     .join("\n");
+                if capped {
+                    text.push_str(&format!(
+                        "\n[truncated: hit the {max_matches}-match cap — MORE matches exist. Refine the pattern/glob or raise max before concluding anything is exhaustive.]"
+                    ));
+                }
                 Ok(ToolResult::ok(if text.is_empty() {
                     "(no matches)".to_string()
                 } else {
@@ -859,11 +1877,17 @@ impl ToolManager {
         let max = args.get("max").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
         match self.workspace.search.glob(pattern, max) {
             Ok(hits) => {
-                let text = hits
+                let capped = max > 0 && hits.len() >= max;
+                let mut text = hits
                     .iter()
                     .map(|h| h.path.display().to_string())
                     .collect::<Vec<_>>()
                     .join("\n");
+                if capped {
+                    text.push_str(&format!(
+                        "\n[truncated: hit the {max}-file cap — more files match. Narrow the pattern or raise max before treating this as the full list.]"
+                    ));
+                }
                 Ok(ToolResult::ok(if text.is_empty() {
                     "(no files)".to_string()
                 } else {
@@ -872,6 +1896,165 @@ impl ToolManager {
             }
             Err(e) => Ok(ToolResult::err(e.to_string())),
         }
+    }
+
+    fn do_code_index(&self, args: &Value) -> Result<ToolResult> {
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+        let root = self.workspace.project_root.clone();
+
+        if !force {
+            if let Ok(Some(idx)) = SymbolIndex::load(&root) {
+                return Ok(ToolResult::ok(format!(
+                    "index already exists: {} symbol(s) in {} file(s); pass force=true to rebuild",
+                    idx.symbols.len(),
+                    idx.scanned_files
+                )));
+            }
+        }
+        match IndexEngine::new(&root).scan() {
+            Ok(idx) => match idx.save(&root) {
+                Ok(_) => Ok(ToolResult::ok(format!(
+                    "indexed {} symbol(s) in {} file(s) -> {}",
+                    idx.symbols.len(),
+                    idx.scanned_files,
+                    SymbolIndex::file_path(&root).display()
+                ))),
+                Err(e) => Ok(ToolResult::err(format!("could not save index: {e}"))),
+            },
+            Err(e) => Ok(ToolResult::err(format!("scan failed: {e}"))),
+        }
+    }
+
+    fn do_code_symbols(&self, args: &Value) -> Result<ToolResult> {
+        let name = Self::str_arg(args, "name")?.to_string();
+        self.report_index_query(&name)
+    }
+
+    fn do_code_defs(&self, args: &Value) -> Result<ToolResult> {
+        let name = Self::str_arg(args, "name")?.to_string();
+        let root = self.workspace.project_root.clone();
+        match SymbolIndex::load(&root) {
+            Ok(Some(idx)) => {
+                let hits = idx.query(&name);
+                if hits.is_empty() {
+                    return Ok(ToolResult::ok(format!(
+                        "no definition for '{name}' in the current index; the index is regex-based and best-effort, so absence is not proof the symbol doesn't exist. Verify with code_symbols or a targeted grep before concluding anything."
+                    )));
+                }
+                let text = hits
+                    .iter()
+                    .map(|s| format!("{}:{}:{}  {}", s.file, s.line, s.kind, s.name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(ToolResult::ok(format!(
+                    "{} definition(s) for '{name}':\n{text}",
+                    hits.len()
+                )))
+            }
+            Ok(None) => Ok(ToolResult::err("no index; run code_index first")),
+            Err(e) => Ok(ToolResult::err(e.to_string())),
+        }
+    }
+
+    fn report_index_query(&self, name: &str) -> Result<ToolResult> {
+        let root = self.workspace.project_root.clone();
+        match SymbolIndex::load(&root) {
+            Ok(Some(idx)) => {
+                let hits = idx.query(name);
+                if hits.is_empty() {
+                    return Ok(ToolResult::ok(format!(
+                        "no symbols matching '{name}' in the index; the index is regex-based and best-effort, so absence is not proof of non-existence. Fall back to grep/glob for a definitive check."
+                    )));
+                }
+                let text = hits
+                    .iter()
+                    .map(|s| format!("{:8} {}:{}  {}", s.kind, s.file, s.line, s.name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(ToolResult::ok(format!(
+                    "{} match(es) for '{name}':\n{text}",
+                    hits.len()
+                )))
+            }
+            Ok(None) => Ok(ToolResult::err("no index; run code_index first")),
+            Err(e) => Ok(ToolResult::err(e.to_string())),
+        }
+    }
+
+    fn do_code_refs(&self, args: &Value) -> Result<ToolResult> {
+        let name = Self::str_arg(args, "name")?;
+        let max = args.get("max").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+        match self.workspace.search.grep(SearchOptions {
+            pattern: word_boundary(name),
+            glob: None,
+            case_insensitive: false,
+            max_matches: max,
+            path: None,
+        }) {
+            Ok(hits) => {
+                let capped = max > 0 && hits.len() >= max;
+                let hits = filter_out_own_index(&self.workspace.project_root, hits);
+                let mut text = hits
+                    .iter()
+                    .map(|h| format!("{}:{}:{}", h.path.display(), h.line, h.text))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if capped {
+                    text.push_str(&format!(
+                        "\n[truncated: hit the {max}-reference cap — MORE references may exist. Raise max or refine before treating this as exhaustive.]"
+                    ));
+                }
+                Ok(ToolResult::ok(if text.is_empty() {
+                    format!("no references to '{name}'")
+                } else {
+                    format!("{} reference(s) to '{name}':\n{text}", hits.len())
+                }))
+            }
+            Err(e) => Ok(ToolResult::err(e.to_string())),
+        }
+    }
+
+    fn do_code_rename(&self, args: &Value) -> Result<ToolResult> {
+        let old = Self::str_arg(args, "old")?;
+        let new = Self::str_arg(args, "new")?;
+        let hits = match self.workspace.search.grep(SearchOptions {
+            pattern: word_boundary(old),
+            glob: None,
+            case_insensitive: false,
+            max_matches: 2000,
+            path: None,
+        }) {
+            Ok(h) => h,
+            Err(e) => return Ok(ToolResult::err(e.to_string())),
+        };
+        let hits = filter_out_own_index(&self.workspace.project_root, hits);
+        if hits.is_empty() {
+            return Ok(ToolResult::ok(format!("no references to '{old}'")));
+        }
+        let mut by_file: Vec<(std::path::PathBuf, Vec<usize>)> = Vec::new();
+        for h in &hits {
+            match by_file.iter().position(|(p, _)| *p == h.path) {
+                Some(i) => by_file[i].1.push(h.line),
+                None => by_file.push((h.path.clone(), vec![h.line])),
+            }
+        }
+        let mut out = format!(
+            "rename '{old}' -> '{new}': {} reference(s) in {} file(s)\n",
+            hits.len(),
+            by_file.len()
+        );
+        for (f, lines) in &by_file {
+            let shown: Vec<String> = lines.iter().take(5).map(|l| l.to_string()).collect();
+            let suffix = if lines.len() > 5 { ", …" } else { "" };
+            out.push_str(&format!(
+                "  {}: {} line(s) [{}]\n",
+                f.display(),
+                lines.len(),
+                shown.join(", ") + suffix
+            ));
+        }
+        out.push_str("Plan only — review and apply the edits yourself before they take effect.");
+        Ok(ToolResult::ok(out))
     }
 
     fn do_bash<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
@@ -953,6 +2136,160 @@ impl ToolManager {
         }
     }
 
+    /// Run the project's tests. Auto-detects the test command from common
+    /// manifest files, or honors an explicit `command` override. Output is
+    /// the same bounded format as `bash` plus a parsed pass/fail summary so
+    /// the model gets a verdict without scraping raw logs.
+    fn do_test<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        let root = self.workspace.project_root.clone();
+        let command = match Self::str_arg(args, "command") {
+            Ok(c) if !c.trim().is_empty() => c.trim().to_string(),
+            _ => match detect_test_command(&root) {
+                Some(c) => c,
+                None => {
+                    return Ok(ToolResult::err(format!(
+                        "couldn't auto-detect a test command in {}. Pass an explicit `command` (e.g. \"cargo test\" or \"pytest -q\").",
+                        root.display()
+                    )));
+                }
+            },
+        };
+        let timeout = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .map(Duration::from_secs)
+            .or(Some(Duration::from_secs(300)));
+        let opts = TerminalOptions {
+            cwd: root.clone(),
+            timeout,
+            sandbox: Sandbox::RestrictedFs,
+            profile: CommandProfile::Foreground,
+            use_pty: false,
+        };
+        match self.terminal.run(
+            &command,
+            &self.workspace.files.gate,
+            opts,
+            self.cancel.clone(),
+            &mut *approver,
+        ) {
+            Ok(out) => {
+                let summary = summarize_test_output(&out.stdout);
+                let text = format!(
+                    "command: {command}\nexit={:?} cancelled={} timed_out={}\n[test summary]\n{summary}\n--- stdout ---\n{}--- stderr ---\n{}{}",
+                    out.exit_code,
+                    out.cancelled,
+                    out.timed_out,
+                    out.stdout,
+                    out.stderr,
+                    if out.truncated { "\n(output truncated)" } else { "" }
+                );
+                if out.exit_code == Some(0) && !out.cancelled && !out.timed_out {
+                    Ok(ToolResult::ok(text))
+                } else {
+                    Ok(ToolResult::err(text))
+                }
+            }
+            Err(e) => Ok(ToolResult::err(e.to_string())),
+        }
+    }
+
+    /// Open a URL in the default browser for visual verification of a
+    /// running app. Launch-and-forget: spawns the platform opener and
+    /// returns immediately — the browser window stays open on the user's
+    /// machine while the agent keeps talking to them about what they see.
+    fn do_browser(&self, args: &Value) -> Result<ToolResult> {
+        let url = Self::str_arg(args, "url")?;
+        let url = url.trim();
+        match open_browser_url(url) {
+            Ok(()) => Ok(ToolResult::ok(format!(
+                "opened {url} in the default browser — the user is looking at it now. Readable Chrome DevTools-level DOM/inspection is not available from here; tell the user what to verify (layout, console errors, requests) and ask what they observe."
+            ))),
+            Err(e) => Ok(ToolResult::err(format!(
+                "couldn't open {url}: {e}. On non-GUI/headless machines there may be no browser to launch."
+            ))),
+        }
+    }
+
+    /// Drive an attached Android device/emulator through `adb` — USB or
+    /// wireless. Individual operations (list/connect/install/launch/logcat/
+    /// screenshot/shell) are implemented in `DeviceEngine`; this layer parses
+    /// the tool arguments and formats the result for the model.
+    fn do_device<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        let action = Self::str_arg(args, "action")?
+            .to_ascii_lowercase();
+        let device = &self.device;
+        // A no-op enum check so unknown actions are rejected before any adb
+        // call (and before the permission prompt).
+        if !matches!(
+            action.as_str(),
+            "devices" | "connect" | "disconnect" | "install" | "uninstall" | "launch" | "screenshot"
+                | "screenrecord" | "logcat" | "logcat_clear" | "shell" | "pair" | "info" | "reverse"
+                | "forward" | "input" | "pull" | "push"
+        ) {
+            return Ok(ToolResult::err(format!(
+                "unknown device action '{action}' — use one of: devices, connect, disconnect, install, uninstall, launch, screenshot, screenrecord, logcat, logcat_clear, shell, pair, info, reverse, forward, input, pull, push"
+            )));
+        }
+
+        let opt_str = |key: &str| Self::opt_str_arg(args, key).map(|s| s.to_string());
+        let req_str = |key: &str| {
+            Self::str_arg(args, key).map(|s| s.to_string()).map_err(|_| {
+                AgentError::InvalidArguments {
+                    tool: "device".into(),
+                    reason: format!("action '{action}' requires '{key}'"),
+                }
+            })
+        };
+
+        let result = match action.as_str() {
+            "devices" => device.devices(&mut *approver),
+            "connect" => device.connect(&req_str("target")?, &mut *approver),
+            "disconnect" => device.disconnect(&req_str("target")?, &mut *approver),
+            "install" => device.install(&req_str("path")?, &mut *approver),
+            "uninstall" => device.uninstall(&req_str("package")?, &mut *approver),
+            "launch" => device.launch(&req_str("package")?, opt_str("activity").as_deref(), &mut *approver),
+            "screenshot" => device.screenshot(opt_str("out").as_deref(), &mut *approver),
+            "screenrecord" => {
+                let seconds = args.get("seconds").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
+                device.screenrecord(opt_str("out").as_deref(), seconds, &mut *approver)
+            }
+            "logcat" => {
+                let max = args.get("max_lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                device.logcat(opt_str("filter").as_deref(), max, &mut *approver)
+            }
+            "logcat_clear" => device.logcat_clear(&mut *approver),
+            "shell" => device.shell(&req_str("command")?, &mut *approver),
+            "pair" => device.pair(&req_str("host_port")?, &req_str("code")?, &mut *approver),
+            "info" => device.info(&mut *approver),
+            "reverse" => {
+                let local = args.get("local_port").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let dev = args.get("device_port").and_then(|v| v.as_u64()).map(|v| v as u32);
+                device.reverse(local, dev, &mut *approver)
+            }
+            "forward" => {
+                let local = args.get("local_port").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let dev = args.get("device_port").and_then(|v| v.as_u64()).map(|v| v as u32);
+                device.forward(local, dev, &mut *approver)
+            }
+            "input" => device.input(&req_str("event")?, &mut *approver),
+            "pull" => device.pull(&req_str("remote")?, opt_str("out").as_deref(), &mut *approver),
+            "push" => device.push(&req_str("out")?, &req_str("remote")?, &mut *approver),
+            _ => unreachable!("validated above"),
+        };
+
+        match result {
+            Ok(out) => Ok(device_result(out)),
+            Err(e) => Ok(ToolResult::err(format!("device action '{action}' failed: {e}"))),
+        }
+    }
+
     fn u64_arg(args: &Value, key: &str) -> Result<u64> {
         args.get(key)
             .and_then(|v| v.as_u64())
@@ -989,6 +2326,26 @@ impl ToolManager {
         let id = Self::u64_arg(args, "id")?;
         match self.background.stop(id) {
             Ok(()) => Ok(ToolResult::ok(format!("stopped background task {id}"))),
+            Err(e) => Ok(ToolResult::err(e.to_string())),
+        }
+    }
+
+    fn do_bg_pause(&self, args: &Value) -> Result<ToolResult> {
+        let id = Self::u64_arg(args, "id")?;
+        match self.background.pause(id) {
+            Ok(()) => Ok(ToolResult::ok(format!(
+                "paused background task {id}; resume it later with bg_resume"
+            ))),
+            Err(e) => Ok(ToolResult::err(e.to_string())),
+        }
+    }
+
+    fn do_bg_resume(&self, args: &Value) -> Result<ToolResult> {
+        let id = Self::u64_arg(args, "id")?;
+        match self.background.resume(id) {
+            Ok(()) => Ok(ToolResult::ok(format!(
+                "resumed background task {id}"
+            ))),
             Err(e) => Ok(ToolResult::err(e.to_string())),
         }
     }
@@ -1161,6 +2518,315 @@ impl ToolManager {
         let branch = Self::str_arg(args, "branch")?;
         git_result(self.git.merge(branch, &mut *approver))
     }
+
+    /// Dispatch a platform-CLI tool (gh/supabase/vercel/docker/kubectl/
+    /// terraform/circleci) to the matching `PlatformEngine` method. Arguments
+    /// are read from the JSON tool args; read-only ops ignore the approver.
+    fn do_platform<F>(&self, name: &str, args: &Value, approver: &mut F) -> Result<ToolResult>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        let count = |k: &str| Self::usize_arg(args, k).unwrap_or(20);
+        let result = match name {
+            "gh_issue_list" => {
+                let label = Self::opt_str_arg(args, "label");
+                let state = Self::opt_str_arg(args, "state").unwrap_or("open");
+                platform_result(self.platform.gh_issue_list(state, count("limit"), label))
+            }
+            "gh_issue_view" => {
+                let n = Self::str_arg(args, "number")?;
+                platform_result(self.platform.gh_issue_view(n))
+            }
+            "gh_issue_create" => {
+                let title = Self::str_arg(args, "title")?;
+                let body = Self::opt_str_arg(args, "body");
+                let label = Self::opt_str_arg(args, "label");
+                platform_result(
+                    self.platform
+                        .gh_issue_create(title, body, label, &mut *approver),
+                )
+            }
+            "gh_issue_close" => {
+                let n = Self::str_arg(args, "number")?;
+                platform_result(self.platform.gh_issue_close(n, &mut *approver))
+            }
+            "gh_pr_list" => {
+                let state = Self::opt_str_arg(args, "state").unwrap_or("open");
+                platform_result(self.platform.gh_pr_list(state, count("limit")))
+            }
+            "gh_pr_view" => {
+                let n = Self::str_arg(args, "number")?;
+                platform_result(self.platform.gh_pr_view(n))
+            }
+            "gh_pr_create" => {
+                let title = Self::str_arg(args, "title")?;
+                let body = Self::opt_str_arg(args, "body");
+                let base = Self::opt_str_arg(args, "base");
+                platform_result(
+                    self.platform
+                        .gh_pr_create(title, body, base, &mut *approver),
+                )
+            }
+            "gh_pr_merge" => {
+                let n = Self::str_arg(args, "number")?;
+                let method = Self::opt_str_arg(args, "method");
+                let del = Self::opt_bool_arg(args, "delete_branch").unwrap_or(false);
+                platform_result(self.platform.gh_pr_merge(n, method, del, &mut *approver))
+            }
+            "gh_release_list" => platform_result(self.platform.gh_release_list(count("limit"))),
+            "gh_release_create" => {
+                let tag = Self::str_arg(args, "tag")?;
+                let title = Self::opt_str_arg(args, "title");
+                let notes = Self::opt_str_arg(args, "notes");
+                platform_result(self.platform.gh_release_create(tag, title, notes, &mut *approver))
+            }
+            "gh_workflow_list" => platform_result(self.platform.gh_workflow_list()),
+            "gh_workflow_run" => {
+                let wf = Self::str_arg(args, "workflow")?;
+                let r = Self::opt_str_arg(args, "ref");
+                platform_result(self.platform.gh_workflow_run(wf, r, &mut *approver))
+            }
+            "gh_run_list" => {
+                let wf = Self::opt_str_arg(args, "workflow");
+                platform_result(self.platform.gh_run_list(wf, count("limit")))
+            }
+            "supabase_login" => platform_result(self.platform.supabase_login(&mut *approver)),
+            "supabase_link" => {
+                let pr = Self::opt_str_arg(args, "project_ref");
+                platform_result(self.platform.supabase_link(pr, &mut *approver))
+            }
+            "supabase_projects_list" => platform_result(self.platform.supabase_projects_list()),
+            "supabase_status" => platform_result(self.platform.supabase_status()),
+            "supabase_db_push" => platform_result(self.platform.supabase_db_push(&mut *approver)),
+            "supabase_db_diff" => {
+                let schema = Self::opt_str_arg(args, "schema");
+                let linked = Self::opt_bool_arg(args, "linked").unwrap_or(false);
+                platform_result(self.platform.supabase_db_diff(schema, linked))
+            }
+            "supabase_functions_list" => platform_result(self.platform.supabase_functions_list()),
+            "supabase_functions_deploy" => {
+                let f = Self::str_arg(args, "function")?;
+                let pr = Self::opt_str_arg(args, "project_ref");
+                let nvj = Self::opt_bool_arg(args, "no_verify_jwt").unwrap_or(false);
+                platform_result(
+                    self.platform
+                        .supabase_functions_deploy(f, pr, nvj, &mut *approver),
+                )
+            }
+            "vercel_whoami" => platform_result(self.platform.vercel_whoami()),
+            "vercel_projects_list" => platform_result(self.platform.vercel_projects_list()),
+            "vercel_env_list" => {
+                let env = Self::opt_str_arg(args, "env");
+                let project = Self::opt_str_arg(args, "project");
+                platform_result(self.platform.vercel_env_list(env, project))
+            }
+            "vercel_deploy" => {
+                let prod = Self::opt_bool_arg(args, "prod").unwrap_or(false);
+                let target = Self::opt_str_arg(args, "target");
+                let project = Self::opt_str_arg(args, "project");
+                platform_result(self.platform.vercel_deploy(prod, target, project, &mut *approver))
+            }
+            "vercel_logs" => {
+                let dep = Self::opt_str_arg(args, "deployment");
+                let project = Self::opt_str_arg(args, "project");
+                let follow = Self::opt_bool_arg(args, "follow").unwrap_or(false);
+                platform_result(self.platform.vercel_logs(dep, project, follow))
+            }
+            "docker_ps" => {
+                let all = Self::opt_bool_arg(args, "all").unwrap_or(false);
+                platform_result(self.platform.docker_ps(all))
+            }
+            "docker_images" => platform_result(self.platform.docker_images()),
+            "docker_compose_up" => {
+                let services = Self::str_array_arg(args, "services");
+                let detached = Self::opt_bool_arg(args, "detached").unwrap_or(false);
+                let build = Self::opt_bool_arg(args, "build").unwrap_or(false);
+                platform_result(
+                    self.platform
+                        .docker_compose_up(services, detached, build, &mut *approver),
+                )
+            }
+            "docker_compose_down" => {
+                let volumes = Self::opt_bool_arg(args, "volumes").unwrap_or(false);
+                platform_result(self.platform.docker_compose_down(volumes, &mut *approver))
+            }
+            "docker_compose_logs" => {
+                let service = Self::opt_str_arg(args, "service");
+                let follow = Self::opt_bool_arg(args, "follow").unwrap_or(false);
+                platform_result(self.platform.docker_compose_logs(service, follow))
+            }
+            "k8s_get" => {
+                let resource = Self::str_arg(args, "resource")?;
+                let n = Self::opt_str_arg(args, "name");
+                let ns = Self::opt_str_arg(args, "namespace");
+                let an = Self::opt_bool_arg(args, "all_namespaces").unwrap_or(false);
+                platform_result(self.platform.k8s_get(resource, n, ns, an))
+            }
+            "k8s_logs" => {
+                let pod = Self::str_arg(args, "pod")?;
+                let c = Self::opt_str_arg(args, "container");
+                let ns = Self::opt_str_arg(args, "namespace");
+                let follow = Self::opt_bool_arg(args, "follow").unwrap_or(false);
+                platform_result(self.platform.k8s_logs(pod, c, ns, follow))
+            }
+            "k8s_apply" => {
+                let path = Self::str_arg(args, "path")?;
+                let ns = Self::opt_str_arg(args, "namespace");
+                platform_result(self.platform.k8s_apply(path, ns, &mut *approver))
+            }
+            "k8s_rollout_status" => {
+                let resource = Self::str_arg(args, "resource")?;
+                let ns = Self::opt_str_arg(args, "namespace");
+                platform_result(self.platform.k8s_rollout_status(resource, ns))
+            }
+            "tf_init" => platform_result(self.platform.tf_init(&mut *approver)),
+            "tf_validate" => platform_result(self.platform.tf_validate()),
+            "tf_plan" => {
+                let out = Self::opt_str_arg(args, "out");
+                platform_result(self.platform.tf_plan(out))
+            }
+            "tf_apply" => {
+                let plan = Self::opt_str_arg(args, "plan_file");
+                let aa = Self::opt_bool_arg(args, "auto_approve").unwrap_or(false);
+                platform_result(self.platform.tf_apply(plan, aa, &mut *approver))
+            }
+            "circleci_validate" => {
+                let cfg = Self::opt_str_arg(args, "config");
+                platform_result(self.platform.circleci_validate(cfg))
+            }
+            "circleci_builds" => {
+                let project = Self::str_arg(args, "project")?;
+                let branch = Self::opt_str_arg(args, "branch");
+                platform_result(self.platform.circleci_builds(project, branch, count("limit")))
+            }
+            "aws_whoami" => platform_result(self.platform.aws_whoami()),
+            "aws_s3_ls" => {
+                let path = Self::opt_str_arg(args, "path");
+                platform_result(self.platform.aws_s3_ls(path))
+            }
+            "aws_s3_sync" => {
+                let source = Self::str_arg(args, "source")?;
+                let dest = Self::str_arg(args, "dest")?;
+                platform_result(self.platform.aws_s3_sync(source, dest, &mut *approver))
+            }
+            "aws_ecr_login" => platform_result(self.platform.aws_ecr_login(&mut *approver)),
+            "aws_lambda_list" => platform_result(self.platform.aws_lambda_list()),
+            "aws_lambda_invoke" => {
+                let function = Self::str_arg(args, "function")?;
+                let payload = Self::opt_str_arg(args, "payload");
+                platform_result(self.platform.aws_lambda_invoke(function, payload, &mut *approver))
+            }
+            "aws_ecs_list_clusters" => platform_result(self.platform.aws_ecs_list_clusters()),
+            "aws_ecs_force_deploy" => {
+                let cluster = Self::str_arg(args, "cluster")?;
+                let service = Self::str_arg(args, "service")?;
+                platform_result(self.platform.aws_ecs_force_deploy(cluster, service, &mut *approver))
+            }
+            "sam_build" => platform_result(self.platform.sam_build(&mut *approver)),
+            "sam_deploy" => {
+                let guided = Self::opt_bool_arg(args, "guided").unwrap_or(false);
+                let stack_name = Self::opt_str_arg(args, "stack_name");
+                platform_result(self.platform.sam_deploy(guided, stack_name, &mut *approver))
+            }
+            "cloudformation_describe" => {
+                let stack = Self::str_arg(args, "stack")?;
+                platform_result(self.platform.cloudformation_describe(stack))
+            }
+            "cloudformation_deploy" => {
+                let template = Self::str_arg(args, "template")?;
+                let stack = Self::str_arg(args, "stack")?;
+                platform_result(self.platform.cloudformation_deploy(template, stack, &mut *approver))
+            }
+            "az_whoami" => platform_result(self.platform.az_whoami()),
+            "az_webapp_list" => platform_result(self.platform.az_webapp_list()),
+            "az_webapp_deploy" => {
+                let name = Self::str_arg(args, "name")?;
+                let rg = Self::str_arg(args, "resource_group")?;
+                let source = Self::str_arg(args, "source")?;
+                platform_result(self.platform.az_webapp_deploy(name, rg, source, &mut *approver))
+            }
+            "az_functionapp_deploy" => {
+                let name = Self::str_arg(args, "name")?;
+                let rg = Self::str_arg(args, "resource_group")?;
+                let source = Self::str_arg(args, "source")?;
+                platform_result(self.platform.az_functionapp_deploy(name, rg, source, &mut *approver))
+            }
+            "gcloud_whoami" => platform_result(self.platform.gcloud_whoami()),
+            "gcloud_app_deploy" => platform_result(self.platform.gcloud_app_deploy(&mut *approver)),
+            "gcloud_run_deploy" => {
+                let service = Self::str_arg(args, "service")?;
+                let image = Self::str_arg(args, "image")?;
+                let region = Self::opt_str_arg(args, "region");
+                platform_result(self.platform.gcloud_run_deploy(service, image, region, &mut *approver))
+            }
+            "gcloud_run_services" => platform_result(self.platform.gcloud_run_services()),
+            "helm_list" => {
+                let ns = Self::opt_str_arg(args, "namespace");
+                platform_result(self.platform.helm_list(ns))
+            }
+            "helm_status" => {
+                let release = Self::str_arg(args, "release")?;
+                let ns = Self::opt_str_arg(args, "namespace");
+                platform_result(self.platform.helm_status(release, ns))
+            }
+            "helm_install" => {
+                let release = Self::str_arg(args, "release")?;
+                let chart = Self::str_arg(args, "chart")?;
+                let ns = Self::opt_str_arg(args, "namespace");
+                platform_result(self.platform.helm_install(release, chart, ns, &mut *approver))
+            }
+            "helm_upgrade" => {
+                let release = Self::str_arg(args, "release")?;
+                let chart = Self::str_arg(args, "chart")?;
+                let ns = Self::opt_str_arg(args, "namespace");
+                platform_result(self.platform.helm_upgrade(release, chart, ns, &mut *approver))
+            }
+            "helm_uninstall" => {
+                let release = Self::str_arg(args, "release")?;
+                let ns = Self::opt_str_arg(args, "namespace");
+                platform_result(self.platform.helm_uninstall(release, ns, &mut *approver))
+            }
+            "fly_whoami" => platform_result(self.platform.fly_whoami()),
+            "fly_apps_list" => platform_result(self.platform.fly_apps_list()),
+            "fly_deploy" => {
+                let image = Self::opt_str_arg(args, "image");
+                let app = Self::opt_str_arg(args, "app");
+                platform_result(self.platform.fly_deploy(image, app, &mut *approver))
+            }
+            "fly_status" => {
+                let app = Self::str_arg(args, "app")?;
+                platform_result(self.platform.fly_status(app))
+            }
+            "railway_whoami" => platform_result(self.platform.railway_whoami()),
+            "railway_status" => platform_result(self.platform.railway_status()),
+            "railway_up" => {
+                let detach = Self::opt_bool_arg(args, "detach").unwrap_or(false);
+                platform_result(self.platform.railway_up(detach, &mut *approver))
+            }
+            "render_whoami" => platform_result(self.platform.render_whoami()),
+            "render_services" => platform_result(self.platform.render_services()),
+            "render_deploy" => {
+                let service_id = Self::str_arg(args, "service_id")?;
+                platform_result(self.platform.render_deploy(service_id, &mut *approver))
+            }
+            "netlify_whoami" => platform_result(self.platform.netlify_whoami()),
+            "netlify_sites" => platform_result(self.platform.netlify_sites()),
+            "netlify_deploy" => {
+                let dir = Self::str_arg(args, "dir")?;
+                let prod = Self::opt_bool_arg(args, "prod").unwrap_or(false);
+                let site = Self::opt_str_arg(args, "site");
+                platform_result(self.platform.netlify_deploy(dir, prod, site, &mut *approver))
+            }
+            "firebase_projects" => platform_result(self.platform.firebase_projects()),
+            "firebase_deploy" => {
+                let only = Self::opt_str_arg(args, "only");
+                platform_result(self.platform.firebase_deploy(only, &mut *approver))
+            }
+            "firebase_functions" => platform_result(self.platform.firebase_functions()),
+            _ => return Err(AgentError::UnknownTool(name.to_string())),
+        };
+        result
+    }
 }
 
 /// Render a `GitOutput` (or the permission/spawn error that prevented one)
@@ -1183,6 +2849,151 @@ fn git_result(result: zeus_fs::Result<GitOutput>) -> Result<ToolResult> {
         }
         Err(e) => Ok(ToolResult::err(e.to_string())),
     }
+}
+
+/// Same convention as `git_result` for the platform-CLI engines.
+fn platform_result(result: zeus_fs::Result<PlatformOutput>) -> Result<ToolResult> {
+    match result {
+        Ok(out) => {
+            let text = format!(
+                "exit={:?}\n--- stdout ---\n{}--- stderr ---\n{}",
+                out.exit_code, out.stdout, out.stderr
+            );
+            if out.success {
+                Ok(ToolResult::ok(text))
+            } else {
+                Ok(ToolResult::err(text))
+            }
+        }
+        Err(e) => Ok(ToolResult::err(e.to_string())),
+    }
+}
+
+/// Same convention as `git_result`/`platform_result` for the adb-backed
+/// device engine. `DeviceOutput.success` is false when the command exits
+/// nonzero OR the capture itself failed (no device, timeout) — in both cases
+/// zeus must present it as an error so the model can react, not shrug.
+fn device_result(out: zeus_fs::DeviceOutput) -> ToolResult {
+    let artifact = out
+        .artifact
+        .as_ref()
+        .map(|p| format!("\nartifact: {}", p.display()))
+        .unwrap_or_default();
+    let text = format!(
+        "exit={:?}\n--- stdout ---\n{}--- stderr ---\n{}{}",
+        out.exit_code, out.stdout, out.stderr, artifact
+    );
+    if out.success {
+        ToolResult::ok(text)
+    } else {
+        ToolResult::err(text)
+    }
+}
+
+/// Detect the most likely test command for a project by looking at its
+/// manifests. Best-effort; the tool falls back to an explicit override when
+/// nothing matches.
+fn detect_test_command(root: &Path) -> Option<String> {
+    let dir = |name: &str| root.join(name);
+    // Ordered by likelihood/portability. `cargo test` and `go test ./...`
+    // are the two that never need an extra runner installed.
+    if dir("Cargo.toml").is_file() {
+        return Some("cargo test".into());
+    }
+    if dir("go.mod").is_file() {
+        return Some("go test ./...".into());
+    }
+    if dir("pyproject.toml").is_file() {
+        return Some("python -m pytest -q".into());
+    }
+    if dir("package.json").is_file() {
+        if dir("pnpm-lock.yaml").is_file() || dir("pnpm-workspace.yaml").is_file() {
+            return Some("pnpm test".into());
+        }
+        if dir("yarn.lock").is_file() {
+            return Some("yarn test".into());
+        }
+        return Some("npm test".into());
+    }
+    if dir("Makefile").is_file() {
+        return Some("make test".into());
+    }
+    if dir("Gemfile").is_file() {
+        return Some("bundle exec rspec".into());
+    }
+    None
+}
+
+/// Pull the handful of verdict lines (e.g. `test result: ok. 12 passed; 0
+/// failed`, `12 passed in 1.2s`, `Done in 1.1s`) out of raw runner output so
+/// the model gets a compact summary instead of a wall of dots.
+fn summarize_test_output(stdout: &str) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for raw in stdout.lines() {
+        let line = raw.trim();
+        let interesting = line.starts_with("test result:")
+            || line.starts_with("ok ")
+            || line.starts_with("FAIL")
+            || (line.contains("passed") && line.contains("failed"))
+            || line.contains(" passed in ")
+            || line.contains("Tests:")
+            || line.contains("Test Suites:")
+            || line.contains("Error:")
+            || line.starts_with("no test data")
+            || line.starts_with("All tests passed");
+        if interesting && !seen.contains(&line) {
+            seen.push(line);
+        }
+        if seen.len() >= 8 {
+            break;
+        }
+    }
+    if seen.is_empty() {
+        "(no summary lines captured)".to_string()
+    } else {
+        seen.join("\n")
+    }
+}
+
+/// Launch the platform's default browser opener for `url`, launch-and-forget.
+/// Rejects non-`{http,https,file}://` (and scheme-less `host:port`) targets so
+/// a stray string can't be misinterpreted as a shell flag or command.
+fn open_browser_url(url: &str) -> std::io::Result<()> {
+    let url = url.trim();
+    if !(url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("file://")
+        || url.starts_with("localhost:")
+        || url.starts_with("127.0.0.1:")
+        || (url.contains('.') && !url.contains(' ') && !url.starts_with('-')))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{url}' isn't a usable web URL — expect something like http://localhost:5173"),
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(url)
+            .spawn()
+            .map(|_| ())?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut cmd = std::process::Command::new("open");
+        #[cfg(all(not(target_os = "macos"), target_os = "linux"))]
+        let mut cmd = std::process::Command::new("xdg-open");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(url).spawn().map(|_| ())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1308,6 +3119,70 @@ mod tests {
     }
 
     #[test]
+    fn code_intel_tools_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub struct Foo {}\nimpl Foo { pub fn bar(&self) {} }\nfn use_it(f: &Foo) -> u32 { 0 }\n",
+        )
+        .unwrap();
+
+        let tm = tool_manager(&root);
+
+        // Build the index (force so a stale one can't short-circuit).
+        let r = tm
+            .dispatch_with_approver("code_index", r#"{"force":true}"#, approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("indexed"));
+
+        // Fresh run without force reports the cached index.
+        let r = tm
+            .dispatch_with_approver("code_index", "{}", approve)
+            .unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.contains("already exists"));
+
+        // Symbols lookup.
+        let r = tm
+            .dispatch_with_approver("code_symbols", r#"{"name":"Foo"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.contains("Foo") && r.content.contains("lib.rs"));
+
+        // Refs (word-boundary) find all three occurrences.
+        let r = tm
+            .dispatch_with_approver("code_refs", r#"{"name":"Foo"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.contains("3 reference(s)"), "got: {}", r.content);
+    }
+
+    #[test]
+    fn code_verbose_rename_reports_plan_only() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "fn alpha() { leap_alpha(); }\n").unwrap();
+
+        let tm = tool_manager(&root);
+        let r = tm
+            .dispatch_with_approver(
+                "code_rename",
+                r#"{"old":"alpha","new":"omega"}"#,
+                approve,
+            )
+            .unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.contains("rename 'alpha' -> 'omega'"));
+        assert!(r.content.contains("Plan only"));
+        // Rename must never write.
+        assert!(std::fs::read_to_string(root.join("lib.rs")).unwrap().contains("fn alpha()"));
+    }
+
+    #[test]
     fn bash_runs_and_denies_destructive() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("proj");
@@ -1423,11 +3298,8 @@ mod tests {
             let err = tm.dispatch_with_approver(&spec.name, "{}", approve);
             // Missing required args should surface as InvalidArguments, not
             // UnknownTool — proves the name is wired to a real handler.
-            match err {
-                Err(AgentError::UnknownTool(_)) => {
-                    panic!("tool spec '{}' has no handler", spec.name)
-                }
-                _ => {}
+            if let Err(AgentError::UnknownTool(_)) = err {
+                panic!("tool spec '{}' has no handler", spec.name)
             }
         }
     }
@@ -1486,5 +3358,101 @@ mod tests {
             .dispatch_with_approver("git_reset", r#"{"mode":"hard"}"#, approve)
             .unwrap();
         assert!(hard_reset.is_error);
+    }
+
+    #[test]
+    fn detect_test_command_maps_manifests() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        assert_eq!(detect_test_command(root).as_deref(), Some("cargo test"));
+
+        std::fs::remove_file(root.join("Cargo.toml")).unwrap();
+        std::fs::write(root.join("go.mod"), "").unwrap();
+        assert_eq!(detect_test_command(root).as_deref(), Some("go test ./..."));
+
+        std::fs::remove_file(root.join("go.mod")).unwrap();
+        std::fs::write(root.join("pyproject.toml"), "").unwrap();
+        assert_eq!(
+            detect_test_command(root).as_deref(),
+            Some("python -m pytest -q")
+        );
+
+        std::fs::remove_file(root.join("pyproject.toml")).unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        assert_eq!(detect_test_command(root).as_deref(), Some("npm test"));
+
+        std::fs::write(root.join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(detect_test_command(root).as_deref(), Some("pnpm test"));
+
+        std::fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+        std::fs::write(root.join("yarn.lock"), "").unwrap();
+        assert_eq!(detect_test_command(root).as_deref(), Some("yarn test"));
+    }
+
+    #[test]
+    fn detect_test_command_none_when_no_manifest() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(detect_test_command(tmp.path()), None);
+    }
+
+    #[test]
+    fn summarize_test_output_picks_verdict_lines() {
+        let out = "\n  Compiling zeus v0.1.0\n\nrunning 4 tests\n..s....\n\ntest result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n\nrunning 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        let summary = summarize_test_output(out);
+        assert!(summary.contains("test result: ok"), "{summary}");
+        assert!(summary.contains("4 passed"), "{summary}");
+        assert!(!summary.contains("running 4"), "{summary}");
+    }
+
+    #[test]
+    fn test_tool_runs_with_explicit_command() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        let cmd = if cfg!(windows) {
+            r#"powershell -NoProfile -Command "Write-Output 'test result: ok. 1 passed; 0 failed'""#
+        } else {
+            "echo test result: ok. 1 passed; 0 failed"
+        };
+        let args = serde_json::json!({ "command": cmd });
+        let r = tm
+            .dispatch_with_approver("test", &args.to_string(), approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("1 passed"), "{}", r.content);
+    }
+
+    #[test]
+    fn test_tool_without_command_reports_detection_failure() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        let r = tm.dispatch_with_approver("test", "{}", approve).unwrap();
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("auto-detect"), "{}", r.content);
+    }
+
+    #[test]
+    fn browser_rejects_bad_url_and_blocks_in_plan_mode() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+
+        // A path-ish target isn't a web URL and must not be handed as-is to
+        // the opener (argument-injection guard — never spawn in this test).
+        let bad = tm
+            .dispatch_with_approver("browser", r#"{"url":"C:/Windows/System32"}"#, approve)
+            .unwrap();
+        assert!(bad.is_error, "{}", bad.content);
+
+        // Plan mode blocks it even for a plausible http URL.
+        tm.set_plan_mode(true);
+        let blocked = tm
+            .dispatch_with_approver("browser", r#"{"url":"http://localhost:5173"}"#, approve)
+            .unwrap();
+        assert!(blocked.is_error, "{}", blocked.content);
+        assert!(blocked.content.contains("Plan mode"), "{}", blocked.content);
+        tm.set_plan_mode(false);
     }
 }

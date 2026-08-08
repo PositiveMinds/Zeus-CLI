@@ -16,8 +16,8 @@ pub use keys::KeysFile;
 pub use paths::{ensure_global_dirs, global_home, project_agent_dir, GlobalPaths, ProjectPaths};
 pub use providers::{ProviderConfig, ProvidersFile};
 pub use settings::{
-    AgentSettings, McpServerConfig, PermissionDefault, PermissionRule, PermissionState,
-    SettingsLayer, SettingsStack,
+    AgentSettings, LlamaCppSettings, LocalModelEntry, McpServerConfig, PermissionDefault,
+    PermissionRule, PermissionState, SettingsLayer, SettingsStack,
 };
 
 use std::path::{Path, PathBuf};

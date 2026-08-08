@@ -204,8 +204,13 @@ mod tests {
 
     #[test]
     fn opencodezen_is_a_registered_provider_kind() {
-        let file = ProvidersFile::builtin_defaults();
-        assert!(file.get("opencodezen").is_some());
+        let mut file = ProvidersFile::builtin_defaults();
+        // Point at a guaranteed-absent env var so the "no key configured"
+        // expectation doesn't depend on whatever key vars the machine running
+        // the test happens to have set (e.g. a real OPENCODE_API_KEY).
+        if let Some(cfg) = file.providers.get_mut("opencodezen") {
+            cfg.api_key_env = Some("ZEUS_TEST_UNSET_OPENCODEZEN_KEY".into());
+        }
         match create_provider("opencodezen", &file) {
             Ok(_) => panic!("expected MissingApiKey for unconfigured opencodezen"),
             Err(err) => assert!(matches!(err, ProviderError::MissingApiKey(_))),

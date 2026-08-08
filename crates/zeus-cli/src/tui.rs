@@ -53,10 +53,12 @@ enum Role {
 }
 
 impl Role {
-    fn prefix(&self) -> &'static str {
+    /// Avatar glyph shown before the message body for the first line only
+    /// (mirrors the zeus-cli.html `YOUR`/`⚡` avatar chips).
+    fn marker(&self) -> &'static str {
         match self {
-            Role::User => "❯ ",
-            Role::Assistant => "● ",
+            Role::User => "YOU ",
+            Role::Assistant => "⚡ ",
             Role::Tool => "◆ ",
             Role::ToolError => "✗ ",
             Role::Info => "· ",
@@ -64,13 +66,24 @@ impl Role {
         }
     }
 
-    fn style(&self) -> Style {
+    fn marker_style(&self) -> Style {
         match self {
-            Role::User => theme::amber(),
-            Role::Assistant => theme::green(),
-            Role::Tool => theme::blue(),
+            Role::User => theme::dim(),
+            Role::Assistant => theme::violet().add_modifier(Modifier::BOLD),
+            Role::Tool => theme::cyan(),
             Role::ToolError => theme::red(),
-            Role::Info => theme::muted(),
+            Role::Info => theme::faint(),
+            Role::Error => theme::red(),
+        }
+    }
+
+    fn text_style(&self) -> Style {
+        match self {
+            Role::User => theme::user_text(),
+            Role::Assistant => theme::text(),
+            Role::Tool => theme::cyan(),
+            Role::ToolError => theme::red(),
+            Role::Info => theme::dim(),
             Role::Error => theme::red(),
         }
     }
@@ -78,30 +91,209 @@ impl Role {
 
 struct Block_ {
     role: Role,
+    /// Plain body text. When `lines` is empty, `to_lines` derives the rows
+    /// from this (splitting on newlines); otherwise `lines` wins (used for
+    /// the seeded demo transcript with tool-call chips and diff blocks).
     text: String,
+    /// Pre-built styled rows (empty for plain text blocks).
+    lines: Vec<Vec<Span<'static>>>,
 }
 
 impl Block_ {
-    fn to_lines(&self) -> Vec<Line<'static>> {
-        let style = self.role.style();
-        let prefix = self.role.prefix();
-        let mut lines: Vec<Line<'static>> = self
-            .text
-            .lines()
-            .enumerate()
-            .map(|(i, l)| {
-                let text = if i == 0 {
-                    format!("{prefix}{l}")
-                } else {
-                    format!("  {l}")
-                };
-                Line::from(Span::styled(text, style))
-            })
-            .collect();
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled(prefix.to_string(), style)));
+    fn new(role: Role, text: String) -> Self {
+        Self { role, text, lines: Vec::new() }
+    }
+
+    fn rich(role: Role, lines: Vec<Vec<Span<'static>>>) -> Self {
+        Self { role, text: String::new(), lines }
+    }
+
+    /// Plain text of this block: the stored `text` when present, otherwise the
+    /// concatenated content of its styled spans (e.g. a copied diff).
+    fn plain_text(&self) -> String {
+        if !self.text.is_empty() {
+            return self.text.clone();
         }
-        lines
+        self.lines
+            .iter()
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Indent applied to continuation lines so they clear the avatar marker.
+    fn pad() -> &'static str {
+        "    "
+    }
+
+    fn to_lines(&self) -> Vec<Line<'static>> {
+        let marker_style = self.role.marker_style();
+        let marker = self.role.marker();
+        let text_style = self.role.text_style();
+        let mut raw_lines: Vec<&str> = if self.lines.is_empty() {
+            self.text.lines().collect()
+        } else {
+            Vec::new()
+        };
+        if raw_lines.is_empty() && self.lines.is_empty() {
+            raw_lines.push("");
+        }
+
+        let mut out: Vec<Line<'static>> = Vec::new();
+        if !self.lines.is_empty() {
+            for (i, spans) in self.lines.iter().enumerate() {
+                let mut line_spans = Vec::new();
+                if i == 0 {
+                    line_spans.push(Span::styled(marker, marker_style));
+                    if self.role == Role::Assistant {
+                        // violet left rule like the HTML bubble's border-left
+                        line_spans.push(Span::styled("▍", theme::violet().add_modifier(Modifier::BOLD)));
+                        line_spans.push(Span::raw(" "));
+                    }
+                } else {
+                    line_spans.push(Span::styled(Self::pad(), theme::faint()));
+                }
+                line_spans.extend(spans.iter().cloned());
+                out.push(Line::from(line_spans));
+            }
+            return out;
+        }
+
+        // Assistant replies may embed fenced code blocks — tokenize and color
+        // them instead of emitting everything in a single flat span.
+        let highlighted: Option<Vec<Vec<Span<'static>>>> = (self.role == Role::Assistant)
+            .then(|| super::highlight::markdown_lines(&self.text, text_style));
+        if let Some(lines) = highlighted {
+            if !lines.is_empty() {
+                for (i, spans) in lines.iter().enumerate() {
+                    let mut line_spans = Vec::new();
+                    if i == 0 {
+                        line_spans.push(Span::styled(marker, marker_style));
+                        line_spans.push(Span::styled("▍", theme::violet().add_modifier(Modifier::BOLD)));
+                        line_spans.push(Span::raw(" "));
+                    } else {
+                        line_spans.push(Span::styled(Self::pad(), theme::faint()));
+                    }
+                    line_spans.extend(spans.iter().cloned());
+                    out.push(Line::from(line_spans));
+                }
+                return out;
+            }
+        }
+
+        for (i, l) in raw_lines.iter().enumerate() {
+            let mut spans = Vec::new();
+            if i == 0 {
+                spans.push(Span::styled(marker, marker_style));
+                if self.role == Role::Assistant {
+                    spans.push(Span::styled("▍", theme::violet().add_modifier(Modifier::BOLD)));
+                    spans.push(Span::raw(" "));
+                }
+            } else {
+                spans.push(Span::styled(Self::pad(), theme::faint()));
+            }
+            spans.push(Span::styled(l.to_string(), text_style));
+            out.push(Line::from(spans));
+        }
+        out
+    }
+}
+
+/// A temporary seeded preview: the demo conversation from `zeus-cli.html`,
+/// reproduced verbatim (messages, tool-call chips, and a diff block) so the
+/// bubble design can be confirmed in the TUI. **Seeding preview only** — the
+/// intent is to remove this once the layout is signed off.
+fn demo_transcript() -> Vec<Block_> {
+    let dblk = Color::Rgb(0x0a, 0x0c, 0x12);
+    let dadd = Color::Rgb(0x0c, 0x12, 0x0e);
+    let ddel = Color::Rgb(0x0c, 0x10, 0x10);
+    let dchip = Color::Rgb(0x0a, 0x16, 0x1f); // faint cyan ≈ --cyan at 7% on --void
+
+    // <code> spans render cyan, matching `.bubble code { color: var(--cyan) }`.
+    let text = |s: &str| Span::styled(s.to_string(), theme::text());
+    let code = |s: &str| Span::styled(s.to_string(), theme::cyan());
+    // A tool-call chip: cyan "●" + args on a faint-cyan pill, like `.toolcall`.
+    let chip = |args: &str| {
+        vec![
+            Span::styled(
+                "● ",
+                Style::default().fg(theme::CYAN).add_modifier(Modifier::BOLD).bg(dchip),
+            ),
+            Span::styled(args.to_string(), Style::default().fg(theme::CYAN).bg(dchip)),
+        ]
+    };
+
+    let mut blocks = Vec::new();
+
+    blocks.push(Block_::new(
+        Role::User,
+        "the /api/users endpoint is throwing a 500 on pagination past page 3. can you find it and fix it?"
+            .into(),
+    ));
+
+    // Assistant #1 with tool chips, inline code, and a diff block.
+    let asst1: Vec<Vec<Span<'static>>> = vec![
+        vec![text("Looking at the route handler and the query builder now.")],
+        chip("search_files(\"pagination\", scope: \"src/api/users\")"),
+        chip("read_file(\"src/api/users/handler.ts\")"),
+        vec![
+            text("Found it — "),
+            code("offset"),
+            text(" is computed as "),
+            code("page * limit"),
+            text(" instead of "),
+            code("(page - 1) * limit"),
+            text(", so once you pass the third page it skips past the end of a small result set and the count query throws. Here's the fix:"),
+        ],
+        // diffblock
+        vec![
+            Span::styled("  src/api/users/handler.ts", Style::default().fg(theme::DIM).bg(dblk)),
+            Span::styled("       @@ -18,7 +18,7 @@", Style::default().fg(theme::DIM).bg(dblk)),
+        ],
+        { let dctx = |s: &str| vec![Span::styled(s.to_string(), Style::default().fg(theme::DIM).bg(dblk))]; dctx("  const limit = Number(query.limit) || 20;") },
+        { let ddell = |s: &str| vec![Span::styled(s.to_string(), Style::default().fg(theme::RED).bg(ddel))]; ddell("- const offset = page * limit;") },
+        { let daddl = |s: &str| vec![Span::styled(s.to_string(), Style::default().fg(theme::GREEN).bg(dadd))]; daddl("+ const offset = (page - 1) * limit;") },
+        { let dctx = |s: &str| vec![Span::styled(s.to_string(), Style::default().fg(theme::DIM).bg(dblk))]; dctx("  const rows = await db.users.findMany({ take: limit, skip: offset });") },
+        vec![text(
+            "Added it to today's TODOs on the right so it doesn't get lost before you review the diff.",
+        )],
+    ];
+    blocks.push(Block_::rich(Role::Assistant, asst1));
+
+    blocks.push(Block_::new(
+        Role::User,
+        "good catch. apply it and run the tests".into(),
+    ));
+
+    // asst2: two tool calls then a short reply.
+    let asst2: Vec<Vec<Span<'static>>> = vec![
+        chip("apply_patch(\"src/api/users/handler.ts\")"),
+        chip("run(\"npm test -- users.pagination\")"),
+        vec![text(
+            "All 6 pagination tests pass, including the new edge case for a partial last page. Want me to open a commit for this, or keep it staged for a bigger PR?",
+        )],
+    ];
+    blocks.push(Block_::rich(Role::Assistant, asst2));
+
+    blocks
+}
+
+impl PartialEq for Role {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Role::User, Role::User)
+                | (Role::Assistant, Role::Assistant)
+                | (Role::Tool, Role::Tool)
+                | (Role::ToolError, Role::ToolError)
+                | (Role::Info, Role::Info)
+                | (Role::Error, Role::Error)
+        )
     }
 }
 
@@ -142,6 +334,7 @@ enum PickerEntry {
 /// free / local), a selectable provider, or a selectable model belonging to
 /// that provider. Flat list so a single index drives keyboard and mouse
 /// selection.
+#[derive(Clone)]
 enum ProviderEntry {
     Header(String),
     Provider {
@@ -193,6 +386,38 @@ fn provider_picker_move(entries: &[ProviderEntry], selected: usize, dir: isize) 
             return idx as usize;
         }
     }
+}
+
+/// Move the dropdown highlight one row toward the end, skipping group
+/// headers (not selectable). Wraps around the list.
+fn dropdown_next_selectable(entries: &[ProviderEntry], selected: usize) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    let mut idx = selected;
+    for _ in 0..entries.len() {
+        idx = (idx + 1) % entries.len();
+        if !matches!(entries.get(idx), Some(ProviderEntry::Header(_))) {
+            return idx;
+        }
+    }
+    selected
+}
+
+/// Move the dropdown highlight one row toward the start, skipping group
+/// headers (not selectable). Wraps around the list.
+fn dropdown_prev_selectable(entries: &[ProviderEntry], selected: usize) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    let mut idx = selected;
+    for _ in 0..entries.len() {
+        idx = (idx + entries.len() - 1) % entries.len();
+        if !matches!(entries.get(idx), Some(ProviderEntry::Header(_))) {
+            return idx;
+        }
+    }
+    selected
 }
 
 /// Applies the chosen model: switches provider first if it differs from the
@@ -338,6 +563,45 @@ fn apply_provider_picker_choice(
     }
 }
 
+/// Apply a pick inside the top-right provider dropdown. Ready providers/model
+/// switch immediately (dropdown closes); a provider that still needs a key
+/// keeps the dropdown open but swaps it into the inline API-key entry view.
+fn dropdown_apply(
+    state: &mut AppState,
+    agent_slot: &mut Option<Agent>,
+    config: &Config,
+    entry: &ProviderEntry,
+) {
+    match entry {
+        ProviderEntry::Provider { name, ready, .. } => {
+            if *ready {
+                apply_provider_picker_choice(name.clone(), true, config, agent_slot, state);
+                state.dropdown = None;
+            } else {
+                open_dropdown_key(state, name);
+            }
+        }
+        ProviderEntry::Model { provider, model, .. } => {
+            if provider_status_ok(config, provider) {
+                apply_picker_choice(provider.clone(), model.id.clone(), state, agent_slot, config);
+                state.dropdown = None;
+            } else {
+                open_dropdown_key(state, provider);
+            }
+        }
+        ProviderEntry::Header(_) => state.dropdown = None,
+    }
+}
+
+/// Swap the dropdown's list for its inline key-entry view for `provider`
+/// (preserving the entry list so Esc can step back out).
+fn open_dropdown_key(state: &mut AppState, provider: &str) {
+    if let Some(d) = state.dropdown.as_mut() {
+        d.keying = Some(KeyingState { provider: provider.to_string(), key: String::new() });
+        d.selected = 0;
+    }
+}
+
 /// Free-vs-paid tag for a fetched model id. Generous free heuristic — matches
 /// the common free/low-cost tiers across providers (opencodezen's
 /// deepseek-v4-flash-free, gemini flash, gpt mini, lite/nano variants, and
@@ -382,7 +646,7 @@ async fn provider_picker_entries(
             .filter(|n| {
                 config
                     .providers
-                    .get(*n)
+                    .get(n)
                     .map(|c| group_of(&c.kind) == group)
                     .unwrap_or(false)
             })
@@ -535,6 +799,28 @@ impl AgentMode {
     }
 }
 
+/// The accent color a mode drives the UI with — the HTML page's per-mode
+/// `--mode-color` (`PLAN`→gold `#fbbf24`, `BUILD`→cyan `#22d3ee`, `AUTO`→
+/// magenta `#ff3d9a`). Switching modes repaints the pill, input ring, caret,
+/// SEND button, hint label, and the whole right-hand sidebar, mirroring the
+/// reference page's `setMode()` behavior.
+fn mode_accent(mode: AgentMode) -> Color {
+    match mode {
+        AgentMode::Build => theme::CYAN,
+        AgentMode::Plan => theme::GOLD,
+        AgentMode::Auto => theme::MAGENTA,
+    }
+}
+
+/// A mode chip (filled with the mode's accent, dark label) for the segmented
+/// control and the input status line.
+fn mode_chip(mode: AgentMode) -> Style {
+    Style::default()
+        .fg(theme::VOID)
+        .bg(mode_accent(mode))
+        .add_modifier(Modifier::BOLD)
+}
+
 /// Push the selected TUI mode down to the agent: Plan turns the read-only
 /// guard on; Build turns it off; Auto leaves it off and enables plan-then-run.
 fn apply_agent_mode(agent: &Agent, mode: AgentMode) {
@@ -559,7 +845,7 @@ struct AppState {
     /// Project-root info for the header "directory" panel (workspace name,
     /// root path, git branch if any, file count).
     dir: DirInfo,
-    /// Highlighted row in the slash-command dropdown; clamped against the
+/// Highlighted row in the slash-command dropdown; clamped against the
     /// current match count wherever it's read; reset to 0 whenever the
     /// input text changes so the highlight always starts back at the top
     /// match instead of pointing at a stale/since-filtered-out row.
@@ -570,27 +856,108 @@ struct AppState {
     model_picker_area: Option<Rect>,
     /// Same for the provider picker popup.
     provider_picker_area: Option<Rect>,
+    /// Bare-provider dropdown (top-right corner, like the HTML page) — same
+    /// `ProviderEntry` shape as the `/provider` picker but rendered as a
+    /// compact popover under the provider button. `None` when hidden.
+    dropdown: Option<DropdownState>,
+    /// TODO checklist for the right sidebar (mirrors the HTML sample data).
+    todos: Vec<TodoItem>,
+    /// The provider-picker dropdown has a free-text search bar, like the
+    /// HTML `.provider-search` box.
+    drop_search: String,
+    /// Rendered rect of the TODO list — maps mouse clicks to rows.
+    todo_area: Option<Rect>,
+    /// Rendered rect of the top-right provider button — maps a click to
+    /// opening/closing the dropdown.
+    provider_btn_area: Option<Rect>,
+    /// When the session started — drives the "Session" readout in the sidebar.
+    started: std::time::Instant,
 }
 
-/// Project-root facts shown in the SuperCode-style "directory" header panel.
+struct DropdownState {
+    entries: Vec<ProviderEntry>,
+    selected: usize,
+    /// Where the popover gets drawn. `None` until the first render computes it.
+    area: Option<Rect>,
+    /// When set, the dropdown swaps its list for an inline API-key entry for
+    /// the given provider (still inside the same popover), instead of kicking
+    /// the user out to the full-screen `KeyEntry` mode.
+    keying: Option<KeyingState>,
+}
+
+struct KeyingState {
+    provider: String,
+    key: String,
+}
+
+struct TodoItem {
+    text: String,
+    done: bool,
+    active: bool,
+}
+
+/// Builds the compact provider/model rows for the top-right dropdown,
+/// regrouping configured providers so the current one leads, then the rest in
+/// alphabetical order — same scanning approach as the full `/provider` picker.
+async fn build_dropdown_entries(
+    config: &Config,
+    current: &str,
+    _current_model: &str,
+) -> Vec<ProviderEntry> {
+    let mut names: Vec<&String> = config.providers.providers.keys().collect();
+    names.sort();
+    if let Some(pos) = names.iter().position(|n| n.as_str() == current) {
+        let cur = names.remove(pos);
+        names.insert(0, cur);
+    }
+    let models = list_models_by_provider(config).await;
+    let mut entries = Vec::new();
+    let mut any = false;
+    for name in names {
+        let Some(cfg) = config.providers.get(name) else { continue };
+        let ready = provider_status_ok(config, name);
+        any = true;
+        entries.push(ProviderEntry::Header(name.to_string()));
+        entries.push(ProviderEntry::Provider {
+            name: name.to_string(),
+            kind: cfg.kind.clone(),
+            model: cfg.default_model.clone().unwrap_or_default(),
+            ready,
+        });
+        if let Some((_, provider_models)) = models.iter().find(|(n, _)| n == (name as &String)) {
+            for m in provider_models {
+                entries.push(ProviderEntry::Model {
+                    provider: name.to_string(),
+                    model: m.clone(),
+                    free: is_free_model(&m.id),
+                });
+            }
+        }
+    }
+    if any {
+        entries.push(ProviderEntry::Header("manage providers — /provider".to_string()));
+    }
+entries
+}
+
+/// Git branch shown in the side-panel session footer. Single field only —
+/// other directory facts (workspace/path/file count) aren't rendered yet, so
+/// they were dropped to avoid dead fields.
 pub struct DirInfo {
-    pub workspace: String,
-    pub path: String,
     pub git_branch: Option<String>,
-    pub file_count: usize,
 }
 
 impl AppState {
-    fn new(agent: &Agent, known_commands: Vec<(String, String)>, dir: DirInfo) -> Self {
-        Self {
-            transcript: Vec::new(),
+    fn new(agent: &Agent, known_commands: Vec<(String, String)>, dir: DirInfo, start_in_plan: bool) -> Self {
+        let state = Self {
+            transcript: demo_transcript(),
             current_reply: String::new(),
             input: String::new(),
             cursor: 0,
             busy: false,
             quit: false,
             mode: Mode::Chat,
-            agent_mode: AgentMode::Build,
+            agent_mode: if start_in_plan { AgentMode::Plan } else { AgentMode::Build },
             model: agent.model().to_string(),
             provider: agent.provider_id().to_string(),
             session_id: agent.session_id().to_string(),
@@ -599,13 +966,20 @@ impl AppState {
             command_selected: 0,
             model_picker_area: None,
             provider_picker_area: None,
-        }
+            dropdown: None,
+            todos: Vec::new(),
+            drop_search: String::new(),
+            todo_area: None,
+            provider_btn_area: None,
+            started: std::time::Instant::now(),
+        };
+        state
     }
 
     fn flush_current_reply(&mut self) {
         if !self.current_reply.is_empty() {
             let text = std::mem::take(&mut self.current_reply);
-            self.transcript.push(Block_ { role: Role::Assistant, text });
+            self.transcript.push(Block_::new(Role::Assistant, text));
         }
     }
 
@@ -614,19 +988,24 @@ impl AppState {
             AgentEvent::TextDelta(t) => self.current_reply.push_str(&t),
             AgentEvent::ToolCallStarted { name, arguments, .. } => {
                 self.flush_current_reply();
-                self.transcript.push(Block_ {
-                    role: Role::Tool,
-                    text: format!("{name} {arguments}"),
-                });
+                self.transcript.push(Block_::new(
+                    Role::Tool,
+                    format!("{name} {arguments}"),
+                ));
             }
             AgentEvent::ToolCallFinished { name, result, is_error, .. } => {
                 self.flush_current_reply();
                 let role = if is_error { Role::ToolError } else { Role::Tool };
                 let marker = if is_error { "failed" } else { "done" };
-                self.transcript.push(Block_ {
+                self.transcript.push(Block_::new(
                     role,
-                    text: format!("{name} ({marker})\n{result}"),
-                });
+                    format!("{name} ({marker})\n{result}"),
+                ));
+                // A completed mutation auto-checks the in-flight task, filling
+                // the sidebar progress bar (the HTML page's AI-driven TODOs).
+                if !is_error && matches!(name.as_str(), "apply_patch" | "write" | "edit" | "update" | "run" | "patch") {
+                    self.complete_task(&name);
+                }
             }
             AgentEvent::Compacted(c) => {
                 self.push_info(format!("(compacted {} earlier message(s))", c.removed_messages));
@@ -648,34 +1027,68 @@ impl AppState {
                 self.push_info(format!("plan step {} · {}", step.id, step.description));
             }
             AgentEvent::PlanReviewed { persona, report } => {
-                self.transcript.push(Block_ {
-                    role: Role::Tool,
-                    text: format!("review ({persona})\n{report}"),
-                });
+                self.transcript.push(Block_::new(
+                    Role::Tool,
+                    format!("review ({persona})\n{report}"),
+                ));
             }
             AgentEvent::PlanStepDone { step, summary } => {
-                self.transcript.push(Block_ {
-                    role: Role::Tool,
-                    text: format!("step {} done · {}\n{}", step.id, step.description, summary),
-                });
+                self.transcript.push(Block_::new(
+                    Role::Tool,
+                    format!("step {} done · {}\n{}", step.id, step.description, summary),
+                ));
+            }
+            AgentEvent::PlanStepDeclined { step } => {
+                self.transcript.push(Block_::new(
+                    Role::Tool,
+                    format!("step {} declined · {}", step.id, step.description),
+                ));
             }
             AgentEvent::OrchestrationDone { summary } => {
                 self.flush_current_reply();
-                self.transcript.push(Block_ { role: Role::Assistant, text: summary });
+                self.transcript.push(Block_::new(Role::Assistant, summary));
             }
         }
     }
 
     fn push_user(&mut self, text: String) {
-        self.transcript.push(Block_ { role: Role::User, text });
+        self.transcript.push(Block_::new(Role::User, text));
     }
 
     fn push_info(&mut self, text: impl Into<String>) {
-        self.transcript.push(Block_ { role: Role::Info, text: text.into() });
+        self.transcript.push(Block_::new(Role::Info, text.into()));
     }
 
     fn push_error(&mut self, text: impl Into<String>) {
-        self.transcript.push(Block_ { role: Role::Error, text: text.into() });
+        self.transcript.push(Block_::new(Role::Error, text.into()));
+    }
+
+    /// Mark the current in-flight task complete (the AI drives the checklist):
+    /// checks the first open `active` task, or records a fresh done entry when
+    /// there's nothing active yet. Re-rendering recomputes the progress fill.
+    fn complete_task(&mut self, tool: &str) {
+        if let Some(t) = self.todos.iter_mut().find(|t| !t.done) {
+            t.done = true;
+            t.active = false;
+        } else {
+            // Active list so a completed task still shows as a ticked row.
+            let text = if self.todos.is_empty() {
+                format!("Complete {tool}")
+            } else {
+                self.todos.last().map(|x| x.text.clone()).unwrap_or_default()
+            };
+            if !self.todos.iter().any(|x| x.done && x.text == text) {
+                self.todos.push(TodoItem { text, done: true, active: false });
+            }
+        }
+    }
+
+    fn toggle_todo(&mut self, idx: usize) {
+        let Some(t) = self.todos.get_mut(idx) else { return };
+        t.done = !t.done;
+        if t.done {
+            t.active = false;
+        }
     }
 
     fn command_matches(&self) -> Vec<(&str, &str)> {
@@ -717,108 +1130,60 @@ fn remove_char_at(s: &mut String, char_idx: usize) {
 /// blocky splash wordmark.
 /// Warm-to-cool "AI" gradient (orange → pink → purple → blue → cyan),
 /// matching the sweep across Antigravity CLI's logo — `t` in `0.0..=1.0`.
-fn ai_gradient_color(t: f32) -> Color {
-    const STOPS: [(f32, (u8, u8, u8)); 5] = [
-        (0.0, (255, 125, 40)),
-        (0.25, (235, 70, 150)),
-        (0.5, (175, 75, 225)),
-        (0.75, (75, 125, 240)),
-        (1.0, (55, 220, 225)),
-    ];
-    let t = t.clamp(0.0, 1.0);
-    let mut lo = STOPS[0];
-    let mut hi = STOPS[STOPS.len() - 1];
-    for pair in STOPS.windows(2) {
-        if t >= pair[0].0 && t <= pair[1].0 {
-            lo = pair[0];
-            hi = pair[1];
-            break;
-        }
-    }
-    let span = (hi.0 - lo.0).max(f32::EPSILON);
-    let local_t = ((t - lo.0) / span).clamp(0.0, 1.0);
-    let mix = |a: u8, b: u8| -> u8 { (a as f32 + (b as f32 - a as f32) * local_t).round() as u8 };
-    Color::Rgb(mix(lo.1 .0, hi.1 .0), mix(lo.1 .1, hi.1 .1), mix(lo.1 .2, hi.1 .2))
-}
-
-fn zeus_logo_lines() -> Vec<Line<'static>> {
-    const LETTERS: [[&str; 6]; 4] = [
-        ["██████", ".....█", "....█.", "..█...", ".█....", "██████"], // Z
-        ["██████", "█.....", "█████.", "█.....", "█.....", "██████"], // E
-        ["█....█", "█....█", "█....█", "█....█", "█....█", "██████"], // U
-        ["██████", "█.....", "██████", ".....█", ".....█", "██████"], // S
-    ];
-    // One combined row per letter-row, letters joined with a single-column
-    // gap, so the gradient sweeps smoothly across the whole word instead of
-    // jumping in four flat per-letter blocks.
-    let combined_rows: Vec<String> = (0..6)
-        .map(|row| {
-            LETTERS
-                .iter()
-                .map(|letter| letter[row])
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect();
-    let width = combined_rows[0].chars().count().max(1);
-
-    combined_rows
-        .iter()
-        .map(|row| {
-            let spans: Vec<Span<'static>> = row
-                .chars()
-                .enumerate()
-                .map(|(col, ch)| {
-                    let display = if ch == '.' { ' ' } else { ch };
-                    let t = col as f32 / (width - 1).max(1) as f32;
-                    Span::styled(
-                        display.to_string(),
-                        Style::default().fg(ai_gradient_color(t)).add_modifier(Modifier::BOLD),
-                    )
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect()
-}
-
 fn placeholder_style() -> Style {
     theme::faint()
 }
 
-/// SuperCode-theme terminal palette (mirrors `supercode ui/*.html`).
+/// zeus-cli.html palette — variables taken 1:1 from the reference page's
+/// `:root` block (`--void` … `--red`) plus the mode accent colors, so the
+/// TUI reproduces the HTML mockup exactly.
 mod theme {
     use ratatui::style::{Color, Style};
 
-    /// Dark, near-black green-tinted page background (`#0a0c0a`).
-    pub const BG: Color = Color::Rgb(0x0a, 0x0c, 0x0a);
-    /// Slightly lighter panel background (`#14161a`).
-    pub const PANEL: Color = Color::Rgb(0x14, 0x16, 0x1a);
-    /// Bordered panel surface / slab (`#1c1f26`).
-    pub const SURFACE: Color = Color::Rgb(0x1c, 0x1f, 0x26);
-    /// Neon-green brand/accent (`#22e88f`).
-    pub const GREEN: Color = Color::Rgb(0x22, 0xe8, 0x8f);
-    /// Amber highlight / user (`#e8a83b`).
-    pub const AMBER: Color = Color::Rgb(0xe8, 0xa8, 0x3b);
-    /// Sky-blue path / link accent (`#7fb1e0`).
-    pub const BLUE: Color = Color::Rgb(0x7f, 0xb1, 0xe0);
-    /// Red for errors/destructive (`#e2564f`).
-    pub const RED: Color = Color::Rgb(0xe2, 0x56, 0x4f);
-    /// Primary readable text (`#d6d9de`).
-    pub const TEXT: Color = Color::Rgb(0xd6, 0xd9, 0xde);
-    /// Muted secondary text (`#8a8f98`).
-    pub const MUTED: Color = Color::Rgb(0x8a, 0x8f, 0x98);
-    /// Faint tertiary text (`#5c6068`).
-    pub const FAINT: Color = Color::Rgb(0x5c, 0x60, 0x68);
+    /// `--void`: page background (`#07080d`).
+    pub const VOID: Color = Color::Rgb(0x07, 0x08, 0x0d);
+    /// `--panel`: panel background (`#0d1017`).
+    pub const PANEL: Color = Color::Rgb(0x0d, 0x10, 0x17);
+    /// `--panel-2`: slightly lighter panel (`#11141c`).
+    pub const PANEL2: Color = Color::Rgb(0x11, 0x14, 0x1c);
+    /// `--elevated`: dropdown/elevated surface (`#161a24`).
+    pub const ELEVATED: Color = Color::Rgb(0x16, 0x1a, 0x24);
+    /// `--border`: borders (`#20242f`).
+    pub const BORDER: Color = Color::Rgb(0x20, 0x24, 0x2f);
+    /// `--border-soft`: soft borders (`#181c26`).
+    pub const BORDER_SOFT: Color = Color::Rgb(0x18, 0x1c, 0x26);
+    /// `--text`: primary text (`#e7e9f2`).
+    pub const TEXT: Color = Color::Rgb(0xe7, 0xe9, 0xf2);
+    /// `--text-dim`: secondary text (`#767c8f`).
+    pub const DIM: Color = Color::Rgb(0x76, 0x7c, 0x8f);
+    /// `--text-faint`: tertiary text (`#454a59`).
+    pub const FAINT: Color = Color::Rgb(0x45, 0x4a, 0x59);
+    /// `--violet`: brand accent (`#a855ff`).
+    pub const VIOLET: Color = Color::Rgb(0xa8, 0x55, 0xff);
+    /// `--violet-dim`: muted violet (`#6d2fb8`).
+    pub const VIOLET_DIM: Color = Color::Rgb(0x6d, 0x2f, 0xb8);
+    /// `--cyan` (`#22d3ee`) — Build mode accent + tool calls.
+    pub const CYAN: Color = Color::Rgb(0x22, 0xd3, 0xee);
+    /// `--gold` (`#fbbf24`) — Plan mode accent.
+    pub const GOLD: Color = Color::Rgb(0xfb, 0xbf, 0x24);
+    /// `--magenta` (`#ff3d9a`) — Auto mode accent.
+    pub const MAGENTA: Color = Color::Rgb(0xff, 0x3d, 0x9a);
+    /// `--green` (`#34d399`).
+    pub const GREEN: Color = Color::Rgb(0x34, 0xd3, 0x99);
+    /// `--red` (`#ff5f6d`).
+    pub const RED: Color = Color::Rgb(0xff, 0x5f, 0x6d);
 
+    pub fn violet() -> Style {
+        Style::default().fg(VIOLET)
+    }
+    pub fn cyan() -> Style {
+        Style::default().fg(CYAN)
+    }
+    pub fn gold() -> Style {
+        Style::default().fg(GOLD)
+    }
     pub fn green() -> Style {
         Style::default().fg(GREEN)
-    }
-    pub fn amber() -> Style {
-        Style::default().fg(AMBER)
-    }
-    pub fn blue() -> Style {
-        Style::default().fg(BLUE)
     }
     pub fn red() -> Style {
         Style::default().fg(RED)
@@ -826,24 +1191,25 @@ mod theme {
     pub fn text() -> Style {
         Style::default().fg(TEXT)
     }
-    pub fn muted() -> Style {
-        Style::default().fg(MUTED)
+    pub fn dim() -> Style {
+        Style::default().fg(DIM)
     }
     pub fn faint() -> Style {
         Style::default().fg(FAINT)
     }
+    /// User bubble text (`#c7cadb`).
+    pub fn user_text() -> Style {
+        Style::default().fg(Color::Rgb(0xc7, 0xca, 0xdb))
+    }
 }
 
 fn status_style() -> Style {
-    theme::muted()
+    theme::dim()
 }
 
-fn hint_key_style() -> Style {
-    Style::default().fg(theme::BG).bg(theme::GREEN)
-}
-
+/// Violet border used by the centered picker popups.
 fn border_style() -> Style {
-    theme::green()
+    theme::violet()
 }
 
 fn menu_height(matches: &[(&str, &str)]) -> u16 {
@@ -854,14 +1220,15 @@ fn menu_height(matches: &[(&str, &str)]) -> u16 {
     }
 }
 
-/// Slash-command dropdown — a name column (padded to align) plus a dim
-/// description column, with a full-width highlight bar on the selected row.
-/// Modeled after opencode's own `/`-menu.
+/// Slash-command dropdown — command names in violet bold, descriptions dim,
+/// highlight bar on the selected row (mirrors the HTML `.palette-item`
+/// rows with their gold command labels).
 fn render_menu(f: &mut Frame, area: Rect, matches: &[(&str, &str)], selected: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::SURFACE));
+        .border_style(Style::default().fg(theme::BORDER))
+        .style(Style::default().bg(theme::ELEVATED));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -870,27 +1237,32 @@ fn render_menu(f: &mut Frame, area: Rect, matches: &[(&str, &str)], selected: us
         .iter()
         .map(|(name, desc)| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!("/{name:<name_width$}"), theme::green().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("/{name:<name_width$}"), theme::violet().add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
                 Span::styled(desc.to_string(), placeholder_style()),
             ]))
         })
         .collect();
     let list = List::new(items).highlight_style(
-        Style::default().fg(theme::AMBER).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::GOLD).add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(selected.min(matches.len().saturating_sub(1))));
     f.render_stateful_widget(list, inner, &mut list_state);
 }
 
-/// Renders the pinned input box — SuperCode-style: a `[chat] >` prompt, a
-/// filled mode chip, and a model · provider · session status line below.
+/// The pinned input box — the HTML `.inputbar`: a mode-colored caret `›`,
+/// the placeholder "Message Zeus, or type / for commands…", and a filled
+/// mode-accent SEND button on the right. The border + caret + button all
+/// repaint when the mode switches.
 fn render_input_box(f: &mut Frame, area: Rect, state: &AppState) {
+    let accent = mode_accent(state.agent_mode);
+    let focused = !state.busy && matches!(state.mode, Mode::Chat);
+    let border = if focused { accent } else { theme::BORDER };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(border_style())
+        .border_style(Style::default().fg(border))
         .style(Style::default().bg(theme::PANEL));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -899,7 +1271,7 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState) {
 
     if let Mode::Approval(pending) = &state.mode {
         let line = Line::from(vec![
-            Span::styled("[chat] > ", theme::amber().add_modifier(Modifier::BOLD)),
+            Span::styled("⚠ ", theme::gold().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("Allow {}?", pending.request.description),
                 theme::text().add_modifier(Modifier::BOLD),
@@ -908,24 +1280,28 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled("[y] approve · [n] deny · [s] session", theme::faint()),
         ]);
         f.render_widget(Paragraph::new(line), rows[0]);
-        let preview = pending
-            .request
-            .preview
-            .as_deref()
-            .unwrap_or("")
-            .lines()
-            .next()
-            .unwrap_or("");
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(preview.to_string(), placeholder_style()))),
-            rows[1],
-        );
+        let preview = pending.request.preview.as_deref().unwrap_or("");
+        let preview_lines: Vec<Line> = if super::highlight::looks_like_diff(preview) {
+            super::highlight::diff_lines(preview, placeholder_style())
+                .into_iter()
+                .map(Line::from)
+                .collect()
+        } else {
+            vec![Line::from(Span::styled(
+                preview.lines().next().unwrap_or(""),
+                placeholder_style(),
+            ))]
+        };
+        let preview_paragraph = preview_lines.first().cloned();
+        if let Some(p) = preview_paragraph {
+            f.render_widget(Paragraph::new(p), rows[1]);
+        }
         return;
     }
 
     if let Mode::KeyEntry { provider } = &state.mode {
         let line = Line::from(vec![
-            Span::styled("[api key] ", theme::amber().add_modifier(Modifier::BOLD)),
+            Span::styled("🔑 ", theme::gold().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("paste API key for {provider}:"),
                 theme::text().add_modifier(Modifier::BOLD),
@@ -944,64 +1320,95 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let prompt_style = if state.busy { theme::faint() } else { theme::green() };
+    let caret = Span::styled(
+        "› ",
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    );
     let input_line = if state.busy {
         Line::from(vec![
-            Span::styled("[chat] ", prompt_style),
-            Span::styled("> ", prompt_style),
-            Span::styled("zeus is working…", placeholder_style()),
+            caret,
+            Span::styled(
+                format!("{} zeus is working…", spinner_glyph(state)),
+                placeholder_style(),
+            ),
         ])
     } else if state.input.is_empty() {
         Line::from(vec![
-            Span::styled("[chat] ", theme::green()),
-            Span::styled("> ", theme::green()),
-            Span::styled("Ask anything... \"Fix broken tests\"", placeholder_style()),
+            caret,
+            Span::styled("Message Zeus, or type / for commands…", placeholder_style()),
         ])
     } else {
-        Line::from(vec![
-            Span::styled("[chat] ", theme::green()),
-            Span::styled("> ", theme::green()),
-            Span::raw(state.input.clone()),
-        ])
+        Line::from(vec![caret, Span::raw(state.input.clone())])
     };
-    f.render_widget(Paragraph::new(input_line), rows[0]);
 
-    let mode_style = match state.agent_mode {
-        AgentMode::Build => Style::default().fg(theme::BG).bg(theme::GREEN),
-        AgentMode::Plan => Style::default().fg(theme::BG).bg(theme::AMBER),
-        AgentMode::Auto => Style::default().fg(theme::BG).bg(theme::BLUE),
+    let send_style = if state.busy {
+        Style::default().fg(theme::FAINT).bg(theme::BORDER_SOFT)
+    } else {
+        Style::default().fg(theme::VOID).bg(accent).add_modifier(Modifier::BOLD)
     };
+    let send = Line::from(vec![Span::styled(" SEND ", send_style)]);
+
+    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(6)]).split(rows[0]);
+    f.render_widget(Paragraph::new(input_line), cols[0]);
+    f.render_widget(Paragraph::new(send), cols[1]);
+
     let status = Line::from(vec![
-        Span::styled(format!(" {} ", state.agent_mode.label()), mode_style.add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {} ", state.agent_mode.label().to_uppercase()), mode_chip(state.agent_mode)),
         Span::styled(" · ", status_style()),
         Span::styled(state.model.clone(), theme::text()),
         Span::styled(" · ", status_style()),
-        Span::styled(state.provider.clone(), theme::muted()),
+        Span::styled(state.provider.clone(), theme::dim()),
         Span::styled(format!(" · session={}", state.session_id), theme::faint()),
     ]);
     f.render_widget(Paragraph::new(status), rows[1]);
 
-    if !state.busy && matches!(state.mode, Mode::Chat) {
-        // Cursor sits just past the `[chat] > ` prompt.
-        let base = "[chat] > ".chars().count() as u16;
+    if focused {
+        // Cursor sits just past the `› ` caret.
+        let base = 2u16;
         let cursor_col = base + char_count(&state.input.chars().take(state.cursor).collect::<String>()) as u16;
         f.set_cursor_position((inner.x + cursor_col, inner.y));
     }
 }
 
-fn render_hints(f: &mut Frame, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled(" enter ", hint_key_style()),
-        Span::raw(" send   "),
-        Span::styled(" tab ", hint_key_style()),
-        Span::raw(" plan/build   "),
-        Span::styled(" / ", hint_key_style()),
-        Span::raw(" commands   "),
-        Span::styled(" ctrl+c ", hint_key_style()),
-        Span::raw(" cancel / quit"),
+fn render_hints(f: &mut Frame, area: Rect, state: &AppState) {
+    let accent = mode_accent(state.agent_mode);
+    let left = Line::from(vec![Span::styled(
+        "⏎ send · ⇧⏎ newline · / commands · esc close",
+        theme::faint(),
+    )]);
+    let right_text = format!(
+        "mode: {} · {} · {}",
+        state.agent_mode.label().to_uppercase(),
+        state.model,
+        state.provider
+    );
+    let right = Line::from(vec![
+        Span::styled("mode: ", theme::faint()),
+        Span::styled(
+            state.agent_mode.label().to_uppercase(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {} · {}", state.model, state.provider), theme::dim()),
+    ]);
+    let parts = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(right_text.chars().count() as u16 + 2),
     ])
-    .alignment(Alignment::Center);
-    f.render_widget(Paragraph::new(line), area);
+    .split(area);
+    f.render_widget(Paragraph::new(left), parts[0]);
+    f.render_widget(Paragraph::new(right), parts[1]);
+}
+
+/// Animated activity glyph: cycles through braille frames based on elapsed
+/// time since the UI started, so "busy" states read as alive rather than
+/// stalled. The 100ms step matches the redraw cadence.
+fn spinner_frames() -> &'static [char] {
+    &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+}
+
+fn spinner_glyph(state: &AppState) -> char {
+    let frames = spinner_frames();
+    frames[(state.started.elapsed().as_millis() / 100) as usize % frames.len()]
 }
 
 fn transcript_text(state: &AppState) -> Text<'static> {
@@ -1011,106 +1418,42 @@ fn transcript_text(state: &AppState) -> Text<'static> {
         lines.push(Line::from(""));
     }
     if !state.current_reply.is_empty() {
-        let streaming = Block_ {
-            role: Role::Assistant,
-            text: state.current_reply.clone(),
-        };
+        let streaming = Block_::new(Role::Assistant, state.current_reply.clone());
         lines.extend(streaming.to_lines());
     } else if state.busy {
-        lines.push(Line::from(Span::styled("● thinking…", placeholder_style())));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", spinner_glyph(state)),
+                theme::violet().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("thinking…", theme::dim()),
+        ]));
+    } else if state.transcript.is_empty() {
+        // Empty-session splash: the animated rainbow/pulse ZEUS wordmark.
+        let t = state.started.elapsed().as_millis();
+        lines.extend(
+            super::decor::animated_banner(t)
+                .into_iter()
+                .map(Line::from),
+        );
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "· let me build with you ·",
+            theme::faint(),
+        )]));
     }
     Text::from(lines)
 }
 
-fn render_splash(f: &mut Frame, area: Rect, state: &AppState, matches: &[(&str, &str)]) {
-    let logo = zeus_logo_lines();
-    let logo_h = logo.len() as u16;
-    let dir_h: u16 = 5; // directory info panel
-    let box_h: u16 = 4;
-    let menu_h = menu_height(matches);
-    let hint_h: u16 = 1;
-    let gap1: u16 = 2;
-    let gap2: u16 = 1;
-    let gap3: u16 = 2;
-    let total = dir_h + gap1 + logo_h + gap2 + menu_h + box_h + gap3 + hint_h;
-    let top_pad = area.height.saturating_sub(total) / 2;
-
-    let rows = Layout::vertical([
-        Constraint::Length(top_pad),
-        Constraint::Length(dir_h),
-        Constraint::Length(gap1),
-        Constraint::Length(logo_h),
-        Constraint::Length(gap2),
-        Constraint::Length(menu_h),
-        Constraint::Length(box_h),
-        Constraint::Length(gap3),
-        Constraint::Length(hint_h),
-        Constraint::Min(0),
-    ])
-    .split(area);
-
-    let box_w = area.width.saturating_sub(4).min(76).max(30);
-    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(box_w), Constraint::Min(0)]);
-
-    render_dir_panel(f, cols.split(rows[1])[1], state);
-    f.render_widget(Paragraph::new(logo).alignment(Alignment::Center), rows[3]);
-
-    if menu_h > 0 {
-        render_menu(f, cols.split(rows[5])[1], matches, state.command_selected);
-    }
-    render_input_box(f, cols.split(rows[6])[1], state);
-    render_hints(f, rows[8]);
-}
-
-/// SuperCode-style bordered "directory" panel: workspace, path, git branch
-/// (if any), and file count — mirroring the `supercode_cli_chat_screen`
-/// mockup's workspace/path/git/files box.
-fn render_dir_panel(f: &mut Frame, area: Rect, state: &AppState) {
-    let d = &state.dir;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::SURFACE))
-        .title(Line::from(
-            Span::styled(" directory ", theme::green()),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("workspace", theme::green().add_modifier(Modifier::BOLD)),
-            Span::styled(" · ", theme::faint()),
-            Span::styled(d.workspace.clone(), theme::text()),
-        ]),
-        Line::from(vec![
-            Span::styled("path", theme::green().add_modifier(Modifier::BOLD)),
-            Span::styled(" · ", theme::faint()),
-            Span::styled(d.path.clone(), theme::blue()),
-        ]),
-        Line::from(vec![
-            Span::styled("files", theme::green().add_modifier(Modifier::BOLD)),
-            Span::styled(" · ", theme::faint()),
-            Span::styled(d.file_count.to_string(), theme::text()),
-        ]),
-    ];
-    if let Some(branch) = &d.git_branch {
-        lines.push(Line::from(vec![
-            Span::styled("git", theme::green().add_modifier(Modifier::BOLD)),
-            Span::styled(" · ", theme::faint()),
-            Span::styled(branch.clone(), theme::amber()),
-            Span::styled(" ●", theme::green()),
-        ]));
-    }
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
-fn render_chat(f: &mut Frame, area: Rect, state: &AppState, matches: &[(&str, &str)]) {
+/// The chat column: scrolling transcript on top, the slash-command dropdown
+/// and the pinned input bar + hint row at the bottom — mirroring the HTML's
+/// `.chatcol` layout.
+fn render_chat_column(f: &mut Frame, area: Rect, state: &AppState, matches: &[(&str, &str)]) {
     let menu_h = menu_height(matches);
     let rows = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(menu_h),
-        Constraint::Length(4),
+        Constraint::Length(2),
         Constraint::Length(1),
     ])
     .split(area);
@@ -1124,20 +1467,11 @@ fn render_chat(f: &mut Frame, area: Rect, state: &AppState, matches: &[(&str, &s
         .scroll((scroll, 0));
     f.render_widget(para, rows[0]);
 
-    // The input box (and its dropdown menu) stay a fixed, centered width —
-    // same as the splash view and the same idea as opencode's own chatbox —
-    // rather than stretching edge-to-edge just because the transcript above
-    // it uses the full terminal width.
-    let box_w = area.width.saturating_sub(4).min(76).max(30);
-    let boxed = Layout::horizontal([Constraint::Min(0), Constraint::Length(box_w), Constraint::Min(0)]);
-
     if menu_h > 0 {
-        let menu_cols = boxed.split(rows[1]);
-        render_menu(f, menu_cols[1], matches, state.command_selected);
+        render_menu(f, rows[1], matches, state.command_selected);
     }
-    let input_cols = boxed.split(rows[2]);
-    render_input_box(f, input_cols[1], state);
-    render_hints(f, rows[3]);
+    render_input_box(f, rows[2], state);
+    render_hints(f, rows[3], state);
 }
 
 /// Centers a `width`x`height` box within `area` (clamped to fit).
@@ -1163,8 +1497,8 @@ fn render_model_picker(
     entries: &[PickerEntry],
     selected: usize,
 ) -> Rect {
-    let width = area.width.saturating_sub(6).min(70).max(30);
-    let height = (entries.len() as u16 + 4).min(area.height.saturating_sub(4)).max(6);
+    let width = area.width.saturating_sub(6).clamp(30, 70);
+    let height = (entries.len() as u16 + 4).clamp(6, area.height.saturating_sub(4));
     let popup = centered_rect(width, height, area);
 
     f.render_widget(Clear, popup);
@@ -1195,13 +1529,13 @@ fn render_model_picker(
                     Span::styled(marker, theme::green().add_modifier(Modifier::BOLD)),
                     Span::styled(model.name.clone(), theme::text()),
                     Span::raw("  "),
-                    Span::styled(model.id.clone(), theme::muted()),
+                    Span::styled(model.id.clone(), theme::dim()),
                 ]))
             }
         })
         .collect();
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::SURFACE).fg(theme::GREEN).add_modifier(Modifier::BOLD),
+        Style::default().bg(theme::PANEL2).fg(theme::VIOLET).add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(selected.min(entries.len().saturating_sub(1))));
@@ -1221,8 +1555,8 @@ fn render_provider_picker(
     entries: &[ProviderEntry],
     selected: usize,
 ) -> Rect {
-    let width = area.width.saturating_sub(6).min(76).max(36);
-    let height = (entries.len() as u16 + 4).min(area.height.saturating_sub(4)).max(8);
+    let width = area.width.saturating_sub(6).clamp(36, 76);
+    let height = (entries.len() as u16 + 4).clamp(8, area.height.saturating_sub(4));
     let popup = centered_rect(width, height, area);
 
     f.render_widget(Clear, popup);
@@ -1258,7 +1592,7 @@ fn render_provider_picker(
                 ready,
             } => {
                 let is_current = name == current_provider;
-                let dot = if *ready { theme::green() } else { theme::amber() };
+                let dot = if *ready { theme::green() } else { theme::gold() };
                 let dot_label = if *ready { "●" } else { "◌" };
                 let status = if is_current { " (current)" } else { "" };
                 let key_note = if *ready {
@@ -1272,9 +1606,9 @@ fn render_provider_picker(
                     Span::styled(name.clone(), theme::text().add_modifier(Modifier::BOLD)),
                     Span::styled(status, theme::green()),
                     Span::raw("  "),
-                    Span::styled(kind.clone(), theme::muted()),
+                    Span::styled(kind.clone(), theme::dim()),
                     Span::styled(format!(" / {model}"), theme::faint()),
-                    Span::styled(key_note, theme::amber()),
+                    Span::styled(key_note, theme::gold()),
                 ]))
             }
             ProviderEntry::Model { model, free, .. } => {
@@ -1287,7 +1621,7 @@ fn render_provider_picker(
                 let tier = if *free {
                     Span::styled("free", theme::green().add_modifier(Modifier::BOLD))
                 } else {
-                    Span::styled("paid", theme::amber().add_modifier(Modifier::BOLD))
+                    Span::styled("paid", theme::gold().add_modifier(Modifier::BOLD))
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw("   "),
@@ -1301,7 +1635,7 @@ fn render_provider_picker(
         })
         .collect();
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::SURFACE).fg(theme::GREEN).add_modifier(Modifier::BOLD),
+        Style::default().bg(theme::PANEL2).fg(theme::VIOLET).add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(selected.min(entries.len().saturating_sub(1))));
@@ -1310,28 +1644,488 @@ fn render_provider_picker(
     inner
 }
 
+/// The top bar is 3 rows and the bottom hint/session line is 1, per the HTML.
+const TOPBAR_H: u16 = 3;
+/// Right-hand sidebar width (the HTML's 300px TODO panel ≈ 44 columns).
+const SIDE_W: u16 = 44;
+
+/// Linearly interpolate between two RGB colors (used for the TODO progress
+/// bar's violet → mode-accent gradient).
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    fn rgb(c: Color) -> (u8, u8, u8) {
+        match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => (120, 120, 120),
+        }
+    }
+    let (ar, ag, ab) = rgb(a);
+    let (br, bg, bb) = rgb(b);
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
+}
+
+/// Top bar — the HTML `.topbar`: logo + version on the left, the mode
+/// segmented-pill control, and the provider button (with status dot) tucked
+/// in the top-right corner. Returns the provider button's rect for mouse hit
+/// testing.
+fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, config: &Config) -> Option<Rect> {
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    // Row 0: logo (left) + provider button (right). The wordmark carries the
+    // same rainbow/pulse sweep as the splash logo; the ⚡ bolt stays violet.
+    let t = state.started.elapsed().as_millis();
+    let wordmark = super::decor::animated_wordmark("ZEUS", t);
+    let mut logo_spans = vec![
+        Span::styled("⚡ ", theme::violet().add_modifier(Modifier::BOLD)),
+    ];
+    logo_spans.extend(wordmark);
+    logo_spans.push(Span::styled("  v1.0", theme::faint()));
+    let logo = Line::from(logo_spans);
+    let provider_text = format!(
+        "● {}  {}  ▾",
+        state.provider, state.model
+    );
+    let provider_w = provider_text.chars().count() as u16;
+    let top = Layout::horizontal([Constraint::Min(0), Constraint::Length(provider_w + 2)]).split(rows[0]);
+    f.render_widget(Paragraph::new(logo), top[0]);
+
+    let provider_line = Line::from(vec![
+        Span::styled("● ", provider_status_style(config, &state.provider)),
+        Span::styled(state.provider.clone(), theme::dim()),
+        Span::styled("  ", theme::faint()),
+        Span::styled(state.model.clone(), theme::text().add_modifier(Modifier::BOLD)),
+        Span::styled("  ▾", theme::faint()),
+    ]);
+    f.render_widget(Paragraph::new(provider_line), top[1]);
+    let provider_btn = top[1];
+
+    // Row 1: mode segmented pills + a status readout on the right.
+    render_mode_pills(f, rows[1], state.agent_mode);
+
+    // Row 2: hairline separator (HTML `border-bottom` of the topbar).
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(theme::BORDER),
+        ))),
+        rows[2],
+    );
+
+    Some(provider_btn)
+}
+
+/// The HTML `.modes` segmented control — PLAN/BUILD/AUTO with the active
+/// segment filled in its mode accent and the others dimmed.
+fn render_mode_pills(f: &mut Frame, area: Rect, mode: AgentMode) {
+    let pills = [
+        ("PLAN", AgentMode::Plan),
+        ("BUILD", AgentMode::Build),
+        ("AUTO", AgentMode::Auto),
+    ];
+    let mut spans = vec![Span::styled("  [ ", theme::faint())];
+    for (i, (name, m)) in pills.iter().enumerate() {
+        if *m == mode {
+            spans.push(Span::styled(
+                format!(" {} ", name),
+                Style::default()
+                    .fg(theme::VOID)
+                    .bg(mode_accent(*m))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(format!(" {} ", name), theme::dim()));
+        }
+        if i < 2 {
+            spans.push(Span::styled(" │ ", theme::faint()));
+        }
+    }
+    spans.push(Span::styled(" ]", theme::faint()));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The HTML `.side` panel: TODOs header w/ live count, the progress bar
+/// (fills as tasks are completed), the checklist, and the session footer.
+/// Returns the todo-list rect for mouse-click row mapping.
+fn render_side(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
+    // Fill the panel background.
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(theme::PANEL)),
+        area,
+    );
+
+    let done = state.todos.iter().filter(|t| t.done).count();
+    let total = state.todos.len();
+    let accent = mode_accent(state.agent_mode);
+
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(4),
+    ])
+    .split(area);
+
+    // Header.
+    let head = Line::from(vec![
+        Span::styled(
+            "TODOs",
+            Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{done} / {total}"),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(head), rows[0]);
+
+    // Progress bar (violet → accent gradient).
+    render_progress(f, rows[1], done, total, accent);
+
+    // TODO list.
+    let todo_list_area = rows[2];
+    render_todos(f, todo_list_area, state);
+
+    // Footer: Session / Tokens / Cost / Branch.
+    render_side_foot(f, rows[3], state);
+
+    todo_list_area
+}
+
+fn render_progress(f: &mut Frame, area: Rect, done: usize, total: usize, accent: Color) {
+    let w = area.width as usize;
+    let filled = if total == 0 {
+        0
+    } else {
+        ((done as f64 / total as f64) * w as f64).round() as usize
+    };
+    let mut spans = Vec::new();
+    for i in 0..w {
+        if i < filled {
+            let t = if filled > 1 {
+                i as f32 / (filled - 1) as f32
+            } else {
+                1.0
+            };
+            spans.push(Span::styled("█", Style::default().fg(lerp_color(theme::VIOLET, accent, t))));
+        } else {
+            spans.push(Span::styled("·", theme::faint()));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_todos(f: &mut Frame, area: Rect, state: &AppState) {
+    let accent = mode_accent(state.agent_mode);
+    let mut lines = Vec::new();
+    if state.todos.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  no tasks yet — ask Zeus to fix something", theme::faint()),
+        ]));
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    for item in &state.todos {
+        let box_mark = if item.done { "✓" } else { " " };
+        let box_style = if item.done {
+            Style::default()
+                .fg(theme::VOID)
+                .bg(theme::GREEN)
+                .add_modifier(Modifier::BOLD)
+        } else if item.active {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            theme::faint()
+        };
+        let label_style = if item.done {
+            Style::default().fg(theme::FAINT).add_modifier(Modifier::CROSSED_OUT)
+        } else if item.active {
+            Style::default().fg(accent)
+        } else {
+            theme::text()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("[", theme::faint()),
+            Span::styled(box_mark, box_style),
+            Span::styled("]", theme::faint()),
+            Span::raw(" "),
+            Span::styled(item.text.clone(), label_style),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_side_foot(f: &mut Frame, area: Rect, state: &AppState) {
+    let branch = state
+        .dir
+        .git_branch
+        .clone()
+        .unwrap_or_else(|| "(no git repo)".to_string());
+    let elapsed = state.started.elapsed();
+    let secs = elapsed.as_secs();
+    let session = format!("{}m {:02}s", secs / 60, secs % 60);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let vals: [(String, String); 4] = [
+        ("Session".into(), session),
+        ("Tokens".into(), "0 / 200k".into()),
+        ("Cost".into(), "$0.00".into()),
+        ("Branch".into(), branch),
+    ];
+    for (i, (k, v)) in vals.iter().enumerate() {
+        let line = Line::from(vec![
+            Span::styled(k.clone(), theme::faint()),
+            Span::styled("  ", theme::faint()),
+            Span::styled(v.clone(), theme::dim()),
+        ]);
+        f.render_widget(Paragraph::new(line), rows[i]);
+    }
+}
+
+/// Filter trimmed drop_searched dropdown entries into (original_index,
+/// row). Header/footer rows are excluded.
+/// Filter trimmed `drop_search` entries into a flat row list (header rows
+/// included so the group names render, but never selectable). Header rows
+/// are dropped entirely while a search query is active, since a flat match
+/// list needs no group labels.
+fn drop_filtered(state: &AppState) -> Vec<ProviderEntry> {
+    let Some(dd) = &state.dropdown else { return Vec::new() };
+    let q = state.drop_search.to_lowercase();
+    dd.entries
+        .iter().filter(|&e| match e {
+            ProviderEntry::Header(_) => q.is_empty(),
+            ProviderEntry::Provider { name, model, .. } => {
+                q.is_empty() || name.to_lowercase().contains(&q) || model.to_lowercase().contains(&q)
+            }
+            ProviderEntry::Model { provider, model, .. } => {
+                q.is_empty()
+                    || model.name.to_lowercase().contains(&q)
+                    || model.id.to_lowercase().contains(&q)
+                    || provider.to_lowercase().contains(&q)
+            }
+        }).cloned()
+        .collect()
+}
+
+/// The top-right provider dropdown — the HTML `.provider-panel`. Shows a
+/// search bar and the provider/model rows while browsing; swaps to an inline
+/// API-key entry when a key-less provider/model is chosen.
+fn render_dropdown(f: &mut Frame, area: Rect, state: &AppState) -> Option<Rect> {
+    let dd = state.dropdown.as_ref()?;
+    let keying = dd.keying.as_ref();
+    let w = area.width.min(56);
+    let list_h = if keying.is_some() {
+        3
+    } else {
+        let n = drop_filtered(state).len().min(16) as u16;
+        1 + n + 1
+    };
+    let h = (list_h + 2).min(area.height.saturating_sub(TOPBAR_H));
+    let x = area.x + area.width.saturating_sub(w);
+    let y = area.y + TOPBAR_H;
+    let rect = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::VIOLET_DIM))
+        .style(Style::default().bg(theme::ELEVATED));
+    f.render_widget(block.clone(), rect);
+    let inner = block.inner(rect);
+
+    if let Some(k) = keying {
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+            .split(inner);
+        let prompt = Line::from(vec![
+            Span::styled("🔑 API key for ", theme::gold().add_modifier(Modifier::BOLD)),
+            Span::styled(k.provider.clone(), theme::text().add_modifier(Modifier::BOLD)),
+        ]);
+        f.render_widget(Paragraph::new(prompt), rows[0]);
+        let key_line = if k.key.is_empty() {
+            Line::from(vec![Span::styled(
+                "  paste the key…",
+                placeholder_style(),
+            )])
+        } else {
+            let mut masked: String = String::new();
+            let visible = k
+                .key
+                .chars()
+                .last()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| " ".into());
+            masked.push_str(&"•".repeat(k.key.chars().count().saturating_sub(1)));
+            masked.push_str(&visible);
+            Line::from(vec![
+                Span::styled("  ", theme::faint()),
+                Span::styled(masked, theme::green()),
+            ])
+        };
+        f.render_widget(Paragraph::new(key_line), rows[1]);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                " enter save · esc back · backspace edit ",
+                theme::faint(),
+            )])),
+            rows[2],
+        );
+    } else {
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+        let search_line = if state.drop_search.is_empty() {
+            Line::from(vec![
+                Span::styled("▸", theme::violet()),
+                Span::raw("  "),
+                Span::styled("Search providers or models…", placeholder_style()),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("▸ ", theme::violet()),
+                Span::styled(state.drop_search.clone(), theme::text()),
+            ])
+        };
+        f.render_widget(Paragraph::new(search_line), rows[0]);
+
+        let filtered = drop_filtered(state);
+        if !state.drop_search.is_empty() && filtered.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  no matches", theme::faint()),
+                ])),
+                rows[1],
+            );
+            return Some(rect);
+        }
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .map(|e| match e {
+                ProviderEntry::Header(name) => ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", name.to_uppercase()),
+                        theme::green().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                ])),
+                ProviderEntry::Provider { name, kind: _, model, ready } => {
+                    let dot = if *ready { "●" } else { "◌" };
+                    let dot_style = if *ready { theme::green() } else { theme::gold() };
+                    let need = if *ready { "" } else { " key" };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(dot, dot_style.add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(name.clone(), theme::text().add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(model.clone(), theme::faint()),
+                        Span::styled(need, theme::gold()),
+                    ]))
+                }
+                ProviderEntry::Model { provider, model, free, .. } => {
+                    let tier = if *free { "free" } else { "paid" };
+                    let tier_style = if *free { theme::green() } else { theme::gold() };
+                    ListItem::new(Line::from(vec![
+                        Span::raw("  · "),
+                        Span::styled(model.name.clone(), theme::text()),
+                        Span::raw(" "),
+                        Span::styled(tier, tier_style.add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(provider.clone(), theme::faint()),
+                    ]))
+                }
+            })
+            .collect();
+        let list = List::new(items).highlight_style(
+            Style::default()
+                .bg(theme::PANEL2)
+                .fg(theme::VIOLET)
+                .add_modifier(Modifier::BOLD),
+        );
+        let mut list_state = ListState::default();
+        let selectable = filtered.len().saturating_sub(1);
+        let sel = (0..=selectable)
+            .rev()
+            .find(|&i| {
+                !matches!(filtered.get(i), Some(ProviderEntry::Header(_)))
+            })
+            .unwrap_or(0);
+        list_state.select(Some(sel.min(selectable)));
+        f.render_stateful_widget(list, rows[1], &mut list_state);
+    }
+
+    Some(rect)
+}
+
+/// The provider dot in the top-right button and pickers: green when the
+fn provider_status_ok(config: &Config, provider: &str) -> bool {
+    let Some(cfg) = config.providers.get(provider) else {
+        return false;
+    };
+    if matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp")
+        || cfg.headers.contains_key("Authorization")
+    {
+        return true;
+    }
+    match &cfg.api_key_env {
+        Some(var) => std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false),
+        None => true,
+    }
+}
+
+fn provider_status_style(config: &Config, provider: &str) -> Style {
+    if provider_status_ok(config, provider) {
+        theme::green()
+    } else {
+        theme::gold()
+    }
+}
+
 fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     let area = f.area();
 
-    // Frame the whole app with a SuperCode-style header bar on top and a
-    // status bar along the bottom, like the HTML mockups' breadcrumb header
-    // and the `[chat] · model · tab mode` footer.
+    // Fill the whole frame with the void background first.
+    f.render_widget(Block::default().style(Style::default().bg(theme::VOID)), area);
+
     let rows = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(TOPBAR_H),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .split(area);
-    render_header_bar(f, rows[0], state, config);
 
-    let matches = state.command_matches();
-    if state.transcript.is_empty() && state.current_reply.is_empty() {
-        render_splash(f, rows[1], state, &matches);
-    } else {
-        render_chat(f, rows[1], state, &matches);
+    if let Some(btn) = render_topbar(f, rows[0], state, config) {
+        state.provider_btn_area = Some(btn);
     }
 
-    render_status_bar(f, rows[2], state);
+    let has_side = area.width >= 100;
+    let main = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(if has_side { SIDE_W } else { 0 }),
+    ])
+    .split(rows[1]);
+    state.todo_area = if has_side { Some(main[1]) } else { None };
+
+    let matches = state.command_matches();
+    render_chat_column(f, main[0], state, &matches);
+
+    if has_side {
+        let list_area = render_side(f, main[1], state);
+        state.todo_area = Some(list_area);
+    }
+
+    // Top-right provider dropdown popover (drawn above the main content).
+    if let Some(rect) = render_dropdown(f, rows[1], state) {
+        if let Some(dd) = state.dropdown.as_mut() {
+            dd.area = Some(rect);
+        }
+    } else if let Some(dd) = state.dropdown.as_mut() {
+        dd.area = None;
+    }
 
     let picker_area = if let Mode::ModelPicker { entries, selected } = &state.mode {
         Some(render_model_picker(f, area, &state.model, entries, *selected))
@@ -1354,118 +2148,6 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
             None
         };
     state.provider_picker_area = provider_picker_area;
-}
-
-/// SuperCode-style breadcrumb header: `supercode · chat · <model>` on the
-/// left with a green left-rule, status (`ready`/`busy · type to chat`) on
-/// the right, separated by a horizontal rule.
-fn render_header_bar(f: &mut Frame, area: Rect, state: &AppState, config: &Config) {
-    let status_right = if state.busy {
-        "busy · esc to interrupt"
-    } else {
-        "ready · type to chat"
-    };
-    let parts = Layout::horizontal([Constraint::Min(0), Constraint::Length(status_right.len() as u16 + 4)])
-        .split(area);
-    let left = Line::from(vec![
-        Span::styled("zeus", theme::green().add_modifier(Modifier::BOLD)),
-        Span::styled(" · ", theme::faint()),
-        Span::styled("chat", theme::text()),
-        Span::styled(" · ", theme::faint()),
-        Span::styled(provider_dot(config, &state.provider), provider_status_style(config, &state.provider)),
-        Span::styled(state.provider.clone(), theme::text().add_modifier(Modifier::BOLD)),
-        Span::styled(" / ", theme::faint()),
-        Span::styled(state.model.clone(), theme::text()),
-        Span::styled(" · ", theme::faint()),
-        Span::styled(format!("session={}", state.session_id), theme::muted()),
-    ]);
-    f.render_widget(Paragraph::new(left), parts[0]);
-
-    let right = Line::from(vec![
-        Span::styled(
-            if state.busy { "busy" } else { "ready" },
-            if state.busy { theme::amber() } else { theme::green() },
-        ),
-        Span::styled(" · ", theme::faint()),
-        Span::styled(
-            if state.busy { "esc to interrupt" } else { "type to chat" },
-            theme::muted(),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(right.alignment(Alignment::Right)), parts[1]);
-
-    let dash = Line::from(Span::styled(
-        "─".repeat(area.width as usize),
-        Style::default().fg(theme::SURFACE),
-    ));
-    f.render_widget(Paragraph::new(dash), Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    });
-}
-
-/// A leading status glyph for a provider in the header: green dot when it
-/// actually has a key (cloud) or is a local kind, amber dot when a cloud
-/// provider is missing its key.
-fn provider_dot(config: &Config, provider: &str) -> &'static str {
-    if provider_status_ok(config, provider) {
-        "●"
-    } else {
-        "●"
-    }
-}
-
-fn provider_status_ok(config: &Config, provider: &str) -> bool {
-    let Some(cfg) = config.providers.get(provider) else {
-        return false;
-    };
-    if matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp") {
-        true
-    } else if cfg.headers.contains_key("Authorization") {
-        true
-    } else if let Some(var) = &cfg.api_key_env {
-        std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false)
-    } else {
-        true
-    }
-}
-
-fn provider_status_style(config: &Config, provider: &str) -> Style {
-    if provider_status_ok(config, provider) {
-        theme::green()
-    } else {
-        theme::amber()
-    }
-}
-
-/// SuperCode-style bottom status bar: mode chip + git branch + connected,
-/// and a version on the right — the `[chat] · glm-5.2 · tab mode` footer.
-fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
-    let git = state
-        .dir
-        .git_branch
-        .clone()
-        .unwrap_or_else(|| "(no git repo)".to_string());
-    let line = Line::from(vec![
-        Span::styled(format!(" {} ", state.agent_mode.label()), {
-            let bg = match state.agent_mode {
-                AgentMode::Build => theme::GREEN,
-                AgentMode::Plan => theme::AMBER,
-                AgentMode::Auto => theme::BLUE,
-            };
-            Style::default().fg(theme::BG).bg(bg).add_modifier(Modifier::BOLD)
-        }),
-        Span::styled(" · ", theme::faint()),
-        Span::styled(state.model.clone(), theme::muted()),
-        Span::styled(" · ", theme::faint()),
-        Span::styled("⚡ ", theme::green()),
-        Span::styled(format!("{git} · {} files", state.dir.file_count), theme::muted()),
-        Span::raw("  "),
-        Span::styled("zeus", theme::green()),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
 }
 
 type TurnJoin = JoinHandle<(Agent, zeus_agent::Result<TurnResult>)>;
@@ -1507,6 +2189,48 @@ fn start_turn(
     *turn_handle = Some(handle);
 }
 
+/// `/plan <goal>`: same plumbing as `start_turn`, but drives
+/// `Agent::plan_turn` — research read-only, persist `.agent/tasks.json`,
+/// and return without executing anything. Plan mode stays on afterwards so
+/// the next turns remain observational until the user switches to Auto.
+fn start_plan_turn(
+    state: &mut AppState,
+    agent_slot: &mut Option<Agent>,
+    turn_handle: &mut Option<TurnJoin>,
+    cancel_tx: &mut Option<watch::Sender<bool>>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    message: String,
+    yes: bool,
+) {
+    let Some(mut agent) = agent_slot.take() else {
+        return;
+    };
+    *cancel_tx = Some(agent.cancel_handle());
+    state.busy = true;
+    let tx_events = ui_tx.clone();
+    let tx_approval = ui_tx.clone();
+    let handle = tokio::spawn(async move {
+        let on_event = move |ev: AgentEvent| {
+            let _ = tx_events.send(UiEvent::Agent(ev));
+        };
+        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
+            if yes {
+                return ApprovalDecision::Approved;
+            }
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
+                request: req.clone(),
+                reply: reply_tx,
+            }));
+            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
+        };
+        let result = agent.plan_turn(&message, on_event, approver).await;
+        (agent, result)
+    });
+    *turn_handle = Some(handle);
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_key(
     key: KeyEvent,
     state: &mut AppState,
@@ -1528,6 +2252,87 @@ async fn handle_key(
             if let Mode::Approval(pending) = std::mem::replace(&mut state.mode, Mode::Chat) {
                 let _ = pending.reply.send(decision);
             }
+        }
+        return Ok(());
+    }
+
+    // ---- Top-right provider dropdown (search / key entry) ----
+    if state.dropdown.is_some() {
+        // Inline API-key entry mode.
+        if let Some(k) = state
+            .dropdown
+            .as_ref()
+            .and_then(|d| d.keying.as_ref())
+            .map(|k| (k.provider.clone(), k.key.clone()))
+        {
+            let (provider, keybuf) = k;
+            let mut keyval = keybuf;
+            match key.code {
+                KeyCode::Enter => {
+                    state.dropdown = None;
+                    persist_key_and_switch(&provider, &keyval, config, agent_slot, state);
+                }
+                KeyCode::Esc => {
+                    if let Some(d) = state.dropdown.as_mut() {
+                        d.keying = None;
+                    }
+                }
+                KeyCode::Backspace => {
+                    keyval.pop();
+                    if let Some(d) = state.dropdown.as_mut() {
+                        d.keying.as_mut().unwrap().key = keyval;
+                    }
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    keyval.push(c);
+                    if let Some(d) = state.dropdown.as_mut() {
+                        d.keying.as_mut().unwrap().key = keyval;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // List mode — search + navigate. Group headers are part of the
+        // filtered list for rendering, but navigation and selection skip them.
+        let filtered = drop_filtered(state);
+        match key.code {
+            KeyCode::Esc => state.dropdown = None,
+            KeyCode::Up => {
+                if let Some(d) = state.dropdown.as_mut() {
+                    d.selected = dropdown_prev_selectable(&filtered, d.selected);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(d) = state.dropdown.as_mut() {
+                    d.selected = dropdown_next_selectable(&filtered, d.selected);
+                }
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                let sel = state
+                    .dropdown
+                    .as_ref()
+                    .map(|d| d.selected)
+                    .unwrap_or(0);
+                if let Some(entry) = filtered.get(sel) {
+                    let picked = entry.clone();
+                    dropdown_apply(state, agent_slot, config, &picked);
+                }
+            }
+            KeyCode::Backspace => {
+                state.drop_search.pop();
+                if let Some(d) = state.dropdown.as_mut() {
+                    d.selected = 0;
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.drop_search.push(c);
+                if let Some(d) = state.dropdown.as_mut() {
+                    d.selected = 0;
+                }
+            }
+            _ => {}
         }
         return Ok(());
     }
@@ -1656,6 +2461,22 @@ async fn handle_key(
         return Ok(());
     }
 
+    // ESC acts as the universal pause/cancel: during an in-flight turn it
+    // stops the agent loop and any running bash tool (same path as Ctrl-C);
+    // at idle it clears the current input instead of accidental quit.
+    if key.code == KeyCode::Esc {
+        if state.busy {
+            if let Some(tx) = cancel_tx.as_ref() {
+                let _ = tx.send(true);
+            }
+            state.push_info("ESC pressed — pausing in-flight turn");
+        } else {
+            state.input.clear();
+            state.cursor = 0;
+        }
+        return Ok(());
+    }
+
     if state.busy {
         return Ok(());
     }
@@ -1731,6 +2552,42 @@ async fn handle_key(
                         state.current_reply.clear();
                         state.push_info(format!("cleared — new session={}", state.session_id));
                     }
+                    "new" => {
+                        let agent = build_agent_repl(config).await?;
+                        apply_agent_mode(&agent, state.agent_mode);
+                        state.session_id = agent.session_id().to_string();
+                        state.model = agent.model().to_string();
+                        state.provider = agent.provider_id().to_string();
+                        *agent_slot = Some(agent);
+                        state.transcript.clear();
+                        state.current_reply.clear();
+                        state.push_info(format!(
+                            "new session started — session={}",
+                            state.session_id
+                        ));
+                    }
+                    "autocompact" => {
+                        let on = arg.to_ascii_lowercase();
+                        if let Some(agent) = agent_slot.as_mut() {
+                            match on.as_str() {
+                                "on" => {
+                                    agent.set_auto_compact(true);
+                                    state.push_info("auto-compaction: on");
+                                }
+                                "off" => {
+                                    agent.set_auto_compact(false);
+                                    state.push_info("auto-compaction: off");
+                                }
+                                _ => {
+                                    let on = agent.auto_compact();
+                                    state.push_info(format!(
+                                        "auto-compaction: {} — use /autocompact on|off",
+                                        if on { "on" } else { "off" }
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     "compact" => {
                         if let Some(agent) = agent_slot.as_mut() {
                             match agent.compact_now().await {
@@ -1803,7 +2660,7 @@ async fn handle_key(
                     }
                     "session" => state.push_info(format!("session={}", state.session_id)),
                     "agents" => {
-                        if arg.to_ascii_lowercase() == "count" {
+                        if arg.eq_ignore_ascii_case("count") {
                             let pools = personas_by_department();
                             let total: usize = pools.iter().map(|(_, list)| list.len()).sum();
                             state.push_info(format!("{total} specialist agents"));
@@ -1836,6 +2693,42 @@ async fn handle_key(
                             apply_agent_mode(agent, next);
                         }
                         state.push_info(format!("mode: {}", next.label()));
+                    }
+                    "plan" => {
+                        if arg.is_empty() {
+                            state.push_error("usage: /plan <goal>");
+                        } else {
+                            state.agent_mode = AgentMode::Plan;
+                            if let Some(agent) = agent_slot.as_ref() {
+                                apply_agent_mode(agent, AgentMode::Plan);
+                            }
+                            state.push_user(trimmed.clone());
+                            start_plan_turn(
+                                state,
+                                agent_slot,
+                                turn_handle,
+                                cancel_tx,
+                                ui_tx,
+                                arg.to_string(),
+                                yes,
+                            );
+                        }
+                    }
+                    "copy" => {
+                        let block = state
+                            .transcript
+                            .iter()
+                            .rev()
+                            .find(|b| matches!(b.role, Role::Assistant | Role::Tool));
+                        match block {
+                            Some(b) => match super::clipboard::copy(&b.plain_text()) {
+                                Ok(()) => {
+                                    state.push_info("copied last block to clipboard");
+                                }
+                                Err(e) => state.push_error(format!("copy failed: {e}")),
+                            },
+                            None => state.push_error("nothing to copy yet"),
+                        }
                     }
                     _ => {
                         let expanded = expand_slash_command(config, trimmed.clone());
@@ -1886,7 +2779,72 @@ async fn handle_key(
 /// immediately (matching opencode's own click-to-choose), scroll to move
 /// the highlight without applying. Only meaningful while the picker is
 /// open — mouse events are otherwise ignored.
-fn handle_mouse(ev: MouseEvent, state: &mut AppState, agent_slot: &mut Option<Agent>, config: &Config) {
+async fn handle_mouse(ev: MouseEvent, state: &mut AppState, agent_slot: &mut Option<Agent>, config: &Config) {
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        let col = ev.column;
+        let row = ev.row;
+        let in_provider = state
+            .provider_btn_area
+            .map(|a| col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height)
+            .unwrap_or(false);
+        let in_drop = state
+            .dropdown
+            .as_ref()
+            .and_then(|d| d.area)
+            .map(|a| col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height)
+            .unwrap_or(false);
+
+        // Dropdown is open: pick a row inside it, close when clicking outside.
+        if state.dropdown.is_some() {
+            if in_provider {
+                state.dropdown = None;
+                state.drop_search.clear();
+                return;
+            }
+            if in_drop {
+                let area = state.dropdown.as_ref().unwrap().area.unwrap();
+                // List rows start just past the border + search row.
+                let list_top = area.y + 2;
+                let idx = row as isize - list_top as isize;
+                let filtered = drop_filtered(state);
+                if idx >= 0 && (idx as usize) < filtered.len() {
+                    let entry = filtered[idx as usize].clone();
+                    dropdown_apply(state, agent_slot, config, &entry);
+                }
+                return;
+            }
+            state.dropdown = None;
+            state.drop_search.clear();
+            return;
+        }
+
+        // Provider button: build (from the real config — dynamic, not the
+        // hardcoded HTML list) and open the dropdown.
+        if in_provider {
+            let entries =
+                build_dropdown_entries(config, &state.provider, &state.model).await;
+            state.dropdown = Some(DropdownState {
+                entries,
+                selected: 0,
+                area: None,
+                keying: None,
+            });
+            state.drop_search.clear();
+            return;
+        }
+
+        // Click a TODO row to toggle it (progress bar fills in live).
+        if let Some(ta) = state.todo_area {
+            if col >= ta.x && col < ta.x + ta.width && row >= ta.y && row < ta.y + ta.height {
+                let idx = row as isize - ta.y as isize;
+                if idx >= 0 && (idx as usize) < state.todos.len() {
+                    state.toggle_todo(idx as usize);
+                }
+                return;
+            }
+        }
+    }
+
     match state.mode {
         Mode::ModelPicker { .. } => {
             let Some(area) = state.model_picker_area else {
@@ -1977,21 +2935,26 @@ async fn run_app<B: Backend>(
 ) -> Result<()> {
     let known_commands = known_slash_commands(config);
     let dir = build_dir_info(config);
-    let mut state = AppState::new(&agent, known_commands, dir);
+    let mut state = AppState::new(&agent, known_commands, dir, config.project_root.is_some());
     let mut agent_slot = Some(agent);
+    // When starting with an actual project, begin in read-only Plan mode so
+    // the agent researches before it changes anything (and the injected
+    // project survey grounds the plan in real files rather than guesses).
+    if config.project_root.is_some() {
+        if let Some(a) = agent_slot.as_mut() {
+            apply_agent_mode(a, state.agent_mode);
+        }
+    }
     let mut turn_handle: Option<TurnJoin> = None;
     let mut cancel_tx: Option<watch::Sender<bool>> = None;
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
-    std::thread::spawn(move || loop {
-        match crossterm::event::read() {
-            Ok(ev) => {
-                if input_tx.send(ev).is_err() {
-                    break;
-                }
+    std::thread::spawn(move || {
+        while let Ok(ev) = crossterm::event::read() {
+            if input_tx.send(ev).is_err() {
+                break;
             }
-            Err(_) => break,
         }
     });
 
@@ -2013,7 +2976,9 @@ async fn run_app<B: Backend>(
                             }
                         }
                     }
-                    Event::Mouse(mouse) => handle_mouse(mouse, &mut state, &mut agent_slot, config),
+                    Event::Mouse(mouse) => {
+                        handle_mouse(mouse, &mut state, &mut agent_slot, config).await;
+                    }
                     _ => {}
                 }
             }
@@ -2054,18 +3019,13 @@ terminal.draw(|f| render(f, &mut state, config))?;
     Ok(())
 }
 
-/// Gather project-root facts for the SuperCode-style "directory" header
-/// panel: workspace folder name, root path, current git branch (if any), and
-/// a rough file count. Best-effort — any piece that fails degrades silently.
+/// Current git branch for the side-panel footer. Best-effort — any failure
+/// degrades silently to "(no git repo)".
 fn build_dir_info(config: &Config) -> DirInfo {
     let path = config
         .project_root
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
-    let workspace = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
 
     let git_branch = std::process::Command::new("git")
         .arg("-C")
@@ -2078,44 +3038,7 @@ fn build_dir_info(config: &Config) -> DirInfo {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Rough file count, capped so a huge tree doesn't stall startup.
-    let file_count = walk_file_count(&path, 0, 50_000);
-
-    DirInfo {
-        workspace,
-        path: path.display().to_string(),
-        git_branch,
-        file_count,
-    }
-}
-
-/// Depth-limited recursive file count (skips hidden + vendor dirs). Stops
-/// early once `cap` is reached so startup never crawls on a giant tree.
-fn walk_file_count(dir: &std::path::Path, depth: usize, max: usize) -> usize {
-    if depth > 6 || max == 0 {
-        return 0;
-    }
-    let mut count = 0usize;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if depth == 0 && matches!(name.as_str(), ".git" | "node_modules" | "target" | ".agent" | ".zeus")
-        {
-            continue;
-        }
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            count += walk_file_count(&entry.path(), depth + 1, max.saturating_sub(count));
-        } else if ft.is_file() {
-            count += 1;
-        }
-        if count >= max {
-            return count;
-        }
-    }
-    count
+    DirInfo { git_branch }
 }
 
 /// Belt-and-suspenders alongside `render_input_box` only setting a cursor

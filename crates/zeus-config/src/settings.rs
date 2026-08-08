@@ -59,6 +59,7 @@ pub struct PermissionRule {
 
 /// Fully merged agent settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default)]
 pub struct AgentSettings {
     #[serde(default)]
     pub model: ModelSettings,
@@ -79,21 +80,12 @@ pub struct AgentSettings {
     /// cache defaults — for anything in a nonstandard location.
     #[serde(default)]
     pub extra_model_dirs: Vec<String>,
+    /// llama.cpp local serving engine: binary resolution, port, and an
+    /// auto-downloadable catalog of GGUF models.
+    #[serde(default)]
+    pub llamacpp: LlamaCppSettings,
 }
 
-impl Default for AgentSettings {
-    fn default() -> Self {
-        Self {
-            model: ModelSettings::default(),
-            permissions: PermissionSettings::builtin_safe(),
-            context: ContextSettings::default(),
-            logging: LoggingSettings::default(),
-            project_roots: Vec::new(),
-            mcp_servers: Vec::new(),
-            extra_model_dirs: Vec::new(),
-        }
-    }
-}
 
 /// One configured external MCP tool server, spawned over stdio.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,6 +129,54 @@ impl Default for ModelSettings {
             max_tokens: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlamaCppSettings {
+    /// Path to the `llama-server` binary. When unset, zeus searches PATH and,
+    /// if still not found, downloads a llama.cpp release build into
+    /// `~/.zeus/bin/` on first use.
+    #[serde(default)]
+    pub binary: Option<String>,
+    /// Port the spawned llama-server listens on.
+    #[serde(default = "default_llamacpp_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub threads: Option<u32>,
+    #[serde(default)]
+    pub ctx: Option<u32>,
+    /// Auto-downloadable GGUF models: `name` is what `--model`/the picker
+    /// refer to; `repo` + `file` point at a Hugging Face GGUF download. When
+    /// the file is absent it's pulled into `~/.zeus/models/` on demand.
+    #[serde(default)]
+    pub models: Vec<LocalModelEntry>,
+}
+
+impl Default for LlamaCppSettings {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            port: default_llamacpp_port(),
+            threads: None,
+            ctx: None,
+            models: Vec::new(),
+        }
+    }
+}
+
+fn default_llamacpp_port() -> u16 {
+    8080
+}
+
+/// One auto-downloadable local model for the llama.cpp engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalModelEntry {
+    /// Short name used to select the model (e.g. `llama3.2`).
+    pub name: String,
+    /// Hugging Face repo id, e.g. `bartowski/Llama-3.2-3B-Instruct-GGUF`.
+    pub repo: String,
+    /// File within the repo, e.g. `Llama-3.2-3B-Instruct-Q4_K_M.gguf`.
+    pub file: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -339,6 +379,8 @@ struct PartialSettings {
     mcp_servers: Option<Vec<McpServerConfig>>,
     #[serde(default)]
     extra_model_dirs: Option<Vec<String>>,
+    #[serde(default)]
+    llamacpp: Option<LlamaCppSettings>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -403,6 +445,7 @@ impl SettingsStack {
                 project_roots: Some(Vec::new()),
                 mcp_servers: Some(Vec::new()),
                 extra_model_dirs: Some(Vec::new()),
+                llamacpp: Some(LlamaCppSettings::default()),
             },
         ));
         s
@@ -417,7 +460,7 @@ impl SettingsStack {
         let partial: PartialSettings =
             toml::from_str(&text).map_err(|source| ConfigError::TomlParse {
                 path: path.to_path_buf(),
-                source,
+                source: Box::new(source),
             })?;
         self.layers.push((layer, partial));
         Ok(())
@@ -452,6 +495,7 @@ impl SettingsStack {
             project_roots: Vec::new(),
             mcp_servers: Vec::new(),
             extra_model_dirs: Vec::new(),
+            llamacpp: LlamaCppSettings::default(),
         };
 
         for (_layer, partial) in &self.layers {
@@ -542,6 +586,9 @@ impl SettingsStack {
             if let Some(dirs) = &partial.extra_model_dirs {
                 // Later layers replace the list entirely, same as project_roots.
                 out.extra_model_dirs = dirs.clone();
+            }
+            if let Some(lcpp) = &partial.llamacpp {
+                out.llamacpp = lcpp.clone();
             }
         }
 

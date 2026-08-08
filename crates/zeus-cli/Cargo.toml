@@ -17,6 +17,7 @@ futures = { workspace = true }
 zeus-agent = { workspace = true }
 zeus-config = { workspace = true }
 zeus-fs = { workspace = true }
+zeus-lang = { workspace = true }
 zeus-logging = { workspace = true }
 zeus-provider = { workspace = true }
 tokio = { workspace = true }
@@ -25,6 +26,8 @@ anstyle = "1.0.14"
 toml.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
+syntect = { workspace = true }
+arboard = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -61,6 +61,8 @@ pub struct GlobalPaths {
     /// `zeus models --local` so downloaded-but-not-yet-served models are
     /// still discoverable without any server running.
     pub models: PathBuf,
+    /// Downloaded helper binaries (e.g. llama.cpp's `llama-server`) land here.
+    pub bin: PathBuf,
 }
 
 impl GlobalPaths {
@@ -84,6 +86,7 @@ impl GlobalPaths {
             prompts: root.join("prompts"),
             personas: root.join("personas"),
             models: root.join("models"),
+            bin: root.join("bin"),
             root,
         }
     }
@@ -135,6 +138,7 @@ pub fn ensure_global_dirs(paths: &GlobalPaths) -> Result<()> {
         &paths.prompts,
         &paths.personas,
         &paths.models,
+        &paths.bin,
     ] {
         std::fs::create_dir_all(dir).map_err(ConfigError::Io)?;
     }

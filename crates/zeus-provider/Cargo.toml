@@ -17,6 +17,7 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
 dirs.workspace = true
+zip = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

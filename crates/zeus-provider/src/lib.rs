@@ -16,6 +16,7 @@ mod detect;
 mod download;
 mod error;
 mod heuristics;
+mod llamacpp;
 mod local_models;
 mod ollama;
 mod openai_compat;
@@ -27,7 +28,13 @@ pub use anthropic::AnthropicProvider;
 pub use detect::{detect_local_provider, is_provider_reachable, is_reachable};
 pub use download::download_hf_file;
 pub use error::{ProviderError, Result};
-pub use local_models::{scan_local_models, LocalModelFile};
+pub use llamacpp::{
+    ensure_model_file, ensure_server_binary, find_on_path, locate_server_binary,
+    resolve_local_model, serve, spawn_server_and_wait, ServerInfo, DEFAULT_MODEL_CATALOG,
+};
+pub use local_models::{
+    import_model_file, scan_local_models, scan_system_models, LocalModelFile,
+};
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use registry::{create_default, create_provider, ProviderHandle};

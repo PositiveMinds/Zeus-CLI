@@ -182,7 +182,7 @@ impl CheckpointStore {
                         std::fs::create_dir_all(parent).map_err(|e| FsError::io(parent, e))?;
                     }
                     let bytes = base64_decode(content_b64)
-                        .map_err(|e| FsError::Checkpoint(e))?;
+                        .map_err(FsError::Checkpoint)?;
                     std::fs::write(&full, bytes).map_err(|e| FsError::io(&full, e))?;
                     restored += 1;
                 }
@@ -217,7 +217,7 @@ impl CheckpointStore {
         }
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.root).map_err(|e| FsError::io(&self.root, e))? {
-            let entry = entry.map_err(|e| FsError::IoSimple(e))?;
+            let entry = entry.map_err(FsError::IoSimple)?;
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
@@ -271,7 +271,7 @@ fn base64_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
         }
     }
     let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("invalid base64 length".into());
     }
     let mut out = Vec::new();

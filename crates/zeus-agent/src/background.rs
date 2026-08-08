@@ -11,7 +11,7 @@
 //! by PID (`tasklist`/`kill -0`), not by owning the process.
 
 use crate::error::{AgentError, Result};
-use crate::terminal::kill_tree;
+use crate::terminal::{kill_tree, resume_process, suspend_process};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,10 @@ use std::process::{Command, Stdio};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Running,
+    /// Process is temporarily suspended (SIGSTOP / NtSuspendProcess); its
+    /// threads are frozen but the process hasn't exited. `resume` continues
+    /// it exactly where it stopped.
+    Paused,
     /// Process is gone. Exit code isn't recoverable this way once the
     /// spawning process has exited, so this doesn't distinguish clean exit
     /// from crash — check the log files for that.
@@ -33,6 +37,10 @@ pub struct BackgroundTask {
     pub pid: u32,
     pub cwd: String,
     pub started_at: String,
+    /// Whether the process is currently suspended. Persisted so a later
+    /// `zeus bg list` invocation (a fresh process) can report Paused.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 pub struct BackgroundTaskRegistry {
@@ -114,11 +122,30 @@ impl BackgroundTaskRegistry {
             pid,
             cwd: cwd.display().to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            paused: false,
         };
         let text = serde_json::to_string_pretty(&task)
             .map_err(|e| AgentError::Terminal(e.to_string()))?;
         std::fs::write(self.meta_path(id), text)?;
         Ok(id)
+    }
+
+    /// Persist updated task metadata (used when toggling the paused flag).
+    fn write_meta(&self, task: &BackgroundTask) -> Result<()> {
+        let text = serde_json::to_string_pretty(task)
+            .map_err(|e| AgentError::Terminal(e.to_string()))?;
+        std::fs::write(self.meta_path(task.id), text).map_err(|e| AgentError::Terminal(e.to_string()))
+    }
+
+    /// Derive a task's status from its persisted `paused` flag plus liveness.
+    fn status_of(task: &BackgroundTask) -> TaskStatus {
+        if !is_alive(task.pid) {
+            TaskStatus::Exited
+        } else if task.paused {
+            TaskStatus::Paused
+        } else {
+            TaskStatus::Running
+        }
     }
 
     pub fn list(&self) -> Result<Vec<(BackgroundTask, TaskStatus)>> {
@@ -132,12 +159,7 @@ impl BackgroundTaskRegistry {
             }
             let text = std::fs::read_to_string(&path)?;
             if let Ok(task) = serde_json::from_str::<BackgroundTask>(&text) {
-                let status = if is_alive(task.pid) {
-                    TaskStatus::Running
-                } else {
-                    TaskStatus::Exited
-                };
-                out.push((task, status));
+                out.push((task.clone(), Self::status_of(&task)));
             }
         }
         out.sort_by_key(|(t, _)| t.id);
@@ -152,12 +174,56 @@ impl BackgroundTaskRegistry {
         let text = std::fs::read_to_string(&path)?;
         let task: BackgroundTask =
             serde_json::from_str(&text).map_err(|e| AgentError::Terminal(e.to_string()))?;
-        let status = if is_alive(task.pid) {
-            TaskStatus::Running
-        } else {
-            TaskStatus::Exited
+        Ok(Some((task.clone(), Self::status_of(&task))))
+    }
+
+    /// Suspend a running task in place. The process keeps its PID and its
+    /// log files; nothing is re-spawned on resume.
+    pub fn pause(&self, id: u64) -> Result<()> {
+        let Some((mut task, status)) = self.get(id)? else {
+            return Err(AgentError::Terminal(format!(
+                "no such background task: {id}"
+            )));
         };
-        Ok(Some((task, status)))
+        match status {
+            TaskStatus::Exited => Err(AgentError::Terminal(format!(
+                "task {id} has already exited — nothing to pause"
+            ))),
+            TaskStatus::Paused => Err(AgentError::Terminal(format!(
+                "task {id} is already paused"
+            ))),
+            TaskStatus::Running => {
+                suspend_process(task.pid)
+                    .map_err(|e| AgentError::Terminal(format!("pause task {id}: {e}")))?;
+                task.paused = true;
+                self.write_meta(&task)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Continue a paused task from exactly where it was suspended.
+    pub fn resume(&self, id: u64) -> Result<()> {
+        let Some((mut task, status)) = self.get(id)? else {
+            return Err(AgentError::Terminal(format!(
+                "no such background task: {id}"
+            )));
+        };
+        match status {
+            TaskStatus::Exited => Err(AgentError::Terminal(format!(
+                "task {id} has already exited — nothing to resume"
+            ))),
+            TaskStatus::Running => Err(AgentError::Terminal(format!(
+                "task {id} is not paused"
+            ))),
+            TaskStatus::Paused => {
+                resume_process(task.pid)
+                    .map_err(|e| AgentError::Terminal(format!("resume task {id}: {e}")))?;
+                task.paused = false;
+                self.write_meta(&task)?;
+                Ok(())
+            }
+        }
     }
 
     /// Captured output so far: (stdout, stderr), read straight from the log
@@ -175,9 +241,16 @@ impl BackgroundTaskRegistry {
                 "no such background task: {id}"
             )));
         };
-        if status == TaskStatus::Running {
-            kill_tree(task.pid);
+        if status == TaskStatus::Exited {
+            let _ = std::fs::remove_file(self.meta_path(id));
+            return Ok(());
         }
+        // Suspended processes can't always be killed by killing their
+        // children first (taskkill /T walks them fine, but a plain SIGKILL
+        // leaves stopped children parked) — resume briefly so nothing is
+        // left frozen behind the task.
+        let _ = resume_process(task.pid);
+        kill_tree(task.pid);
         let _ = std::fs::remove_file(self.meta_path(id));
         Ok(())
     }
@@ -187,9 +260,12 @@ impl BackgroundTaskRegistry {
     /// exactly the failure mode this guards against).
     pub fn shutdown_all(&self) -> Result<()> {
         for (task, status) in self.list()? {
-            if status == TaskStatus::Running {
-                kill_tree(task.pid);
+            if status == TaskStatus::Exited {
+                let _ = std::fs::remove_file(self.meta_path(task.id));
+                continue;
             }
+            let _ = resume_process(task.pid);
+            kill_tree(task.pid);
             let _ = std::fs::remove_file(self.meta_path(task.id));
         }
         Ok(())
@@ -294,6 +370,45 @@ mod tests {
         assert_eq!(task.id, id);
         assert_eq!(status, TaskStatus::Running);
         second.stop(id).unwrap();
+    }
+
+    #[test]
+    fn pauses_and_resumes_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
+        let sleep_cmd = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        };
+        let id = registry.spawn(sleep_cmd, &root).unwrap();
+
+        // Cancelled paused state rejected, running accepted.
+        assert!(registry.pause(id).is_ok());
+        let (_, status) = registry.get(id).unwrap().unwrap();
+        assert_eq!(status, TaskStatus::Paused);
+        // Pausing twice is an error, not a no-op.
+        assert!(registry.pause(id).is_err());
+        // The process is still alive while paused, just frozen.
+        let pid = registry.get(id).unwrap().unwrap().0.pid;
+        assert!(is_alive(pid), "paused process must stay alive");
+
+        registry.resume(id).unwrap();
+        let (_, status) = registry.get(id).unwrap().unwrap();
+        assert_eq!(status, TaskStatus::Running);
+        assert!(registry.resume(id).is_err(), "resuming a running task fails");
+
+        // Persisted: a fresh registry instance still sees the paused state.
+        registry.pause(id).unwrap();
+        let fresh = BackgroundTaskRegistry::new(root.join(".agent/background"));
+        let (_, status) = fresh.get(id).unwrap().unwrap();
+        assert_eq!(status, TaskStatus::Paused);
+        registry.resume(id).unwrap();
+
+        registry.stop(id).unwrap();
+        assert!(registry.get(id).unwrap().is_none());
     }
 
     #[test]

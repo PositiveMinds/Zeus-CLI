@@ -16,6 +16,7 @@ mod error;
 mod hooks;
 mod mcp;
 mod personas;
+mod plans;
 mod plugin;
 mod session;
 mod terminal;
@@ -32,10 +33,11 @@ pub use personas::{
     load_custom_personas, persona_by_id, personas_by_department, recommend_persona,
     recommend_reviewer, Persona, ALL_PERSONAS,
 };
+pub use plans::{TaskPlan, TaskStep};
 pub use plugin::{load_all as load_all_plugins, LoadedPlugin, PluginCallResult};
 pub use session::{new_session_id, ConversationState, SessionStore, TranscriptEntry};
 pub use terminal::{
     CommandHistory, CommandProfile, CommandRecord, Sandbox, TerminalOptions, TerminalRunner,
     TerminalOutput,
 };
-pub use tools::{builtin_tool_specs, ToolManager, ToolResult};
+pub use tools::{builtin_tool_specs, platform_tool_specs, ToolManager, ToolResult};

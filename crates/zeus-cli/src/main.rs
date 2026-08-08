@@ -2,6 +2,9 @@
 
 mod tui;
 mod ui;
+mod highlight;
+mod clipboard;
+mod decor;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -16,6 +19,7 @@ use zeus_fs::{
     ApprovalDecision, CopyOptions, EditOptions, GitEngine, PermissionGate, PermissionRequest,
     ReadOptions, ResetMode, SearchOptions, Workspace, WriteOptions,
 };
+use zeus_fs::{filter_out_own_index, IndexEngine, SymbolIndex, word_boundary};
 use zeus_logging::{init as init_logging, LoggingOptions};
 use zeus_provider::{
     create_default, create_provider, ChatRequest, Message, ModelProvider, StreamEvent,
@@ -88,10 +92,18 @@ enum Commands {
         /// Provider name (default: settings.model.provider)
         #[arg(long)]
         provider: Option<String>,
-        /// Scan local model files instead of querying a provider's API —
-        /// finds downloaded-but-not-yet-served models too.
+        /// Scan local model files across the system instead of querying a
+        /// provider's API — finds downloaded-but-not-yet-served models too.
         #[arg(long)]
         local: bool,
+        /// Copy a model file from the `--local` listing into the zeus model
+        /// library (~/.zeus/models), matched on the exact path shown.
+        /// Pair with `--move` to relocate it instead of copying.
+        #[arg(long, value_name = "PATH")]
+        import: Option<PathBuf>,
+        /// With `--import`, move the model file instead of copying it.
+        #[arg(long = "move")]
+        relocate: bool,
     },
 
     /// Run one turn through the full Agent Loop (tool-calling, context
@@ -108,6 +120,10 @@ enum Commands {
         /// Resume an existing session id instead of starting a new one
         #[arg(long)]
         session: Option<String>,
+        /// Plan mode: research the request read-only, persist a structured
+        /// plan to .agent/tasks.json, and exit WITHOUT executing anything.
+        #[arg(long)]
+        plan: bool,
     },
 
     /// Count tokens for a message (context-budget helper)
@@ -227,11 +243,104 @@ enum Commands {
         source: PullCmd,
     },
 
+    /// Serve a local GGUF model via llama.cpp: `zeus serve <model-name>` or
+    /// `zeus serve <repo>/<file.gguf>` (auto-downloads if missing).
+    Serve {
+        /// Model name from [settings.llamacpp.models], or `repo/file.gguf`
+        model: Option<String>,
+    },
+
     /// Manage user-defined slash command templates (.agent/commands/,
     /// ~/.zeus/commands/) — distinct from the built-in REPL /help etc.
-    Commands {
+    UserCommand {
         #[command(subcommand)]
         action: UserCommandCmd,
+    },
+
+    /// Code Intelligence — database-free symbol index & reference tools.
+    /// Build `.agent/index.json` then query definitions/references.
+    Codeint {
+        #[command(subcommand)]
+        action: CodeintCmd,
+    },
+
+    /// Language support — detect a project's language, show its standard
+    /// dev commands (build / test / lint / format), scaffold a minimal
+    /// buildable skeleton, or format a file / project.
+    Project {
+        #[command(subcommand)]
+        action: ProjectCmd,
+    },
+}
+
+/// Sub-actions for `zeus project`.
+#[derive(Debug, Subcommand)]
+enum ProjectCmd {
+    /// Detect the primary language of the project root (or fail).
+    Detect,
+    /// Show the project language and its standard build / test / lint /
+    /// format commands.
+    Commands {
+        /// Restrict to a specific language instead of auto-detecting.
+        lang: Option<String>,
+    },
+    /// Scaffold a minimal, buildable project skeleton.
+    Scaffold {
+        /// Language (or file extension) to scaffold — e.g. "rust", "ts",
+        /// "go", "c#".
+        lang: String,
+        /// Project / module name (used for package names, classes, etc.).
+        name: String,
+    },
+    /// Format a single source file (per-language formatter) — or the whole
+    /// project with no path. Requires the language's formatter on PATH.
+    Format {
+        /// Target file. Omit to run the project-wide formatter.
+        path: Option<PathBuf>,
+    },
+}
+
+/// Sub-actions for `zeus codeint` (Phase 6 — database-free index).
+#[derive(Debug, Subcommand)]
+enum CodeintCmd {
+    /// Scan the project's source files and write `.agent/index.json`
+    Index {
+        /// Rebuild even if a fresh-enough index already exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Find definitions in the index by symbol name (substring,
+    /// case-insensitive).
+    Find {
+        /// Symbol name (or prefix) to search for.
+        name: String,
+    },
+    /// Go-to-definition — same as `find` but shows the resolved primary
+    /// definition for the symbol.
+    Defs {
+        name: String,
+    },
+    /// Find references to a symbol across the project (and any configured
+    /// extra project roots) via ripgrep.
+    Refs {
+        name: String,
+        /// Only touch files matching this glob.
+        #[arg(long)]
+        glob: Option<String>,
+        /// Case-insensitive reference search.
+        #[arg(long, short = 'i')]
+        ignore_case: bool,
+        /// Cap number of reported hits.
+        #[arg(long, default_value_t = 200)]
+        max: usize,
+    },
+    /// Propose a reference-update plan for renaming `old` -> `new`
+    /// (word-boundary). Prints the per-file proposal; applying writes is
+    /// intentionally left to a review step because it mutates many files.
+    Rename {
+        old: String,
+        #[arg(long)]
+        new: String,
     },
 }
 
@@ -272,10 +381,14 @@ enum PullCmd {
 enum BgCmd {
     /// Start a command detached; it keeps running after this process exits
     Run { command: String },
-    /// List background tasks and their running/exited status
+    /// List background tasks and their running/paused/exited status
     List,
     /// Print captured stdout/stderr for a background task
     Output { id: u64 },
+    /// Suspend a running task in place (resume continues it where it left off)
+    Pause { id: u64 },
+    /// Continue a previously-paused task
+    Resume { id: u64 },
     /// Stop a running background task
     Stop { id: u64 },
 }
@@ -436,8 +549,29 @@ enum ConfigCmd {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Run the async entrypoint on a thread with a large stack. clap's
+    // command construction plus the debug build's fat frames otherwise exceed
+    // the OS default 1 MiB main-thread stack, producing a stack overflow.
+    let result = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .name("zeus-main".into())
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+            rt.block_on(async_main());
+        })
+        .expect("spawn zeus-main")
+        .join();
+
+    if result.is_err() {
+        std::process::exit(101);
+    }
+}
+
+async fn async_main() {
     if let Err(e) = run().await {
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -477,13 +611,19 @@ async fn run() -> Result<()> {
             model,
             no_stream,
         }) => cmd_chat(&config, message, provider, model, !no_stream).await,
-        Some(Commands::Models { provider, local }) => cmd_models(&config, provider, local).await,
+        Some(Commands::Models {
+            provider,
+            local,
+            import,
+            relocate,
+        }) => cmd_models(&config, provider, local, import, relocate).await,
         Some(Commands::Agent {
             message,
             provider,
             model,
             session,
-        }) => cmd_agent(&config, message, provider, model, session, cli.yes).await,
+            plan,
+        }) => cmd_agent(&config, message, provider, model, session, plan, cli.yes).await,
         Some(Commands::Tokens {
             message,
             provider,
@@ -529,7 +669,10 @@ async fn run() -> Result<()> {
         Some(Commands::Bg { action }) => cmd_bg(&config, action),
         Some(Commands::Git { action }) => cmd_git(&config, action, cli.yes),
         Some(Commands::Pull { source }) => cmd_pull(&config, source).await,
-        Some(Commands::Commands { action }) => cmd_user_commands(&config, action, cli.yes),
+        Some(Commands::Serve { model }) => cmd_serve(&config, model).await,
+        Some(Commands::UserCommand { action }) => cmd_user_commands(&config, action, cli.yes),
+        Some(Commands::Codeint { action }) => cmd_codeint(&config, action),
+        Some(Commands::Project { action }) => cmd_project(&config, action),
     }
 }
 
@@ -554,12 +697,26 @@ fn approver(yes: bool) -> impl FnMut(&PermissionRequest) -> ApprovalDecision {
         if yes {
             eprintln!("[auto-approve] {}", req.description);
             if let Some(preview) = &req.preview {
-                eprintln!("{preview}");
+                eprintln!(
+                    "{}",
+                    if highlight::looks_like_diff(preview) {
+                        highlight::ansi_diff(preview)
+                    } else {
+                        preview.clone()
+                    }
+                );
             }
             return ApprovalDecision::Approved;
         }
         if let Some(preview) = &req.preview {
-            eprintln!("{preview}");
+            eprintln!(
+                "{}",
+                if highlight::looks_like_diff(preview) {
+                    highlight::ansi_diff(preview)
+                } else {
+                    preview.clone()
+                }
+            );
         }
         eprint!("Allow {}? [y/N/s(session)] ", req.description);
         let _ = io::stderr().flush();
@@ -741,6 +898,33 @@ async fn resolve_provider(
         if let Some(cfg) = config.providers.get(&name) {
             if !zeus_provider::is_provider_reachable(cfg, std::time::Duration::from_millis(800)).await
             {
+                // Default provider is llama.cpp but no server is running yet:
+                // auto-download the llama-server binary + model file and launch
+                // one, so `zeus chat`/the TUI "just works" for local models.
+                if cfg.kind == "llamacpp" {
+                    if let Some(entry) = zeus_provider::resolve_local_model(
+                        &config.settings.llamacpp,
+                        &config.settings.model.model,
+                    ) {
+                        match zeus_provider::serve(
+                            &config.settings.llamacpp,
+                            &entry,
+                            &config.global,
+                        )
+                        .await
+                        {
+                            Ok(server) => {
+                                info!(origin = %server.origin, model = %entry.name, "auto-started llama.cpp local server");
+                                return create_provider(&name, &config.providers).or_else(|_| {
+                                    create_default(&name, &config.providers)
+                                }).with_context(|| format!("failed to create provider '{name}'"));
+                            }
+                            Err(e) => {
+                                info!(model = %entry.name, error = %e, "auto-start of llama.cpp failed; falling back")
+                            }
+                        }
+                    }
+                }
                 match zeus_provider::detect_local_provider(&config.providers).await {
                     Some(detected) => {
                         if detected != name {
@@ -940,30 +1124,15 @@ async fn cmd_chat(
     Ok(())
 }
 
-async fn cmd_models(config: &Config, provider: Option<String>, local: bool) -> Result<()> {
-    if local {
-        let extra_dirs: Vec<PathBuf> = config
-            .settings
-            .extra_model_dirs
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        let found = zeus_provider::scan_local_models(&config.global.models, &extra_dirs);
-        if found.is_empty() {
-            println!("(no local model files found)");
-            println!("scanned: {}", config.global.models.display());
-            return Ok(());
-        }
-        for f in found {
-            let size_mb = f.size_bytes as f64 / (1024.0 * 1024.0);
-            println!(
-                "{}  {:.1} MB  [{}]",
-                f.path.display(),
-                size_mb,
-                f.source
-            );
-        }
-        return Ok(());
+async fn cmd_models(
+    config: &Config,
+    provider: Option<String>,
+    local: bool,
+    import: Option<PathBuf>,
+    relocate: bool,
+) -> Result<()> {
+    if local || import.is_some() {
+        return cmd_local_models(config, import.as_deref(), relocate);
     }
 
     let provider = resolve_provider(config, provider).await?;
@@ -979,6 +1148,78 @@ async fn cmd_models(config: &Config, provider: Option<String>, local: bool) -> R
         }
     }
     println!("prompt_cache: {}", provider.supports_prompt_cache());
+    Ok(())
+}
+
+/// Scan the system for local model files (or import one into the library).
+/// A model is "imported" by copying it into `~/.zeus/models`; `--move`
+/// relocates it instead. `import` indexes into the same listing shown by
+/// `zeus models --local`.
+fn cmd_local_models(
+    config: &Config,
+    import: Option<&Path>,
+    relocate: bool,
+) -> Result<()> {
+    let extra_dirs: Vec<PathBuf> = config
+        .settings
+        .extra_model_dirs
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    let found = zeus_provider::scan_system_models(&config.global.models, &extra_dirs);
+
+    if let Some(want) = import {
+        let Some(model) = found.iter().find(|m| m.path == want) else {
+            bail!(
+                "no scanned model at '{}' — pick the full path from `zeus models --local`",
+                want.display()
+            );
+        };
+        return cmd_import_model(config, model, relocate);
+    }
+
+if found.is_empty() {
+        println!("(no local model files found)");
+        println!("scanned: {}", config.global.models.display());
+        println!("hint: drop a .gguf/.safetensors under Downloads/Desktop/Documents or add `extra_model_dirs` to extend the scan.");
+        return Ok(());
+    }
+
+    println!("{} model files on this system:", found.len());
+    for f in &found {
+        let size_mb = f.size_bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "{:>10.1} MB  {}  [{}]",
+            size_mb,
+            f.path.display(),
+            f.source
+        );
+    }
+    println!();
+    println!("import into the zeus library:  zeus models --import \"<path from above>\"   (add --move to relocate)");
+    Ok(())
+}
+
+fn cmd_import_model(
+    config: &Config,
+    model: &zeus_provider::LocalModelFile,
+    relocate: bool,
+) -> Result<()> {
+    let dest_dir = config.global.models.clone();
+    let size_mb = model.size_bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        "{} {} ({size_mb:.1} MB) -> {}",
+        if relocate { "moving" } else { "copying" },
+        model.path.display(),
+        dest_dir.display()
+    );
+    let saved = zeus_provider::import_model_file(model, &dest_dir, relocate)
+        .context("import model into library")?;
+    let name = saved.file_name().map(|n| n.to_string_lossy().into_owned());
+    println!("done — {}", saved.display());
+    if let Some(name) = name {
+        println!("use it with:  zeus serve {name}");
+    }
     Ok(())
 }
 
@@ -1033,6 +1274,58 @@ async fn cmd_pull(config: &Config, source: PullCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `zeus serve` — ensure a local GGUF model is on disk and serve it via
+/// llama.cpp, auto-downloading the `llama-server` binary on first use. The
+/// server runs detached (keeps going after this command exits).
+async fn cmd_serve(config: &Config, model: Option<String>) -> Result<()> {
+    let requested = model.unwrap_or_else(|| config.settings.model.model.clone());
+    let entry = if requested.contains('/') {
+        // Treat as a `repo/file` GGUF download.
+        let split = requested.splitn(2, '/').collect::<Vec<_>>();
+        if split.len() != 2 || split[0].is_empty() || split[1].is_empty() {
+            bail!("usage: zeus serve <model-name>  or  zeus serve <repo>/<file.gguf>");
+        }
+        zeus_config::LocalModelEntry {
+            name: requested.clone(),
+            repo: split[0].to_string(),
+            file: split[1].to_string(),
+        }
+    } else {
+        match zeus_provider::resolve_local_model(&config.settings.llamacpp, &requested) {
+            Some(e) => e,
+            None => bail!(
+                "no local model '{requested}' — add it under [settings.llamacpp.models], pass `repo/file`, or see `zeus serve llama3.2`"
+            ),
+        }
+    };
+
+    let lcpp = &config.settings.llamacpp;
+    let server = zeus_provider::serve(lcpp, &entry, &config.global)
+        .await
+        .with_context(|| format!("failed to start llama.cpp for '{requested}'"))?;
+    if server.pid == 0 {
+        println!("reusing llama.cpp already running at {}", server.origin);
+    } else {
+        println!(
+            "serving '{}' via llama.cpp at {} (pid {})",
+            entry.name, server.origin, server.pid
+        );
+        println!(
+            "model file: {}",
+            config.global.models.join(&entry.file).display()
+        );
+    }
+    println!(
+        "logs: {}/llamacpp.stderr.log",
+        config.global.logs.display()
+    );
+    println!(
+        "connect with `zeus chat --provider llamacpp --model {}` or via `/provider` in the TUI",
+        entry.file
+    );
+    Ok(())
 }
 
 /// Best-effort connect to every MCP server in `config.settings.mcp_servers`:
@@ -1136,8 +1429,39 @@ async fn build_agent_with_provider(
     // initializes git at their own convenience, not because zeus checked
     // for a repo up front.
     if state.messages.is_empty() {
-        state.messages.push(Message::system(
-            "You are zeus, a helpful coding assistant with access to file, git, terminal, \
+        state.messages.push(system_prompt(config));
+        if let Some(survey) = build_project_survey(config) {
+            state.messages.push(Message::system(survey));
+        }
+    }
+
+    Ok(Agent::new(
+        provider,
+        tools,
+        context,
+        sessions,
+        state,
+        AgentOptions {
+            model,
+            max_tool_iterations: 8,
+            temperature: config.settings.model.temperature,
+            // Bounds worst-case reply latency — otherwise an ungrounded
+            // ramble (especially on slow CPU-bound local inference) keeps
+            // generating for as long as the model's context window allows.
+            // `model.max_tokens` in settings.toml overrides this.
+            max_tokens: Some(config.settings.model.max_tokens.unwrap_or(1024)),
+            max_parallel_read_steps: 2,
+            tasks_file: config.project.as_ref().map(|p| p.tasks_json.clone()),
+        },
+    ))
+}
+
+/// The agent's standing instructions (system prompt): identity, tool
+/// discipline, and the anti-hallucination grounding rules. New sessions get
+/// this as their leading system message; resumed sessions keep their own.
+fn system_prompt(_config: &Config) -> Message {
+    Message::system(
+        "You are zeus, a helpful coding assistant with access to file, git, terminal, \
              and search tools. Default to replying in plain text with no tool call at all. \
              Only call a tool when the user's message clearly requires one — e.g. they ask you \
              to read, write, or search a specific file, run a command, or inspect git history. \
@@ -1163,27 +1487,92 @@ async fn build_agent_with_provider(
              you, say you need to run the relevant tool rather than fabricating the answer.\n\
              5. When you are not certain, say so plainly. It is always better to admit a gap or \
              run a tool than to produce a confident but wrong answer.",
-        ));
-    }
+    )
+}
 
-    Ok(Agent::new(
-        provider,
-        tools,
-        context,
-        sessions,
-        state,
-        AgentOptions {
-            model,
-            max_tool_iterations: 8,
-            temperature: config.settings.model.temperature,
-            // Bounds worst-case reply latency — otherwise an ungrounded
-            // ramble (especially on slow CPU-bound local inference) keeps
-            // generating for as long as the model's context window allows.
-            // `model.max_tokens` in settings.toml overrides this.
-            max_tokens: Some(config.settings.model.max_tokens.unwrap_or(1024)),
-            max_parallel_read_steps: 2,
-        },
-    ))
+/// A factual, bounded snapshot of the project the agent is operating in,
+/// injected into *new* sessions as a system message. Purpose: ground the
+/// model in real project facts at session start so it doesn't hallucinate
+/// structure (guessing manifests, frameworks, layouts) — everything here is
+/// actually walked from disk and explicitly labeled as such. Kept deliberately
+/// small and capped: on a huge tree it enumerates only the top level plus a
+/// depth-limited walk, and never reads file bodies.
+fn build_project_survey(config: &Config) -> Option<String> {
+    let root = config.project_root.as_ref()?;
+    let name = root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+
+    let mut top_dirs: Vec<String> = Vec::new();
+    let mut top_files: Vec<String> = Vec::new();
+    let mut entries = 0usize;
+
+    // Bounded recursive walk: enumerate top-level entries fully, and stop
+    // after a modest depth/count so startup never crawls a giant tree.
+    let skipped = |f: &str| {
+        matches!(
+            f,
+            ".git" | "node_modules" | "target" | ".agent" | ".zeus" | ".venv" | "__pycache__" | "dist" | "build" | ".next" | ".cache"
+        )
+    };
+    fn walk(
+        dir: &Path,
+        depth: usize,
+        top_dirs: &mut Vec<String>,
+        top_files: &mut Vec<String>,
+        entries: &mut usize,
+        skipped: &impl Fn(&str) -> bool,
+    ) {
+        if depth > 6 || *entries >= 500 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            if *entries >= 500 {
+                return;
+            }
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if skipped(&fname) {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if depth == 0 {
+                if ft.is_dir() {
+                    top_dirs.push(fname);
+                } else if ft.is_file() {
+                    top_files.push(fname);
+                }
+            }
+            *entries += 1;
+            if ft.is_dir() {
+                walk(&entry.path(), depth + 1, top_dirs, top_files, entries, skipped);
+            }
+        }
+    }
+    walk(root, 0, &mut top_dirs, &mut top_files, &mut entries, &skipped);
+
+    let mut lines = vec![
+        "PROJECT SURVEY (facts observed from the filesystem, not guesses — verify anything you rely on)".to_string(),
+        format!("workspace name: {name}"),
+        format!("project root: {}", root.display()),
+    ];
+    if !top_files.is_empty() {
+        top_files.sort();
+        lines.push(format!("top-level files: {}", top_files.join(", ")));
+    }
+    if !top_dirs.is_empty() {
+        top_dirs.sort();
+        lines.push(format!("top-level directories: {}", top_dirs.join(", ")));
+    }
+    lines.push(format!("entries scanned (capped at 500): {entries}"));
+
+    let survey = lines.join("\n");
+    if survey.chars().count() > 8_000 {
+        let truncated: String = survey.chars().take(8_000).collect();
+        return Some(format!("{truncated}\n[survey truncated at 8000 chars]"));
+    }
+    Some(survey)
 }
 
 /// Print one `AgentEvent` to stdout/stderr — shared by the one-shot `agent`
@@ -1273,6 +1662,16 @@ fn print_agent_event(ev: AgentEvent) {
                 )
             );
         }
+        AgentEvent::PlanStepDeclined { step } => {
+            let _ = writeln!(
+                out,
+                "{}",
+                ui::styled(
+                    ui::dim_style(),
+                    &format!("⊘ step {} declined · {}", step.id, step.description)
+                )
+            );
+        }
         AgentEvent::OrchestrationDone { summary } => {
             let _ = writeln!(out, "\n{}", ui::styled(ui::assistant_marker_style(), "● plan complete"));
             let _ = writeln!(out, "{summary}");
@@ -1303,18 +1702,32 @@ async fn cmd_agent(
     provider_name: Option<String>,
     model: Option<String>,
     session: Option<String>,
+    plan: bool,
     yes: bool,
 ) -> Result<()> {
     let message = expand_slash_command(config, message);
     let mut agent = build_agent(config, provider_name, model, session).await?;
 
     print_turn_header();
-    let result = agent
-        .run_turn(&message, print_agent_event, approver(yes))
-        .await
-        .context("agent turn")?;
+    let result = if plan {
+        // `--plan`: research read-only, persist .agent/tasks.json, don't
+        // execute. Plan mode is forced on so no tool call can mutate.
+        agent.set_plan_mode(true);
+        agent.plan_turn(&message, print_agent_event, approver(yes)).await
+    } else {
+        agent.run_turn(&message, print_agent_event, approver(yes)).await
+    }
+    .context("agent turn")?;
 
     writeln!(io::stdout())?;
+    if plan {
+        if let Some(project) = config.project.as_ref() {
+            eprintln!("plan saved to {}", project.tasks_json.display());
+        }
+        eprintln!(
+            "— plan only: nothing was executed. Switch to auto mode and approve to run the plan."
+        );
+    }
     eprintln!(
         "— session={} tool_calls={} cancelled={}",
         agent.session_id(),
@@ -1338,8 +1751,10 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("model", "switch model (opens a picker), or /model <name> directly"),
     ("provider", "list providers, switch (<name>), or persist a key: /provider key <name> <KEY>"),
     ("mode", "set agent mode: /mode build|plan|auto (Tab also cycles)"),
+    ("plan", "plan-only turn: research a goal read-only, persist the plan, don't execute"),
     ("session", "show the current session id"),
     ("agents", "list the specialist-agents roster grouped by department (/agents count)"),
+    ("copy", "copy the last assistant reply to the system clipboard"),
 ];
 
 fn print_repl_help_lines() -> String {
@@ -1475,6 +1890,9 @@ pub(crate) async fn build_agent_repl(config: &Config) -> Result<Agent> {
 
 async fn cmd_repl(config: &Config, yes: bool) -> Result<()> {
     let agent = build_agent_repl(config).await?;
+    if config.project_root.is_some() {
+        agent.set_plan_mode(true);
+    }
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
         return tui::run(config, agent, yes).await;
     }
@@ -1494,6 +1912,8 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
         "Resume this session later with: zeus agent --session {} \"...\"",
         agent.session_id()
     );
+
+    let mut last_reply = String::new();
 
     loop {
         print!("\n{}", ui::styled(ui::prompt_style(), "zeus❯ "));
@@ -1565,6 +1985,19 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     }
                     Err(e) => eprintln!("context lookup failed: {e:#}"),
                 },
+                "copy" => {
+                    if last_reply.is_empty() {
+                        eprintln!("nothing to copy yet — send a message first");
+                    } else {
+                        match clipboard::copy(&last_reply) {
+                            Ok(()) => println!(
+                                "copied {} char(s) to clipboard",
+                                last_reply.chars().count()
+                            ),
+                            Err(e) => eprintln!("copy failed: {e}"),
+                        }
+                    }
+                }
                 "model" => {
                     if arg.is_empty() {
                         println!("current model: {}", agent.model());
@@ -1576,7 +2009,7 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                 "provider" => handle_provider_slash(arg, config, &mut agent).await,
                 "session" => println!("session={}", agent.session_id()),
                 "agents" => {
-                    if arg.to_ascii_lowercase() == "count" {
+                    if arg.eq_ignore_ascii_case("count") {
                         let pools = personas_by_department();
                         let total: usize = pools.iter().map(|(_, list)| list.len()).sum();
                         println!("{total} specialist agents");
@@ -1610,6 +2043,29 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                             agent.set_plan_mode(other == "plan");
                             agent.set_auto_mode(other == "auto");
                             println!("mode: {other}");
+                        }
+                    }
+                }
+                "plan" => {
+                    if arg.is_empty() {
+                        eprintln!("usage: /plan <goal to plan>");
+                    } else {
+                        agent.set_plan_mode(true);
+                        print_turn_header();
+                        match agent.plan_turn(arg, print_agent_event, approver(yes)).await {
+                            Ok(_) => {
+                                writeln!(io::stdout())?;
+                                if let Some(project) = config.project.as_ref() {
+                                    eprintln!("plan saved to {}", project.tasks_json.display());
+                                }
+                                eprintln!(
+                                    "— plan-only turn; switch to /mode auto and approve to execute."
+                                );
+                            }
+                            Err(e) => eprintln!(
+                                "\n{}",
+                                ui::styled(ui::error_style(), &format!("plan failed: {e:#}"))
+                            ),
                         }
                     }
                 }
@@ -1647,6 +2103,7 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
             }
         };
         watcher.abort();
+        last_reply = result.final_text.clone();
 
         writeln!(io::stdout())?;
         if result.cancelled {
@@ -1880,6 +2337,275 @@ fn cmd_glob(config: &Config, pattern: String, max: usize) -> Result<()> {
     Ok(())
 }
 
+fn cmd_codeint(config: &Config, action: CodeintCmd) -> Result<()> {
+    let ws = workspace(config)?;
+    let root = ws.project_root.clone();
+
+    match action {
+        CodeintCmd::Index { force } => {
+            if !force {
+                if let Ok(Some(idx)) = SymbolIndex::load(&root) {
+                    println!(
+                        "index already fresh: {} symbol(s) in {} file(s) — use --force to rebuild",
+                        idx.symbols.len(),
+                        idx.scanned_files
+                    );
+                    return Ok(());
+                }
+            }
+            let idx = IndexEngine::new(&root)
+                .scan()
+                .context("scan symbols")?;
+            idx.save(&root).context("save symbol index")?;
+            println!(
+                "indexed {} symbol(s) in {} file(s) -> {}",
+                idx.symbols.len(),
+                idx.scanned_files,
+                SymbolIndex::file_path(&root).display()
+            );
+        }
+        CodeintCmd::Find { name } | CodeintCmd::Defs { name } => {
+            let idx = load_symbol_index(&root)?;
+            let hits = idx.query(&name);
+            if hits.is_empty() {
+                println!("no symbols matching '{name}'");
+            } else {
+                println!("{} match(es) for '{name}':", hits.len());
+                for s in &hits {
+                    println!("{:10} {}:{}  {}", s.kind, s.file, s.line, s.name);
+                }
+            }
+        }
+        CodeintCmd::Refs {
+            name,
+            glob,
+            ignore_case,
+            max,
+        } => {
+            let hits = ws
+                .search
+                .grep(SearchOptions {
+                    pattern: word_boundary(&name),
+                    glob,
+                    case_insensitive: ignore_case,
+                    max_matches: max,
+                    path: None,
+                })
+                .context("find references")?;
+            let hits = filter_out_own_index(&root, hits);
+            println!("{} reference(s) to '{name}':", hits.len());
+            for h in &hits {
+                let prefix = h
+                    .project
+                    .as_ref()
+                    .map(|p| format!("[{p}] "))
+                    .unwrap_or_default();
+                println!("{prefix}{}:{}:{}", h.path.display(), h.line, h.text);
+            }
+        }
+        CodeintCmd::Rename { old, new } => {
+            let hits = ws
+                .search
+                .grep(SearchOptions {
+                    pattern: word_boundary(&old),
+                    glob: None,
+                    case_insensitive: false,
+                    max_matches: 2000,
+                    path: None,
+                })
+                .context("scan rename references")?;
+            let hits = filter_out_own_index(&root, hits);
+            if hits.is_empty() {
+                println!("no references to '{old}' found");
+                return Ok(());
+            }
+            // Group hits by file so the plan is actionable per file.
+            let mut by_file: Vec<(PathBuf, Vec<usize>)> = Vec::new();
+            for h in &hits {
+                match by_file.iter().position(|(p, _)| *p == h.path) {
+                    Some(i) => by_file[i].1.push(h.line),
+                    None => by_file.push((h.path.clone(), vec![h.line])),
+                }
+            }
+            println!(
+                "rename '{old}' -> '{new}': {} reference(s) in {} file(s)",
+                hits.len(),
+                by_file.len()
+            );
+            for (f, lines) in &by_file {
+                let shown: Vec<String> = lines.iter().take(5).map(|l| l.to_string()).collect();
+                let suffix = if lines.len() > 5 { ", …" } else { "" };
+                println!(
+                    "  {}: {} line(s) [{}]",
+                    f.display(),
+                    lines.len(),
+                    shown.join(", ") + suffix
+                );
+            }
+            println!("plan only — applying the edit is left to a review step.");
+        }
+    }
+    Ok(())
+}
+
+fn load_symbol_index(root: &Path) -> Result<SymbolIndex> {
+    SymbolIndex::load(root)
+        .context("load symbol index")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no index at {}; run `zeus codeint index` first",
+                SymbolIndex::file_path(root).display()
+            )
+        })
+}
+
+fn cmd_project(config: &Config, action: ProjectCmd) -> Result<()> {
+    let ws = workspace(config)?;
+    let root = ws.project_root.clone();
+    match action {
+        ProjectCmd::Detect => match zeus_lang::detect_project(&root) {
+            Some(lang) => {
+                println!("{}", zeus_lang::spec(lang).display_name);
+                Ok(())
+            }
+            None => bail!(
+                "could not detect a supported language for {} — run `zeus project commands --help` to list them",
+                root.display()
+            ),
+        },
+        ProjectCmd::Commands { lang } => {
+            let lang = match lang {
+                Some(name) => zeus_lang::Language::from_name(&name).ok_or_else(|| {
+                    anyhow::anyhow!("unknown language '{name}' — try a name like rust, ts, go, c#")
+                })?,
+                None => zeus_lang::detect_project(&root).ok_or_else(|| {
+                    anyhow::anyhow!("cannot detect language for {}; pass a language name", root.display())
+                })?,
+            };
+            print_lang_commands(lang, &root);
+            Ok(())
+        }
+        ProjectCmd::Scaffold { lang, name } => {
+            let lang = zeus_lang::Language::from_name(&lang).ok_or_else(|| {
+                anyhow::anyhow!("unknown language '{lang}' — try `zeus project scaffold --list` for choices")
+            })?;
+            let target = std::env::current_dir().context("current dir")?.join(&name);
+            if target.exists() {
+                bail!("{} already exists — pick a different name", target.display());
+            }
+            let written = zeus_lang::scaffold_project(lang, &name, &target).context("scaffold")?;
+            println!(
+                "scaffolded {} project '{name}' into {}:",
+                zeus_lang::spec(lang).display_name,
+                target.display()
+            );
+            for p in &written {
+                println!("  created {}", p.display());
+            }
+            Ok(())
+        }
+        ProjectCmd::Format { path } => match path {
+            Some(path) => format_one(&root, &path),
+            None => format_project(&root),
+        },
+    }
+}
+
+/// Resolve the language for `target`: a file's own extension wins, then the
+/// enclosing project root's detection, then the spec table.
+fn resolve_lang_for(root: &Path, target: &Path) -> Result<zeus_lang::Language> {
+    if let Some(lang) = zeus_lang::detect_source(target) {
+        return Ok(lang);
+    }
+    if let Some(lang) = zeus_lang::detect_project(root) {
+        return Ok(lang);
+    }
+    bail!(
+        "cannot detect a language for {} (not a known source file)",
+        target.display()
+    )
+}
+
+fn format_one(root: &Path, path: &Path) -> Result<()> {
+    let target = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if !target.is_file() {
+        bail!("{} is not a file", target.display());
+    }
+    let lang = resolve_lang_for(root, &target)?;
+    let spec = zeus_lang::spec(lang);
+    if spec.format.is_empty() {
+        bail!("no formatter configured for {}", spec.display_name);
+    }
+    if spec.format_style == zeus_lang::FormatStyle::Project {
+        println!(
+            "{} uses a project-wide formatter; run `zeus project format` (no path) instead",
+            spec.display_name
+        );
+        return Ok(());
+    }
+    let args = expand_format_args(spec.format, &target);
+    run_argv(&args, root)
+}
+
+fn format_project(root: &Path) -> Result<()> {
+    let lang = zeus_lang::detect_project(root).ok_or_else(|| {
+        anyhow::anyhow!("cannot detect language in {}", root.display())
+    })?;
+    let spec = zeus_lang::spec(lang);
+    if spec.format.is_empty() {
+        bail!("no formatter configured for {}", spec.display_name);
+    }
+    let args: Vec<String> = spec.format.iter().map(|a| a.to_string()).collect();
+    run_argv(&args, root)
+}
+
+/// Substitute `{file}` in a per-file format command argv.
+fn expand_format_args(template: &[&'static str], target: &Path) -> Vec<String> {
+    let path = target.to_string_lossy().into_owned();
+    template
+        .iter()
+        .map(|a| a.replace(zeus_lang::FILE_PLACEHOLDER, path.as_str()))
+        .collect()
+}
+
+/// Spawn `args[0] args[1..]` with cwd `root`, streaming the program's
+/// stdout/stderr through to the terminal and propagating its exit status.
+fn run_argv(args: &[String], root: &Path) -> Result<()> {
+    let Some((prog, rest)) = args.split_first() else {
+        bail!("empty command");
+    };
+    let status = std::process::Command::new(prog)
+        .args(rest)
+        .current_dir(root)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run '{prog}': {e}"))?;
+    if !status.success() {
+        bail!("{prog} exited with {}", status.code().unwrap_or(-1));
+    }
+    Ok(())
+}
+
+fn print_lang_commands(lang: zeus_lang::Language, root: &Path) {
+    let s = zeus_lang::spec(lang);
+    let fmt_vec = |args: &[&'static str]| -> String {
+        if args.is_empty() {
+            "(none)".to_string()
+        } else {
+            args.join(" ")
+        }
+    };
+    println!("project:  {}", root.display());
+    println!("language: {} ({})", s.display_name, s.exts.join(", "));
+    println!("  build:  {}", fmt_vec(s.build));
+    println!("  test:   {}", fmt_vec(s.test));
+    println!("  lint:   {}", fmt_vec(s.lint));
+    println!("  format: {}", fmt_vec(s.format));
+}
+
 fn cmd_rewind(config: &Config, turn_id: String) -> Result<()> {
     let ws = workspace(config)?;
     let n = ws
@@ -2039,6 +2765,16 @@ fn cmd_bg(config: &Config, action: BgCmd) -> Result<()> {
             println!("--- stdout ---\n{stdout}--- stderr ---\n{stderr}");
             Ok(())
         }
+        BgCmd::Pause { id } => {
+            registry.pause(id).context("pause background task")?;
+            println!("paused background task {id}");
+            Ok(())
+        }
+        BgCmd::Resume { id } => {
+            registry.resume(id).context("resume background task")?;
+            println!("resumed background task {id}");
+            Ok(())
+        }
         BgCmd::Stop { id } => {
             registry.stop(id).context("stop background task")?;
             println!("stopped background task {id}");
@@ -2172,7 +2908,24 @@ fn cmd_doctor(config: &Config) -> Result<()> {
     println!("  [x] AI commit messages + diff review (composed from git_diff + git_commit — no special code needed)");
     println!("  [x] PR support (git pr create/list/view via gh CLI)");
     println!();
-    println!("Next: Phase 6 — Code Intelligence");
+    println!("Phase 6 — Code Intelligence:");
+    println!("  [x] Database-free symbol index (.agent/index.json) — zeus codeint index");
+    println!("  [x] Find definitions / go-to-definition (zeus codeint find|defs)");
+    println!("  [x] Find references via ripgrep, cross-project roots (zeus codeint refs)");
+    println!("  [x] Rename proposal (word-boundary reference plan; apply is review-gated)");
+    println!("  Next: tree-sitter parsing + LSP manager (definition/diagnostics/format)");
+    println!();
+    println!("Phase 7 — Plan Mode:");
+    println!("  [x] -plan one-shot and /plan slash command (read-only research, no execution)");
+    println!("  [x] Structured plan persisted to .agent/tasks.json (`.agent/tasks.json`)");
+    println!("  [x] Review-before-execute gate in Auto mode (plan_execute approval prompt)");
+    println!("  Next: plan diff preview + per-step status in the tasks.json UI");
+    println!();
+    println!("Phase 8 — Test & Visual Verification:");
+    println!("  [x] test tool: auto-detect + run the repo test suite (cargo/npm/pnpm/yarn/pytest/go/make), parsed pass/fail summary");
+    println!("  [x] browser tool: open a URL in the default browser for visual checks + background dev servers");
+    println!("  [x] device tool: adb-driven app testing over USB debug / wireless (connect, install, launch, logcat, screenshot, shell)");
+    println!();
     let default_provider = config.settings.model.provider.clone();
     match create_default(&default_provider, &config.providers) {
         Ok(_) => println!("doctor: provider '{default_provider}' OK"),

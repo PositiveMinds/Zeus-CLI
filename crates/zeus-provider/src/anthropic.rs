@@ -359,7 +359,8 @@ impl ModelProvider for AnthropicProvider {
                         &mut saw_tool_call,
                         &mut last_usage,
                         &mut stop_reason,
-                    );
+                    )
+                    .await;
                 }
             }
         });
@@ -419,7 +420,7 @@ fn map_anthropic_reason(reason: Option<&str>, had_tool_calls: bool) -> FinishRea
 }
 
 /// Apply one Anthropic SSE event (the `data:` payload) to the stream state.
-fn handle_anthropic_event(
+async fn handle_anthropic_event(
     parsed: &Value,
     tx: &tokio::sync::mpsc::Sender<Result<StreamEvent>>,
     text_buf: &mut String,
@@ -447,9 +448,11 @@ fn handle_anthropic_event(
                 Some("text_delta") => {
                     let text = delta["text"].as_str().unwrap_or("");
                     text_buf.push_str(text);
-                    let _ = tx.send(Ok(StreamEvent::TextDelta {
-                        text: text.to_string(),
-                    }));
+                    let _ = tx
+                        .send(Ok(StreamEvent::TextDelta {
+                            text: text.to_string(),
+                        }))
+                        .await;
                 }
                 Some("input_json_delta") => {
                     let partial = delta["partial_json"].as_str().unwrap_or("");
@@ -470,11 +473,13 @@ fn handle_anthropic_event(
         "content_block_stop" => {
             let idx = parsed["index"].as_u64().unwrap_or(0);
             if let Some((id, name, args)) = tool_buf.remove(&idx) {
-                let _ = tx.send(Ok(StreamEvent::ToolCallDelta {
-                    id,
-                    name: Some(name),
-                    arguments_delta: args,
-                }));
+                let _ = tx
+                    .send(Ok(StreamEvent::ToolCallDelta {
+                        id,
+                        name: Some(name),
+                        arguments_delta: args,
+                    }))
+                    .await;
             }
         }
         "message_delta" => {

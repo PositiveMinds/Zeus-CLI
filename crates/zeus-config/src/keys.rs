@@ -28,7 +28,7 @@ impl KeysFile {
         let text = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
         toml::from_str(&text).map_err(|source| ConfigError::TomlParse {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })
     }
 

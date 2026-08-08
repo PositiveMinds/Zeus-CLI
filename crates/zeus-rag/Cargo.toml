@@ -1,0 +1,15 @@
+[package]
+name = "zeus-rag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RAG for zeus: chunk+embed project files and run semantic search over a prebuilt vector index"
+
+[dependencies]
+zeus-provider = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

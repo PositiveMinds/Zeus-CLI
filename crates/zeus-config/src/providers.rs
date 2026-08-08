@@ -47,7 +47,7 @@ impl ProvidersFile {
         let mut file: ProvidersFile =
             toml::from_str(&text).map_err(|source| ConfigError::TomlParse {
                 path: path.to_path_buf(),
-                source,
+                source: Box::new(source),
             })?;
         // Merge builtin defaults for any missing well-known providers.
         let defaults = Self::builtin_defaults();

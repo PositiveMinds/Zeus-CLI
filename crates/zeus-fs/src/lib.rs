@@ -4,20 +4,26 @@
 //! and records a checkpoint entry for undo.
 
 mod checkpoint;
+mod codeint;
+mod device;
 mod diff;
 mod error;
 mod git;
 mod ops;
 mod pathutil;
 mod permission;
+mod platform;
 mod search;
 mod staleness;
 mod workspace;
 
 pub use checkpoint::{CheckpointStore, CheckpointSummary, FileSnapshot};
+pub use codeint::{filter_out_own_index, paths_equal, word_boundary, IndexEngine, Symbol, SymbolIndex};
+pub use device::{DeviceEngine, DeviceOutput};
 pub use diff::preview_diff;
 pub use error::{FsError, Result};
 pub use git::{GitEngine, GitOutput, ResetMode};
+pub use platform::{PlatformEngine, PlatformOutput};
 pub use ops::{
     BulkEditPlan, BulkEditResult, CopyOptions, EditOptions, FileEngine, ReadOptions, ReadResult,
     WriteOptions,

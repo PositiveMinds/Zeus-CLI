@@ -11,6 +11,7 @@
 use crate::context::{CompactResult, ContextManager};
 use crate::error::{AgentError, Result};
 use crate::personas::{persona_by_id, recommend_persona, recommend_reviewer, Persona};
+use crate::plans::TaskPlan;
 use crate::session::{ConversationState, SessionStore};
 use crate::tools::ToolManager;
 use futures::StreamExt;
@@ -40,6 +41,10 @@ pub struct AgentOptions {
     /// other). `1` disables parallelism entirely â€” the prior sequential
     /// behaviour. Amounts to "bounded safe parallelism".
     pub max_parallel_read_steps: usize,
+    /// Where to persist the structured plan (`.agent/tasks.json`). When
+    /// `None`, Auto/plan runs skip persistence but the approval gate still
+    /// applies.
+    pub tasks_file: Option<std::path::PathBuf>,
 }
 
 impl Default for AgentOptions {
@@ -50,6 +55,7 @@ impl Default for AgentOptions {
             temperature: None,
             max_tokens: None,
             max_parallel_read_steps: 2,
+            tasks_file: None,
         }
     }
 }
@@ -82,6 +88,9 @@ pub enum AgentEvent {
     /// A review pass over completed plan work ran; `persona` is the reviewer
     /// id that drove it and `report` is its findings.
     PlanReviewed { persona: String, report: String },
+    /// The user declined an individual recommended step; it is skipped while
+    /// the rest of the plan continues.
+    PlanStepDeclined { step: PlanStep },
     /// All subtasks completed; `summary` is the combined result.
     OrchestrationDone { summary: String },
 }
@@ -91,6 +100,9 @@ pub enum AgentEvent {
 pub struct PlanStep {
     pub id: usize,
     pub description: String,
+    /// Why this approach (what the planner recommends and its trade-offs), so
+    /// the user can make an informed accept/decline per step.
+    pub rationale: String,
     /// Optional specialist-agent id (from `MVP_PERSONAS`) to steer this step;
     /// `None` means run it with the generic coding agent.
     pub persona: Option<String>,
@@ -293,6 +305,56 @@ impl Agent {
         self.drive_turn(on_event, approver).await
     }
 
+    /// Plan mode (v1) entry point: research the goal read-only and produce a
+    /// structured, *persisted* plan — without executing anything. Unlike an
+    /// Auto-mode run, this never touches the workspace: plan mode is forced
+    /// on for the duration, so every tool call the research pass makes is
+    /// read-only. The plan is written to `options.tasks_file`
+    /// (`.agent/tasks.json`) with `approved: false`, leaving the actual
+    /// execution to a later Auto-mode run (which gates on user approval).
+    pub async fn plan_turn<E, A>(
+        &mut self,
+        goal: &str,
+        mut on_event: E,
+        mut approver: A,
+    ) -> Result<TurnResult>
+    where
+        E: FnMut(AgentEvent),
+        A: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        let _ = self.cancel_tx.send(false);
+        self.state.messages.push(Message::user(goal));
+
+        if let Some(result) = self.maybe_compact().await? {
+            on_event(AgentEvent::Compacted(result));
+        }
+
+        let steps = self.plan_task(goal).await?;
+        on_event(AgentEvent::PlanGenerated { steps: steps.clone() });
+
+        // Research pass: read-only by force, so the plan is grounded in real
+        // files rather than guesses. The model's final answer is the
+        // approach write-up (persisted as the plan's `notes`).
+        let was_plan = self.plan_mode();
+        self.set_plan_mode(true);
+        let turn = self.drive_turn(&mut on_event, &mut approver).await;
+        self.set_plan_mode(was_plan);
+        let turn = turn?;
+
+        self.write_task_plan(&TaskPlan::from_steps(goal, &steps, &turn.final_text, false))?;
+
+        Ok(turn)
+    }
+
+    /// Persist the current structured plan to `.agent/tasks.json` (if a
+    /// `tasks_file` was configured). Silently skipped otherwise.
+    fn write_task_plan(&self, plan: &TaskPlan) -> Result<()> {
+        if let Some(path) = &self.options.tasks_file {
+            plan.write(path)?;
+        }
+        Ok(())
+    }
+
     /// Orchestrated `/plan` run: ask a planning-only call (no tools) to
     /// break the goal into an ordered list of subtasks, then execute each
     /// subtask as its own full tool-using turn, carrying forward a summary
@@ -317,6 +379,86 @@ impl Agent {
 
         let steps = self.plan_task(goal).await?;
         on_event(AgentEvent::PlanGenerated { steps: steps.clone() });
+
+        // Persist the drafted plan up front, then hold at the review gate:
+        // nothing below executes until the user approves. This is the
+        // "review-before-execute" step — Auto mode used to plan-then-run
+        // with no checkpoint, so a misframed goal would sail straight into
+        // file edits.
+        let mut plan = TaskPlan::from_steps(goal, &steps, "", false);
+        self.write_task_plan(&plan)?;
+
+        let approved = matches!(
+            approver(&PermissionRequest {
+                tool: "plan_execute".into(),
+                path: self.options.tasks_file.clone(),
+                command: None,
+                description: format!(
+                    "execute the reviewed plan ({} step(s)) for: {goal}",
+                    steps.len()
+                ),
+                preview: Some(self.render_plan_preview(&steps)),
+                overwrites: false,
+            }),
+            ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession
+        );
+        if !approved {
+            let summary = format!(
+                "plan drafted ({n} step(s)) but you declined to execute — nothing changed. \
+                 Review {path} (and/or fine-tune the goal) then rerun to approve.",
+                n = steps.len(),
+                path = self
+                    .options
+                    .tasks_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "the plan".to_string())
+            );
+            on_event(AgentEvent::OrchestrationDone {
+                summary: summary.clone(),
+            });
+            return Ok(summary);
+        }
+        plan.approved = true;
+        self.write_task_plan(&plan)?;
+
+        // Per-step acceptance: each recommended approach can be accepted or
+        // declined independently. Declined steps are skipped (and reported),
+        // the accepted ones run in order. `ApprovedForSession` auto-accepts
+        // every remaining step without re-prompting.
+        let mut accepted: Vec<PlanStep> = Vec::with_capacity(steps.len());
+        let mut declined: Vec<PlanStep> = Vec::new();
+        let mut auto_accept = false;
+        for step in &steps {
+            if auto_accept {
+                accepted.push(step.clone());
+                continue;
+            }
+            let decision = approver(&PermissionRequest {
+                tool: "plan_step".into(),
+                path: self.options.tasks_file.clone(),
+                command: None,
+                description: format!(
+                    "accept recommended step {}: {}",
+                    step.id, step.description
+                ),
+                preview: Some(Self::step_preview(step)),
+                overwrites: false,
+            });
+            match decision {
+                ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession => {
+                    if decision == ApprovalDecision::ApprovedForSession {
+                        auto_accept = true;
+                    }
+                    accepted.push(step.clone());
+                }
+                ApprovalDecision::Denied => {
+                    declined.push(step.clone());
+                    on_event(AgentEvent::PlanStepDeclined { step: step.clone() });
+                }
+            }
+        }
+        let steps: Vec<PlanStep> = accepted;
 
         let mut summaries: Vec<String> = Vec::new();
         let mut prior_content = String::new();
@@ -388,9 +530,11 @@ impl Agent {
                         async move {
                             run_headless_step(
                                 provider,
-                                opt_model,
-                                opt_temperature,
-                                opt_max_tokens,
+                                HeadlessSpec {
+                                    model: opt_model,
+                                    temperature: opt_temperature,
+                                    max_tokens: opt_max_tokens,
+                                },
                                 &step,
                                 goal,
                                 &base_snapshot,
@@ -446,13 +590,52 @@ impl Agent {
         } else {
             final_summary
         };
+        // Stamp the completed plan: every step done, notes = the final
+        // orchestrated summary (including the reviewer's report).
+        plan.mark_all_done();
+        plan.notes = final_summary.clone();
+        self.write_task_plan(&plan)?;
         on_event(AgentEvent::OrchestrationDone {
             summary: final_summary.clone(),
         });
         Ok(final_summary)
     }
 
-    /// One read-only review pass over completed `work`, driven by a
+    /// Compact, human-readable preview of the planned steps, shown in the
+    /// approval prompt before anything executes.
+    fn render_plan_preview(&self, steps: &[PlanStep]) -> String {
+        let mut out = String::from("Proposed plan:\n");
+        for step in steps {
+            out.push_str(&format!(
+                "  {}. {}{}\n",
+                step.id,
+                step.description,
+                step.persona
+                    .as_ref()
+                    .map(|p| format!("  [{p}]"))
+                    .unwrap_or_default()
+            ));
+            if !step.rationale.is_empty() {
+                out.push_str(&format!("     why: {}\n", step.rationale));
+            }
+        }
+        out
+    }
+
+    /// One-line preview of a single planned step, including the rationale for
+/// choosing that approach. Used for the per-step accept/deny gate.
+fn step_preview(step: &PlanStep) -> String {
+    let mut s = format!("{}. {}", step.id, step.description);
+    if let Some(p) = step.persona.as_deref() {
+        s.push_str(&format!("  [{p}]"));
+    }
+    if !step.rationale.is_empty() {
+        s.push_str(&format!("\n   why: {}", step.rationale));
+    }
+    s
+}
+
+/// One read-only review pass over completed `work`, driven by a
     /// `reviewer: true` persona matched to the goal. Emits a `PlanReviewed`
     /// event with the report. Returns the report text, or `None` when no
     /// reviewer is available.
@@ -505,37 +688,68 @@ impl Agent {
                     Message::system(
                         "You are a planning agent. Break the user's goal into 2-6 concrete, \
                          ordered subtasks that a coding agent with file and shell access can \
-                         execute one at a time. Respond with ONLY a JSON array of strings, \
-                         no prose, no markdown fences. Example: \
-                         [\"Read package.json\", \"Add the missing dependency\"]",
+                         execute one at a time. For each subtask give a short `description` of \
+                         the action and a short `rationale` explaining why this approach and \
+                         its trade-offs (1-2 sentences). Respond with ONLY a JSON array of \
+                         objects, no prose, no markdown fences. Example: \
+                         [{\"description\": \"Read package.json\", \"rationale\": \"Confirms the \
+                         dependency list before editing.\"}]",
                     ),
                     Message::user(goal),
                 ],
                 tools: Vec::new(),
                 temperature: None,
-                max_tokens: Some(512),
+                max_tokens: Some(1024),
                 cancel: Some(self.cancel_rx.clone()),
             })
             .await
             .map_err(AgentError::Provider)?;
 
         let text = response.message.content;
-        let parsed = serde_json::from_str::<Vec<String>>(text.trim())
+        // Tolerate both the object form `[{description, rationale}]` and the
+        // older plain-string form `["read x"]`.
+        let parsed = serde_json::from_str::<Vec<serde_json::Value>>(text.trim())
             .ok()
             .filter(|v| !v.is_empty());
         match parsed {
-            Some(steps) => Ok(steps
-                .into_iter()
-                .enumerate()
-                .map(|(i, description)| PlanStep {
-                    id: i + 1,
-                    description: description.clone(),
-                    persona: recommend_persona(&description).map(|p| p.id.to_string()),
-                })
-                .collect()),
+            Some(items) => {
+                let steps: Vec<PlanStep> = items
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| {
+                        let description = v
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .map(str::to_string)
+                            .or_else(|| v.as_str().map(str::to_string));
+                        let description = description?;
+                        let rationale = v
+                            .get("rationale")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        Some(PlanStep {
+                            id: i + 1,
+                            description: description.clone(),
+                            rationale,
+                            persona: recommend_persona(&description).map(|p| p.id.to_string()),
+                        })
+                    })
+                    .collect();
+                if !steps.is_empty() {
+                    return Ok(steps);
+                }
+                Ok(vec![PlanStep {
+                    id: 1,
+                    description: goal.to_string(),
+                    rationale: String::new(),
+                    persona: recommend_persona(goal).map(|p| p.id.to_string()),
+                }])
+            }
             None => Ok(vec![PlanStep {
                 id: 1,
                 description: goal.to_string(),
+                rationale: String::new(),
                 persona: recommend_persona(goal).map(|p| p.id.to_string()),
             }]),
         }
@@ -825,7 +1039,13 @@ impl Agent {
             i += 1;
         }
         new_messages.push(Message::system(format!(
-            "[Earlier conversation summary]\n{summary_text}"
+            "[Earlier conversation summary]\n\
+             The earlier turns were removed to keep the context small. The original \
+             tool outputs they were based on are GONE — treat this summary as a claim, \
+             NOT as evidence. Re-run the relevant tool (read/grep/search/glob) before \
+             asserting any file content, path, line number, or symbol that is not \
+             explicitly quoted here, and expect this summary to be incomplete or wrong.\n\n\
+             {summary_text}"
         )));
         new_messages.extend_from_slice(&self.state.messages[boundary..]);
 
@@ -895,11 +1115,16 @@ fn step_summary(step: &PlanStep, text: &str) -> String {
 /// conversation mutation) and return its text. Used for concurrent read-only
 /// steps: unconnected cloned provider/cancel handle in, finished text out,
 /// nothing about `self` shared or mutated.
-async fn run_headless_step(
-    provider: std::sync::Arc<dyn ModelProvider>,
+/// Model knobs shared by headless plan steps.
+struct HeadlessSpec {
     model: String,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+}
+
+async fn run_headless_step(
+    provider: std::sync::Arc<dyn ModelProvider>,
+    spec: HeadlessSpec,
     step: &PlanStep,
     goal: &str,
     snapshot: &str,
@@ -920,11 +1145,11 @@ async fn run_headless_step(
     );
 
     let request = ChatRequest {
-        model,
+        model: spec.model,
         messages: vec![Message::system(system), Message::user(user)],
         tools: Vec::new(),
-        temperature,
-        max_tokens: max_tokens.or(Some(512)),
+        temperature: spec.temperature,
+        max_tokens: spec.max_tokens.or(Some(512)),
         cancel: Some(cancel),
     };
     let mut stream = provider.stream(request).await.map_err(AgentError::Provider)?;

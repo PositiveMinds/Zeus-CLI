@@ -8,6 +8,11 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use std::path::{Path, PathBuf};
 
+/// Skip files larger than this while grepping — a single multi-hundred-MB
+/// minified bundle or vendored artifact shouldn't stall a project-wide scan
+/// or blow the result set. Large projects routinely contain such files.
+const GREP_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
     /// Regex pattern for content search.
@@ -40,6 +45,18 @@ pub struct GrepMatch {
     pub line: usize,
     pub text: String,
     pub project: Option<String>,
+}
+
+/// Accumulator for grep results with a result cap shared across roots.
+struct GrepSink {
+    out: Vec<GrepMatch>,
+    max: usize,
+}
+
+impl GrepSink {
+    fn full(&self) -> bool {
+        self.out.len() >= self.max
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,19 +103,22 @@ impl SearchEngine {
             .transpose()
             .map_err(|e| FsError::InvalidPath(format!("invalid glob: {e}")))?;
 
-        let mut matches = Vec::new();
+        let mut sink = GrepSink {
+            out: Vec::new(),
+            max: opts.max_matches,
+        };
         let roots = self.collect_roots();
         for (label, root) in roots {
             let start = match &opts.path {
                 Some(p) if label.is_none() => resolve_in_project(&root, p)?,
                 _ => root.clone(),
             };
-            self.grep_root(&start, &root, label.as_deref(), &re, file_glob.as_ref(), opts.max_matches, &mut matches)?;
-            if matches.len() >= opts.max_matches {
+            self.grep_root(&start, &root, label.as_deref(), &re, file_glob.as_ref(), &mut sink)?;
+            if sink.out.len() >= opts.max_matches {
                 break;
             }
         }
-        Ok(matches)
+        Ok(sink.out)
     }
 
     fn grep_root(
@@ -108,8 +128,7 @@ impl SearchEngine {
         project_label: Option<&str>,
         re: &Regex,
         file_glob: Option<&globset::GlobMatcher>,
-        max: usize,
-        out: &mut Vec<GrepMatch>,
+        sink: &mut GrepSink,
     ) -> Result<()> {
         let walker = WalkBuilder::new(start)
             .hidden(false)
@@ -118,7 +137,7 @@ impl SearchEngine {
             .build();
 
         for entry in walker {
-            if out.len() >= max {
+            if sink.full() {
                 break;
             }
             let entry = match entry {
@@ -139,6 +158,12 @@ impl SearchEngine {
                     continue;
                 }
             }
+            // Skip oversized files (minified bundles, vendored deps, dumps).
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.len() > GREP_MAX_FILE_BYTES {
+                    continue;
+                }
+            }
             let bytes = match std::fs::read(path) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -148,7 +173,7 @@ impl SearchEngine {
             }
             let text = String::from_utf8_lossy(&bytes);
             for (i, line) in text.lines().enumerate() {
-                if out.len() >= max {
+                if sink.full() {
                     break;
                 }
                 if re.is_match(line) {
@@ -156,7 +181,7 @@ impl SearchEngine {
                         .strip_prefix(project_root)
                         .unwrap_or(path)
                         .to_path_buf();
-                    out.push(GrepMatch {
+                    sink.out.push(GrepMatch {
                         path: rel,
                         line: i + 1,
                         text: line.to_string(),

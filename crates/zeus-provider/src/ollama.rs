@@ -336,16 +336,15 @@ impl ModelProvider for OllamaProvider {
                         return;
                     }
                     if let Some(msg) = &parsed.message {
-                        if !msg.content.is_empty() {
-                            if tx
+                        if !msg.content.is_empty()
+                            && tx
                                 .send(Ok(StreamEvent::TextDelta {
                                     text: msg.content.clone(),
                                 }))
                                 .await
                                 .is_err()
-                            {
-                                return;
-                            }
+                        {
+                            return;
                         }
                         for call in tool_calls_from(msg, next_call_id) {
                             saw_tool_call = true;

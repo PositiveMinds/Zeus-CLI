@@ -11,6 +11,7 @@ chrono = { workspace = true }
 futures = { workspace = true }
 zeus-config = { workspace = true }
 zeus-fs = { workspace = true }
+zeus-lang = { workspace = true }
 zeus-logging = { workspace = true }
 zeus-provider = { workspace = true }
 serde = { workspace = true }

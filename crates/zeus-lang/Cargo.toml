@@ -1,0 +1,11 @@
+[package]
+name = "zeus-lang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Language detection, per-language dev commands, and project scaffolding for zeus"
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = { workspace = true }

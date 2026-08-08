@@ -501,6 +501,98 @@ pub(crate) fn kill_tree(pid: u32) {
     }
 }
 
+/// Suspend a process (with any children it may have spawned) in place, so it
+/// can later be resumed from exactly the same point. On Unix this SIGSTOPs the
+/// whole process group; on Windows it suspends all threads of the process.
+pub(crate) fn suspend_process(pid: u32) -> std::io::Result<()> {
+    signal_process(pid, true)
+}
+
+/// Continue a previously-suspended process.
+pub(crate) fn resume_process(pid: u32) -> std::io::Result<()> {
+    signal_process(pid, false)
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
+    let sig = if suspend { "STOP" } else { "CONT" };
+    // Prefer the process group so any children freeze/thaw together.
+    let pgid = Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        });
+    let target = match pgid {
+        Some(gid) => format!("-{gid}"),
+        None => pid.to_string(),
+    };
+    run_signal(&format!("-{sig}"), &target)
+}
+
+#[cfg(windows)]
+fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
+    // No SIGSTOP/SIGCONT on Windows — go through ntdll's
+    // NtSuspendProcess/NtResumeProcess, which freezes all threads of the
+    // process (the approach PsSuspend/Process Explorer use).
+    use libloading::{Library, Symbol};
+    use std::ffi::c_void;
+
+    unsafe {
+        type NtSuspend = unsafe extern "system" fn(*mut c_void) -> i32;
+        type OpenProcess = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
+        type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+        const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+
+        let ntdll = Library::new("ntdll.dll").map_err(std::io::Error::other)?;
+        let proc_name: &[u8] = if suspend {
+            b"NtSuspendProcess\0"
+        } else {
+            b"NtResumeProcess\0"
+        };
+        let suspend_proc: Symbol<NtSuspend> = ntdll.get(proc_name).map_err(std::io::Error::other)?;
+
+        let kernel32 = Library::new("kernel32.dll").map_err(std::io::Error::other)?;
+        let open_process: Symbol<OpenProcess> =
+            kernel32.get(b"OpenProcess\0").map_err(std::io::Error::other)?;
+        let close_handle: Symbol<CloseHandle> =
+            kernel32.get(b"CloseHandle\0").map_err(std::io::Error::other)?;
+
+        let handle = open_process(PROCESS_SUSPEND_RESUME, 0, pid);
+        if handle.is_null() {
+            return Err(std::io::Error::other("OpenProcess failed — task may have exited"));
+        }
+        let status = suspend_proc(handle);
+        close_handle(handle);
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "NtSuspend/ResumeProcess returned status {status:#x}"
+            )))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_signal(signal: &str, target: &str) -> std::io::Result<()> {
+    let status = Command::new("kill")
+        .args([signal, target])
+        .status()
+        .map_err(std::io::Error::other)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("kill failed"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,11 +605,7 @@ mod tests {
     }
 
     fn echo_command(msg: &str) -> String {
-        if cfg!(windows) {
-            format!("echo {msg}")
-        } else {
-            format!("echo {msg}")
-        }
+        format!("echo {msg}")
     }
 
     #[test]

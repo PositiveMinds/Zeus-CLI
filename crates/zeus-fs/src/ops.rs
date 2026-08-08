@@ -12,19 +12,10 @@ use tracing::info;
 const BULK_PREVIEW_CAP: usize = 20;
 const DELETE_DIR_PREVIEW_CAP: usize = 20;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReadOptions {
     pub offset: Option<usize>,
     pub limit: Option<usize>,
-}
-
-impl Default for ReadOptions {
-    fn default() -> Self {
-        Self {
-            offset: None,
-            limit: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -701,7 +692,7 @@ fn copy_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
     if from.is_dir() {
         std::fs::create_dir_all(to)?;
         for entry in walkdir::WalkDir::new(from).min_depth(1) {
-            let entry = entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let entry = entry.map_err(std::io::Error::other)?;
             let rel = entry
                 .path()
                 .strip_prefix(from)

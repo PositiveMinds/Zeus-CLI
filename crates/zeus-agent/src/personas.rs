@@ -83,9 +83,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "software-architect",
         department: "Software Engineering",
         role: "Software Architect",
-        expertise: concat!(
-            "system design, module boundaries, interfaces, and high-level structure"
-        ),
+        expertise: "system design, module boundaries, interfaces, and high-level structure",
         keywords: &["architect", "design", "structure", "architecture", "refactor", "scalability"],
         tools: Some(&["read", "grep", "glob", "bash"]),
         constraints: concat!(
@@ -99,7 +97,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "backend-engineer",
         department: "Software Engineering",
         role: "Backend Engineer",
-        expertise: concat!("server code, APIs, data model, core logic"),
+        expertise: "server code, APIs, data model, core logic",
         keywords: &["backend", "api", "server", "endpoint", "service", "controller"],
         tools: None,
         constraints: concat!(
@@ -112,7 +110,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "frontend-engineer",
         department: "Software Engineering",
         role: "Frontend Engineer",
-        expertise: concat!("UI, CLI ergonomics, rendering, interface with the user"),
+        expertise: "UI, CLI ergonomics, rendering, interface with the user",
         keywords: &["frontend", "ui", "cli", "tui", "interface", "terminal", "render", "widget"],
         tools: None,
         constraints: concat!(
@@ -125,7 +123,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "mobile-engineer",
         department: "Software Engineering",
         role: "Mobile Engineer",
-        expertise: concat!("mobile apps, platform-specific code, lifecycle, offline behaviour"),
+        expertise: "mobile apps, platform-specific code, lifecycle, offline behaviour",
         keywords: &["mobile", "ios", "android", "react native", "swift", "kotlin", "phone"],
         tools: None,
         constraints: concat!(
@@ -138,7 +136,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "desktop-engineer",
         department: "Software Engineering",
         role: "Desktop Engineer",
-        expertise: concat!("native desktop apps, windowing, packaging, embedded runtimes"),
+        expertise: "native desktop apps, windowing, packaging, embedded runtimes",
         keywords: &["desktop", "native", "windowing", "tray", "installer", "electron", "tauri"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -151,7 +149,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "database-engineer",
         department: "Software Engineering",
         role: "Database Engineer",
-        expertise: concat!("schemas, persistence, storage layout, migrations"),
+        expertise: "schemas, persistence, storage layout, migrations",
         keywords: &["database", "schema", "migration", "storage", "persistence", "sql"],
         tools: None,
         constraints: concat!(
@@ -164,7 +162,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "devops-engineer",
         department: "Software Engineering",
         role: "DevOps Engineer",
-        expertise: concat!("build config, toolchains, CI, environments"),
+        expertise: "build config, toolchains, CI, environments",
         keywords: &["ci", "build", "pipeline", "deploy", "toolchain", "tooling", "docker", "release"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -177,7 +175,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "qa-engineer",
         department: "Software Engineering",
         role: "QA Engineer",
-        expertise: concat!("test plans, coverage, verification, catching regressions"),
+        expertise: "test plans, coverage, verification, catching regressions",
         keywords: &["test", "qa", "verify", "regression", "coverage", "assert", "reproduce"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -191,7 +189,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "technical-writer",
         department: "Software Engineering",
         role: "Technical Writer",
-        expertise: concat!("docs, README, comments, prose clarity"),
+        expertise: "docs, README, comments, prose clarity",
         keywords: &["document", "docs", "readme", "explain", "writeup", "comment", "changelog"],
         tools: Some(&["read", "write", "glob"]),
         constraints: concat!(
@@ -205,7 +203,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "security-architect",
         department: "Cybersecurity",
         role: "Security Architect",
-        expertise: concat!("threat modelling, security model, zero-trust, data protection"),
+        expertise: "threat modelling, security model, zero-trust, data protection",
         keywords: &["threat", "security architecture", "zero trust", "hardening"],
         tools: Some(&["read", "grep", "glob", "bash"]),
         constraints: concat!(
@@ -218,7 +216,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "penetration-tester",
         department: "Cybersecurity",
         role: "Penetration Tester",
-        expertise: concat!("finding exploitable weaknesses and review surface"),
+        expertise: "finding exploitable weaknesses and review surface",
         keywords: &["pen test", "pentest", "exploit", "injection", "vulnerability", "attack", "fuzz"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -232,7 +230,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "secure-code-reviewer",
         department: "Cybersecurity",
         role: "Secure Code Reviewer",
-        expertise: concat!("security review of code: injection, authz, secrets, deserialization"),
+        expertise: "security review of code: injection, authz, secrets, deserialization",
         keywords: &["security review", "audit", "hardening", "sanitize", "secret"],
         tools: Some(&["read", "grep", "glob"]),
         constraints: concat!(
@@ -246,7 +244,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "compliance-officer",
         department: "Cybersecurity",
         role: "Compliance Officer",
-        expertise: concat!("standards alignment, data-privacy posture, regulatory review"),
+        expertise: "standards alignment, data-privacy posture, regulatory review",
         keywords: &["compliance", "regulatory", "audit", "gdpr", "standard", "privacy"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -260,7 +258,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "research-scientist",
         department: "Research",
         role: "Research Scientist",
-        expertise: concat!("framing questions, hypotheses, experimental design"),
+        expertise: "framing questions, hypotheses, experimental design",
         keywords: &["hypothesis", "experiment", "study", "methodology", "research"],
         tools: Some(&["read", "grep", "glob"]),
         constraints: concat!(
@@ -273,7 +271,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "literature-review-specialist",
         department: "Research",
         role: "Literature Review Specialist",
-        expertise: concat!("synthesising and summarising relevant literature and references"),
+        expertise: "synthesising and summarising relevant literature and references",
         keywords: &["literature", "related work", "literature review", "source", "prior work"],
         tools: Some(&["read", "grep", "glob"]),
         constraints: concat!(
@@ -286,7 +284,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "statistician",
         department: "Research",
         role: "Statistician",
-        expertise: concat!("statistics, sampling, test selection, interpretation"),
+        expertise: "statistics, sampling, test selection, interpretation",
         keywords: &["statistic", "p-value", "sampling", "regression", "confidence", "power"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -299,7 +297,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "research-methodologist",
         department: "Research",
         role: "Research Methodologist",
-        expertise: concat!("survey and experimental design, validity, bias"),
+        expertise: "survey and experimental design, validity, bias",
         keywords: &["methodology", "validity", "bias", "survey", "confound"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -312,7 +310,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "citation-specialist",
         department: "Research",
         role: "Citation Specialist",
-        expertise: concat!("citations, reference format, bibliographic retrieval"),
+        expertise: "citations, reference format, bibliographic retrieval",
         keywords: &["citation", "reference", "bibliography", "doi", "footnote"],
         tools: Some(&["read", "grep"]),
         constraints: concat!(
@@ -325,7 +323,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "academic-writing-coach",
         department: "Research",
         role: "Academic Writing Coach",
-        expertise: concat!("argument structure, scholarly style, revision"),
+        expertise: "argument structure, scholarly style, revision",
         keywords: &["academic", "writing", "thesis", "draft", "manuscript", "prose"],
         tools: Some(&["read", "write", "glob"]),
         constraints: concat!(
@@ -339,7 +337,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "programming-tutor",
         department: "Education",
         role: "Programming Tutor",
-        expertise: concat!("teaching, worked examples, explaining concepts"),
+        expertise: "teaching, worked examples, explaining concepts",
         keywords: &["teach", "tutor", "explain", "learn", "lesson", "guided"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -353,7 +351,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "code-mentor",
         department: "Education",
         role: "Code Mentor",
-        expertise: concat!("review-based teaching, feedback, levelling up skills"),
+        expertise: "review-based teaching, feedback, levelling up skills",
         keywords: &["mentor", "mentoring", "level up", "practice", "review my code"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -366,7 +364,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "career-coach",
         department: "Education",
         role: "Career Coach",
-        expertise: concat!("career paths, portfolios, interviewing, growth"),
+        expertise: "career paths, portfolios, interviewing, growth",
         keywords: &["career", "portfolio", "interview", "resume", "job search", "growth"],
         tools: None,
         constraints: concat!(
@@ -380,7 +378,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "clinical-informatics",
         department: "Healthcare",
         role: "Clinical Informatics",
-        expertise: concat!("health information systems, EHR workflows, interoperability"),
+        expertise: "health information systems, EHR workflows, interoperability",
         keywords: &["clinical", "informatics", "ehr", "interoperability", "hl7", "health record"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -394,7 +392,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "health-data-analyst",
         department: "Healthcare",
         role: "Health Data Analyst",
-        expertise: concat!("health data analysis, metrics, reporting pipelines"),
+        expertise: "health data analysis, metrics, reporting pipelines",
         keywords: &["health data", "health metrics", "patient metrics", "health report"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -407,7 +405,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "telemedicine-specialist",
         department: "Healthcare",
         role: "Telemedicine Specialist",
-        expertise: concat!("virtual-care workflows, appointment systems, telehealth UX"),
+        expertise: "virtual-care workflows, appointment systems, telehealth UX",
         keywords: &["telemedicine", "telehealth", "virtual care", "appointment"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -421,7 +419,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "product-manager",
         department: "Business",
         role: "Product Manager",
-        expertise: concat!("requirements, prioritisation, user value, scope"),
+        expertise: "requirements, prioritisation, user value, scope",
         keywords: &["product", "requirements", "roadmap", "user story", "prioritize"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -434,7 +432,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "business-analyst",
         department: "Business",
         role: "Business Analyst",
-        expertise: concat!("process analysis, requirements analysis, gap analysis"),
+        expertise: "process analysis, requirements analysis, gap analysis",
         keywords: &["business analyst", "process", "requirements analysis", "gap"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -447,7 +445,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "financial-analyst",
         department: "Business",
         role: "Financial Analyst",
-        expertise: concat!("costing, budgets, financial modelling, return analysis"),
+        expertise: "costing, budgets, financial modelling, return analysis",
         keywords: &["financial", "cost", "budget", "roi", "revenue", "pricing", "forecast"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -460,7 +458,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "marketing-strategist",
         department: "Business",
         role: "Marketing Strategist",
-        expertise: concat!("positioning, messaging, campaigns, audience"),
+        expertise: "positioning, messaging, campaigns, audience",
         keywords: &["marketing", "campaign", "positioning", "messaging", "brand", "audience"],
         tools: None,
         constraints: concat!(
@@ -474,7 +472,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "performance-engineer",
         department: "Software Engineering",
         role: "Performance Engineer",
-        expertise: concat!("profiling, bottlenecks, latency, memory budgets, benchmarks"),
+        expertise: "profiling, bottlenecks, latency, memory budgets, benchmarks",
         keywords: &["performance", "profile", "benchmark", "latency", "throughput", "optimize", "memory"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -488,7 +486,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "accessibility-engineer",
         department: "Software Engineering",
         role: "Accessibility Engineer",
-        expertise: concat!("accessible UI, keyboard and screen-reader flows, contrast"),
+        expertise: "accessible UI, keyboard and screen-reader flows, contrast",
         keywords: &["accessibility", "a11y", "screen reader", "keyboard nav", "contrast", "wcag"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -502,7 +500,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "site-reliability-engineer",
         department: "Software Engineering",
         role: "Platform / Reliability Engineer",
-        expertise: concat!("uptime, monitoring, alerting, incident response, operability"),
+        expertise: "uptime, monitoring, alerting, incident response, operability",
         keywords: &["reliability", "uptime", "monitoring", "alerting", "incident", "observability", "sla"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -516,7 +514,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "runtime-debugger",
         department: "Software Engineering",
         role: "Runtime Debugger",
-        expertise: concat!("crash triage, stack traces, root-cause analysis, bisecting failures"),
+        expertise: "crash triage, stack traces, root-cause analysis, bisecting failures",
         keywords: &["debug", "crash", "stack trace", "panic", "root cause", "trace", "sigsegv", "bisect"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -530,7 +528,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "localization-engineer",
         department: "Software Engineering",
         role: "Localization Engineer",
-        expertise: concat!("i18n, l10n, string externalisation, RTL/plurals"),
+        expertise: "i18n, l10n, string externalisation, RTL/plurals",
         keywords: &["internationalization", "localization", "i18n", "l10n", "translation", "rtl", "locale"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -543,7 +541,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "architectural-reviewer",
         department: "Software Engineering",
         role: "Architectural Reviewer",
-        expertise: concat!("architectural review, coupling, cohesion, design seams"),
+        expertise: "architectural review, coupling, cohesion, design seams",
         keywords: &["architecture review", "design review", "coupling", "cohesion", "seams"],
         tools: Some(&["read", "glob", "bash"]),
         constraints: concat!(
@@ -557,7 +555,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "ai-safety-auditor",
         department: "Cybersecurity",
         role: "AI Safety Auditor",
-        expertise: concat!("prompt injection, tool-authority misuse, over-permission guardrails"),
+        expertise: "prompt injection, tool-authority misuse, over-permission guardrails",
         keywords: &["injection", "prompt injection", "safety", "misuse", "overstep", "authority", "guardrail"],
         tools: Some(&["read", "grep", "glob"]),
         constraints: concat!(
@@ -572,7 +570,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "data-engineer",
         department: "Data & Privacy",
         role: "Data Engineer",
-        expertise: concat!("ETL, data pipelines, streaming, data modelling"),
+        expertise: "ETL, data pipelines, streaming, data modelling",
         keywords: &["etl", "pipeline", "streaming", "data flow", "ingest", "data lake", "warehouse"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -585,7 +583,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "ml-engineer",
         department: "Data & Privacy",
         role: "ML Engineer",
-        expertise: concat!("model training, evaluation, feature pipelines, LLM engineering"),
+        expertise: "model training, evaluation, feature pipelines, LLM engineering",
         keywords: &["ml", "model", "training", "inference", "evaluation", "fine-tune", "prompt"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -598,7 +596,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "privacy-officer",
         department: "Data & Privacy",
         role: "Privacy Officer",
-        expertise: concat!("data minimisation, consent, retention, privacy-preserving defaults"),
+        expertise: "data minimisation, consent, retention, privacy-preserving defaults",
         keywords: &["privacy", "consent", "retention", "data minimisation", "personally", "breach"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -613,7 +611,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "ux-designer",
         department: "Business",
         role: "UX Designer",
-        expertise: concat!("user flows, wireframes, information architecture, usability"),
+        expertise: "user flows, wireframes, information architecture, usability",
         keywords: &["ux", "user flow", "wireframe", "usability", "mockup", "journey"],
         tools: None,
         constraints: concat!(
@@ -627,7 +625,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "business-intelligence-analyst",
         department: "Business",
         role: "Business Intelligence Analyst",
-        expertise: concat!("metrics, dashboards, KPI definitions, analytics reporting"),
+        expertise: "metrics, dashboards, KPI definitions, analytics reporting",
         keywords: &["bi", "dashboard", "kpi", "analytics", "metrics report", "cohort"],
         tools: Some(&["read", "bash", "glob"]),
         constraints: concat!(
@@ -641,7 +639,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "legal-counsel",
         department: "Business",
         role: "Legal Counsel",
-        expertise: concat!("licenses, attributions, dependency legal review, usage terms"),
+        expertise: "licenses, attributions, dependency legal review, usage terms",
         keywords: &["license", "legal", "copyright", "ip", "attribution", "eula", "terms"],
         tools: Some(&["read", "glob"]),
         constraints: concat!(
@@ -654,7 +652,7 @@ pub const ALL_PERSONAS: &[Persona] = &[
         id: "support-engineer",
         department: "Business",
         role: "Support Engineer",
-        expertise: concat!("answer user questions from docs/transcripts, write FAQs"),
+        expertise: "answer user questions from docs/transcripts, write FAQs",
         keywords: &["support", "faq", "question", "helpdesk", "troubleshoot"],
         tools: None,
         constraints: concat!(
