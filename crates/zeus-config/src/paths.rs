@@ -12,7 +12,9 @@
 //! ├── logs/
 //! ├── plugins/
 //! ├── commands/
-//! └── prompts/
+//! ├── prompts/
+//! ├── personas/
+//! └── skills/
 //!
 //! my-project/.agent/
 //! ├── config.toml
@@ -23,6 +25,7 @@
 //! ├── index.json
 //! ├── hooks/
 //! ├── commands/
+//! ├── skills/
 //! └── checkpoints/
 //! ```
 
@@ -57,6 +60,9 @@ pub struct GlobalPaths {
     /// Custom specialist-agent personas (`~/.zeus/personas/*.toml`), merged
     /// into the built-in roster at load time.
     pub personas: PathBuf,
+    /// Reusable skill packages (`~/.zeus/skills/<name>/SKILL.md`), discovered
+    /// alongside project skills so the model can load expertise on demand.
+    pub skills: PathBuf,
     /// Downloaded model files (GGUF, etc.) land here — scanned by
     /// `zeus models --local` so downloaded-but-not-yet-served models are
     /// still discoverable without any server running.
@@ -85,6 +91,7 @@ impl GlobalPaths {
             commands: root.join("commands"),
             prompts: root.join("prompts"),
             personas: root.join("personas"),
+            skills: root.join("skills"),
             models: root.join("models"),
             bin: root.join("bin"),
             root,
@@ -102,8 +109,10 @@ pub struct ProjectPaths {
     pub memory_md: PathBuf,
     pub tasks_json: PathBuf,
     pub index_json: PathBuf,
+    pub instructions_md: PathBuf,
     pub hooks: PathBuf,
     pub commands: PathBuf,
+    pub skills: PathBuf,
     pub checkpoints: PathBuf,
 }
 
@@ -117,8 +126,10 @@ impl ProjectPaths {
             memory_md: root.join("memory.md"),
             tasks_json: root.join("tasks.json"),
             index_json: root.join("index.json"),
+            instructions_md: root.join("instructions.md"),
             hooks: root.join("hooks"),
             commands: root.join("commands"),
+            skills: root.join("skills"),
             checkpoints: root.join("checkpoints"),
             root,
         }
@@ -137,6 +148,7 @@ pub fn ensure_global_dirs(paths: &GlobalPaths) -> Result<()> {
         &paths.commands,
         &paths.prompts,
         &paths.personas,
+        &paths.skills,
         &paths.models,
         &paths.bin,
     ] {

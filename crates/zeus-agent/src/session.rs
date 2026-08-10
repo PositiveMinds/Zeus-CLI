@@ -5,7 +5,7 @@
 use crate::error::{AgentError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use zeus_provider::Message;
+use zeus_provider::{Message, Role};
 
 /// One turn's worth of transcript, for history browsing (not required for
 /// resume — `ConversationState` alone is enough to continue a session).
@@ -20,6 +20,9 @@ pub struct TranscriptEntry {
 pub struct ConversationState {
     pub session_id: String,
     pub messages: Vec<Message>,
+    /// Unix millis of the last save; used for session-recency sorting.
+    #[serde(default)]
+    pub last_activity: i64,
 }
 
 impl ConversationState {
@@ -27,8 +30,20 @@ impl ConversationState {
         Self {
             session_id: session_id.into(),
             messages: Vec::new(),
+            last_activity: 0,
         }
     }
+}
+
+/// A browsable, one-line description of a saved session.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub message_count: usize,
+    /// The last user message text, truncated for a one-line preview.
+    pub last_user: String,
+    /// Unix seconds of the file's last write (recency for resumes).
+    pub modified: i64,
 }
 
 /// Loads/saves `ConversationState` as `<sessions_dir>/<id>.json`.
@@ -56,27 +71,84 @@ impl SessionStore {
 
     pub fn save(&self, state: &ConversationState) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        let text = serde_json::to_string_pretty(state)
+        let mut state = state.clone();
+        state.last_activity = unix_millis();
+        let text = serde_json::to_string_pretty(&state)
             .map_err(|e| AgentError::Session(e.to_string()))?;
         std::fs::write(self.path(&state.session_id), text)?;
         Ok(())
     }
 
+    /// `(id, unix-seconds-of-last-write)` for every saved session, most
+    /// recent first. Cheap: only stat + read the id, not the full state.
     pub fn list_session_ids(&self) -> Result<Vec<String>> {
+        Ok(self.summaries()?.into_iter().map(|s| s.id).collect())
+    }
+
+    /// One-line summary of every saved session, most recently used first.
+    pub fn summaries(&self) -> Result<Vec<SessionSummary>> {
         if !self.dir.exists() {
             return Ok(Vec::new());
         }
-        let mut ids = Vec::new();
+        let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
-            if let Some(stem) = entry.path().file_stem() {
-                if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
-                    ids.push(stem.to_string_lossy().into_owned());
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).map(str::to_string);
+            let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if ext.as_deref() != Some("json") {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut message_count = 0;
+            let mut last_user = String::new();
+            let mut activity = modified;
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                if let Ok(state) = serde_json::from_str::<ConversationState>(&text) {
+                    message_count = state.messages.len();
+                    if state.last_activity > 0 {
+                        activity = state.last_activity;
+                    }
+                    last_user = state
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == Role::User)
+                        .map(|m| m.content.clone())
+                        .unwrap_or_default();
                 }
             }
+            let mut last_user: Vec<char> = last_user.chars().take(90).collect();
+            if last_user.len() == 90 {
+                last_user.extend("…".chars());
+            }
+            let last_user: String = last_user.into_iter().collect();
+            out.push(SessionSummary {
+                id: stem,
+                message_count,
+                last_user,
+                modified: activity,
+            });
         }
-        ids.sort();
-        Ok(ids)
+        out.sort_by(|a, b| {
+            b.modified
+                .cmp(&a.modified)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    /// The most recently used saved session, if any.
+    pub fn most_recent(&self) -> Result<Option<String>> {
+        Ok(self.summaries()?.into_iter().next().map(|s| s.id))
     }
 }
 
@@ -85,6 +157,14 @@ impl SessionStore {
 /// script.
 pub fn new_session_id() -> String {
     format!("session-{}", chrono::Utc::now().format("%Y%m%d%H%M%S%3f"))
+}
+
+/// Unix milliseconds, for session-recency stamps.
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -115,8 +195,8 @@ mod tests {
         assert_eq!(loaded.messages[0].content, "hello");
     }
 
-    #[test]
-    fn list_session_ids_finds_saved_sessions() {
+#[test]
+fn list_session_ids_finds_saved_sessions() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path().to_path_buf());
         store.save(&ConversationState::new("a")).unwrap();
@@ -124,5 +204,39 @@ mod tests {
         let mut ids = store.list_session_ids().unwrap();
         ids.sort();
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn summaries_report_last_user_message_and_recency() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf());
+        let mut state = ConversationState::new("first");
+        state.messages.push(Message::system("sys"));
+        state.messages.push(Message::user("hello world"));
+        state.messages.push(Message::assistant("hi"));
+        store.save(&state).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut recent = ConversationState::new("second");
+        recent.messages.push(Message::user("another session"));
+        store.save(&recent).unwrap();
+
+        let summaries = store.summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].id, "second", "most recent first");
+        assert!(summaries[0].last_user.contains("another"));
+        assert_eq!(summaries[1].id, "first");
+        assert_eq!(summaries[1].message_count, 3);
+        assert!(summaries[1].last_user.contains("hello world"));
+
+        assert_eq!(store.most_recent().unwrap().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn summaries_empty_dir() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf());
+        assert!(store.summaries().unwrap().is_empty());
+        assert_eq!(store.most_recent().unwrap(), None);
     }
 }

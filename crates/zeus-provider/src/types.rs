@@ -24,6 +24,10 @@ pub struct Message {
     /// Assistant-requested tool calls (if any).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// Multimodal image attachments (base64). Supported on User (and Tool for
+    /// Anthropic) messages; providers that understand images render them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImagePart>,
 }
 
 impl Message {
@@ -33,6 +37,7 @@ impl Message {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -42,6 +47,18 @@ impl Message {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    /// User message carrying one or more base64 image attachments.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImagePart>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            images,
         }
     }
 
@@ -51,6 +68,7 @@ impl Message {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -60,8 +78,19 @@ impl Message {
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
+            images: Vec::new(),
         }
     }
+}
+
+/// A base64-encoded image attached to a chat message, e.g. produced by the
+/// `read_image` tool so a vision-capable model can see a local image file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImagePart {
+    /// MIME type, e.g. "image/png" or "image/jpeg".
+    pub mime_type: String,
+    /// Base64-encoded image bytes (no data: URI prefix).
+    pub data_base64: String,
 }
 
 /// Tool definition exposed to the model.

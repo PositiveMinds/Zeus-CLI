@@ -9,8 +9,25 @@ members = [
     "crates/zeus-lang",
     "crates/zeus-logging",
     "crates/zeus-provider",
+    "crates/zeus-rag",
 ]
 default-members = ["crates/zeus-cli"]
+
+# Zeus ships as a downloaded binary (see install.ps1/install.bat), so release
+# build size and steady-state speed matter more than release build time.
+# `thin` LTO gets most of full LTO's cross-crate inlining/dead-code-elimination
+# benefit for meaningfully less compile time than `fat`; `codegen-units = 1`
+# lets the optimizer see the whole crate at once instead of parallel chunks
+# (slower build, better codegen); `strip` drops debug symbols the shipped
+# binary has no use for. `panic` is left at the default `unwind` — the TUI's
+# terminal-restore cleanup in `tui::run` isn't panic-safe either way (it's
+# plain sequential code after the `await`, not a Drop guard), so `abort`
+# wouldn't clearly help and would change unwind-dependent cleanup elsewhere
+# in the workspace (temp files, mutex guards) with no time to audit it here.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [workspace.package]
 version = "0.1.0"

@@ -82,19 +82,29 @@ fn to_anthropic_messages(messages: &[Message]) -> Vec<Value> {
         match m.role {
             Role::System => continue, // handled via top-level `system`
             Role::User | Role::Tool => {
-                let block = if m.role == Role::Tool {
-                    json!({
+                let mut blocks: Vec<Value> = if m.role == Role::Tool {
+                    vec![json!({
                         "type": "tool_result",
                         "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
                         "content": m.content
-                    })
+                    })]
                 } else {
-                    json!({ "type": "text", "text": m.content })
+                    vec![json!({ "type": "text", "text": m.content })]
                 };
+                for img in &m.images {
+                    blocks.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": img.mime_type,
+                            "data": img.data_base64,
+                        }
+                    }));
+                }
                 if matches!(out.last(), Some((role, _)) if role == "user") {
-                    out.last_mut().unwrap().1.push(block);
+                    out.last_mut().unwrap().1.extend(blocks);
                 } else {
-                    out.push(("user".to_string(), vec![block]));
+                    out.push(("user".to_string(), blocks));
                 }
             }
             Role::Assistant => {

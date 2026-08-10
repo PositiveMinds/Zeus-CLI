@@ -1,20 +1,10 @@
-//! Decorative animation: a rainbow/pulse-swept splash logo. Pure-ratatui, no
+//! Decorative animation: a rainbow/pulse-swept wordmark. Pure-ratatui, no
 //! extra deps — hue steps are computed from HSV→RGB per character, and the
 //! overall brightness pulses on a slow sine so the wordmark looks alive
-//! without flashing. Drives the empty-splash banner and the topbar wordmark.
+//! without flashing. Drives the topbar's "ZEUS" wordmark.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-
-/// Figlet-style "ZEUS" block wordmark (6 rows tall, 4 wide).
-const BANNER: [&str; 6] = [
-    "███████  ███████  ████████  ███████ ",
-    "██       ██   ██     ██     ██      ",
-    "██       ██   ██     ██     ███████ ",
-    "██       ██   ██     ██          ██ ",
-    "██       ██   ██     ██          ██ ",
-    "███████  ███████     ██     ███████ ",
-];
 
 /// Convert an HSV triple (hue 0-360, s/v 0-1) to an RGB `Color`.
 fn hsv(h: f32, s: f32, v: f32) -> Color {
@@ -58,20 +48,6 @@ fn rainbow_char(ch: char, t_ms: u128, col: usize) -> Span<'static> {
     Span::styled(ch.to_string(), style)
 }
 
-/// Rainbow+pulse animated rows for the "ZEUS" splash banner.
-pub fn animated_banner(t_ms: u128) -> Vec<Vec<Span<'static>>> {
-    BANNER
-        .iter()
-        .map(|row| {
-            row.chars()
-                .enumerate()
-                .filter(|(_, c)| *c != ' ')
-                .map(|(col, c)| rainbow_char(c, t_ms, col))
-                .collect()
-        })
-        .collect()
-}
-
 /// Rainbow+pulse styled wordmark for the topbar ("ZEUS" after the ⚡).
 pub fn animated_wordmark(text: &str, t_ms: u128) -> Vec<Span<'static>> {
     let mut col = 0;
@@ -106,8 +82,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn banner_rows_match() {
-        assert_eq!(animated_banner(0).len(), 6);
-    }
 }

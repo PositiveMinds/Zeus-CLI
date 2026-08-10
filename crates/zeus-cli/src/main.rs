@@ -10,9 +10,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use zeus_agent::{
-    load_custom_personas, personas_by_department, Agent, AgentEvent, AgentOptions,
-    BackgroundTaskRegistry, ContextManager, ExpandResult, HookRunner, McpClient, SessionStore,
-    SlashCommands, TerminalRunner, ToolManager,
+    discover_workflows, load_custom_personas, personas_by_department, Agent, AgentEvent,
+    AgentOptions, BackgroundTaskRegistry, ContextManager, ExpandResult, HookRunner, McpClient,
+    SessionStore, SlashCommands, TerminalRunner, ToolManager, TurnResult,
 };
 use zeus_config::{Config, KeysFile};
 use zeus_fs::{
@@ -120,10 +120,35 @@ enum Commands {
         /// Resume an existing session id instead of starting a new one
         #[arg(long)]
         session: Option<String>,
+        /// Resume the most recently used saved session instead of starting a
+        /// new one (ignored if `--session` is also given).
+        #[arg(long)]
+        resume: bool,
         /// Plan mode: research the request read-only, persist a structured
         /// plan to .agent/tasks.json, and exit WITHOUT executing anything.
         #[arg(long)]
         plan: bool,
+        /// Auto mode: run the goal as a full orchestrated plan — split into
+        /// steps, execute each as its own tool-using turn, run a lead-reviewer
+        /// gate, and finish. Auto-approves every gate when combined with
+        /// `--yes`; the headless counterpart of `/plan` + Auto mode. Designed
+        /// to be spawned in the background (`zeus bg orchestrate`).
+        #[arg(long)]
+        auto: bool,
+        /// Run a named multi-specialist workflow (from .agent/workflows or
+        /// ~/.zeus/workflows) against the message as its goal.
+        #[arg(long, value_name = "NAME")]
+        workflow: Option<String>,
+    },
+
+    /// List saved sessions (id, message count, last user message)
+    Sessions,
+
+    /// Set or list provider API keys (~/.zeus/keys.toml) without opening a
+    /// session — the one-shot equivalent of the REPL's `/provider key`
+    Key {
+        #[command(subcommand)]
+        action: KeyCmd,
     },
 
     /// Count tokens for a message (context-budget helper)
@@ -345,6 +370,21 @@ enum CodeintCmd {
 }
 
 #[derive(Debug, Subcommand)]
+enum KeyCmd {
+    /// Set a provider's API key. Omit <NAME> to pick one from a numbered
+    /// list instead of typing it; omit <KEY> to be prompted with input
+    /// hidden (recommended interactively) rather than passing it inline.
+    Set {
+        /// Provider name — see `zeus key list` or providers.toml. Omit to
+        /// choose from a list instead.
+        name: Option<String>,
+        key: Option<String>,
+    },
+    /// Show which configured providers have a key set
+    List,
+}
+
+#[derive(Debug, Subcommand)]
 enum UserCommandCmd {
     /// List available commands (project shadows global of the same name)
     List,
@@ -381,6 +421,19 @@ enum PullCmd {
 enum BgCmd {
     /// Start a command detached; it keeps running after this process exits
     Run { command: String },
+    /// Run a goal as a full orchestrated plan in the background: the goal is
+    /// dispatched to a detached headless `zeus agent --auto` process (all
+    /// gates auto-approved), so you keep your prompt while the workforce
+    /// plans, executes, and lead-reviews. Track with `zeus bg list` /
+    /// `zeus bg output <id>` / `zeus bg stop <id>`.
+    Orchestrate {
+        /// The goal for the orchestrated run.
+        goal: String,
+        /// Run a named workflow (from .agent/workflows or ~/.zeus/workflows)
+        /// instead of the auto planner.
+        #[arg(long)]
+        workflow: Option<String>,
+    },
     /// List background tasks and their running/paused/exited status
     List,
     /// Print captured stdout/stderr for a background task
@@ -586,6 +639,7 @@ async fn run() -> Result<()> {
             level: cli.log_level.clone().unwrap_or_else(|| "info".into()),
             file: false,
             logs_dir: None,
+            console: true,
         });
         return cmd_init(&cli).await;
     }
@@ -595,10 +649,19 @@ async fn run() -> Result<()> {
         .log_level
         .clone()
         .unwrap_or_else(|| config.settings.logging.level.clone());
+    // No subcommand + a real terminal on both ends is exactly the condition
+    // `cmd_repl` uses to hand off to the raw-mode TUI (see `tui::run` below)
+    // — a stray log line written to stderr mid-session corrupts that
+    // screen, so the console layer must be off before the TUI ever starts.
+    // File logging (if configured) still captures everything either way.
+    let entering_tui = cli.command.is_none()
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal();
     let _ = init_logging(LoggingOptions {
         level,
         file: config.settings.logging.file,
         logs_dir: Some(config.global.logs.clone()),
+        console: !entering_tui,
     });
 
     match cli.command {
@@ -622,8 +685,25 @@ async fn run() -> Result<()> {
             provider,
             model,
             session,
+            resume,
             plan,
-        }) => cmd_agent(&config, message, provider, model, session, plan, cli.yes).await,
+            auto,
+            workflow,
+        }) => cmd_agent(
+            &config,
+            message,
+            provider,
+            model,
+            session,
+            resume,
+            plan,
+            auto,
+            workflow,
+            cli.yes,
+        )
+        .await,
+        Some(Commands::Sessions) => cmd_sessions(&config),
+        Some(Commands::Key { action }) => cmd_key(&config, action),
         Some(Commands::Tokens {
             message,
             provider,
@@ -1035,25 +1115,27 @@ pub(crate) fn persist_default_provider(config: &Config, provider: &str, model: O
 /// provider that's unreachable, misconfigured, or slow to respond (bounded
 /// by a short timeout) is silently skipped rather than blocking the whole
 /// picker on one bad entry, same "best effort" spirit as MCP server connect.
+///
+/// All providers are probed concurrently (not one after another) — with a
+/// handful of configured providers and a 3s-per-provider timeout, a
+/// sequential scan could take 10+ seconds if several are unreachable, which
+/// reads as a frozen picker. Run together, the whole scan takes as long as
+/// the single slowest provider (worst case ~3s) instead of their sum.
 pub(crate) async fn list_models_by_provider(
     config: &Config,
 ) -> Vec<(String, Vec<zeus_provider::ModelInfo>)> {
     let mut names: Vec<&String> = config.providers.providers.keys().collect();
     names.sort();
 
-    let mut groups = Vec::new();
-    for name in names {
-        let Ok(provider) = zeus_provider::create_provider(name, &config.providers) else {
-            continue;
-        };
+    let fetches = names.into_iter().map(|name| async move {
+        let provider = zeus_provider::create_provider(name, &config.providers).ok()?;
         let fetch = tokio::time::timeout(std::time::Duration::from_secs(3), provider.list_models());
-        if let Ok(Ok(models)) = fetch.await {
-            if !models.is_empty() {
-                groups.push((name.clone(), models));
-            }
+        match fetch.await {
+            Ok(Ok(models)) if !models.is_empty() => Some((name.clone(), models)),
+            _ => None,
         }
-    }
-    groups
+    });
+    futures::future::join_all(fetches).await.into_iter().flatten().collect()
 }
 
 async fn cmd_chat(
@@ -1352,6 +1434,126 @@ fn connect_configured_mcp_servers(config: &Config, project_root: &std::path::Pat
         .collect()
 }
 
+/// Render the saved-session listing (shared by `zeus sessions` and the
+/// REPL `/sessions` command).
+fn render_sessions(config: &Config) -> Result<String> {
+    let store = SessionStore::new(config.global.sessions.clone());
+    let summaries = store.summaries().context("list sessions")?;
+    if summaries.is_empty() {
+        return Ok("no saved sessions yet — run a turn (zeus agent \"...\") to create one.".to_string());
+    }
+    let mut lines = Vec::new();
+    for s in &summaries {
+        lines.push(format!(
+            "{:<38} {} messages  {}",
+            s.id,
+            s.message_count,
+            if s.last_user.is_empty() {
+                "(no user message yet)".to_string()
+            } else {
+                format!("— {}\"", s.last_user)
+            }
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Resolve which session to continue: explicit `--session`, else the most
+/// recently used one when `--resume`, else a brand-new session.
+fn resolve_session(config: &Config, explicit: Option<String>, resume: bool) -> Option<String> {
+    if let Some(id) = explicit {
+        return Some(id);
+    }
+    if resume {
+        let store = SessionStore::new(config.global.sessions.clone());
+        if let Ok(Some(id)) = store.most_recent() {
+            eprintln!("resuming most recent session: {id}");
+            return Some(id);
+        }
+        eprintln!("no saved session found — starting a new one");
+    }
+    None
+}
+
+/// List saved sessions (id, message count, last user message).
+fn cmd_sessions(config: &Config) -> Result<()> {
+    let text = render_sessions(config)?;
+    print!("{}", text);
+    println!();
+    Ok(())
+}
+
+/// `zeus key set/list` — the one-shot equivalent of the REPL's `/provider
+/// key`, for setting a key without opening a full interactive session
+/// first (the terminal-native version of "a popup that asks for a key":
+/// one focused prompt, takes the key, exits — Zeus has no GUI layer to put
+/// an actual dialog in).
+fn cmd_key(config: &Config, action: KeyCmd) -> Result<()> {
+    match action {
+        KeyCmd::Set { name, key } => {
+            let name = match name {
+                Some(n) => n,
+                None => prompt_choose_provider(config)?,
+            };
+            let key = match key {
+                Some(k) => k,
+                None => match read_hidden_line(&format!("Paste {name} API key (input hidden): "))? {
+                    Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+                    _ => bail!("cancelled — no key set"),
+                },
+            };
+            save_provider_key(config, &name, &key)?;
+            println!(
+                "key saved for '{name}' in {} — persistent across restarts.",
+                config.global.keys_toml.display()
+            );
+            Ok(())
+        }
+        KeyCmd::List => {
+            for line in describe_providers(config) {
+                println!("{line}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Lists configured providers with a ready/needs-key marker and prompts for
+/// a number — the "which provider" step before `zeus key set` asks for its
+/// key, for when you'd rather pick from a list than type the exact name.
+fn prompt_choose_provider(config: &Config) -> Result<String> {
+    let mut names: Vec<&String> = config.providers.providers.keys().collect();
+    names.sort();
+    if names.is_empty() {
+        bail!("no providers configured — see providers.toml");
+    }
+    let stored = KeysFile::load(&config.global.keys_toml).unwrap_or_default();
+    println!("Select a provider:");
+    for (i, name) in names.iter().enumerate() {
+        let cfg = config.providers.get(name);
+        let local = cfg
+            .map(|c| matches!(c.kind.as_str(), "ollama" | "lmstudio" | "llamacpp"))
+            .unwrap_or(false);
+        let ready = local
+            || stored.get(*name).is_some()
+            || cfg
+                .and_then(|c| c.api_key_env.as_ref())
+                .map(|var| std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false))
+                .unwrap_or(false);
+        let marker = if ready { "●" } else { "◌" };
+        println!("  {:>2}) {marker} {name}", i + 1);
+    }
+    print!("Enter a number: ");
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).context("read selection")?;
+    let choice: usize = line.trim().parse().context("not a number")?;
+    names
+        .get(choice.wrapping_sub(1))
+        .map(|n| n.to_string())
+        .ok_or_else(|| anyhow::anyhow!("no provider numbered {choice}"))
+}
+
 /// Build a fully-wired `Agent` (provider, tools, context, session) — shared
 /// by the one-shot `agent` subcommand and the interactive REPL so both go
 /// through identical setup.
@@ -1405,7 +1607,7 @@ async fn build_agent_with_provider(
     let hooks = HookRunner::new(project_root.join(".agent/hooks"), project_root.clone());
     let mcp_clients = connect_configured_mcp_servers(config, &project_root);
     let plugins = zeus_agent::load_all_plugins(&config.global.plugins);
-    let tools = ToolManager::new(
+    let mut tools = ToolManager::new(
         ws,
         terminal,
         background,
@@ -1414,6 +1616,7 @@ async fn build_agent_with_provider(
         plugins,
         Arc::new(AtomicBool::new(false)),
     );
+    tools.set_global_skills_dir(Some(config.global.skills.clone()));
     let context = ContextManager::new(
         window,
         config.settings.context.compact_threshold,
@@ -1620,19 +1823,19 @@ fn print_agent_event(ev: AgentEvent) {
         }
         AgentEvent::Done => {}
         AgentEvent::PlanGenerated { steps } => {
+            let roster = steps
+                .iter()
+                .map(|s| match s.persona.as_deref() {
+                    Some(p) => format!("{} [{}]", s.description, p),
+                    None => s.description.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(" → ");
             eprintln!(
                 "{}",
                 ui::styled(
                     ui::dim_style(),
-                    &format!(
-                        "plan · {} step(s): {}",
-                        steps.len(),
-                        steps
-                            .iter()
-                            .map(|s| s.description.clone())
-                            .collect::<Vec<_>>()
-                            .join(" → ")
-                    )
+                    &format!("plan · {} step(s): {roster}", steps.len())
                 )
             );
         }
@@ -1676,6 +1879,104 @@ fn print_agent_event(ev: AgentEvent) {
             let _ = writeln!(out, "\n{}", ui::styled(ui::assistant_marker_style(), "● plan complete"));
             let _ = writeln!(out, "{summary}");
         }
+        AgentEvent::OrchestrationRevision { report } => {
+            let _ = writeln!(out, "\n{}", ui::styled(ui::warn_style(), "⊘ lead reviewer did NOT accept"));
+            let _ = writeln!(out, "{report}");
+        }
+        AgentEvent::WorkflowStarted { id, description, phases } => {
+            let roster = phases
+                .iter()
+                .map(|p| format!("{} [{}]", p.prompt, p.persona))
+                .collect::<Vec<_>>()
+                .join(" → ");
+            let _ = writeln!(
+                out,
+                "{}",
+                ui::styled(
+                    ui::assistant_marker_style(),
+                    &format!("● workflow '{id}' — {description}\n   {roster}")
+                )
+            );
+        }
+        AgentEvent::WorkflowPhaseStarted { name, persona } => {
+            let _ = writeln!(
+                out,
+                "{}",
+                ui::styled(ui::warn_style(), &format!("▶ {}", name))
+            );
+            eprintln!("{}", ui::styled(ui::dim_style(), &format!("   as {persona}")));
+        }
+        AgentEvent::WorkflowPhaseDone { name, persona, summary } => {
+            let _ = writeln!(
+                out,
+                "{}",
+                ui::styled(
+                    ui::tool_style(),
+                    &format!("✓ phase · {name} [{persona}]: {}", summary.chars().take(300).collect::<String>())
+                )
+            );
+        }
+        AgentEvent::WorkflowDone { summary } => {
+            let _ = writeln!(out, "\n{}", ui::styled(ui::assistant_marker_style(), "● workflow complete"));
+            let _ = writeln!(out, "{summary}");
+        }
+        AgentEvent::RepoAnalyzed { stack, relevance } => {
+            eprintln!("{}", ui::styled(ui::dim_style(), "Analyzing repository..."));
+            for line in stack.lines() {
+                eprintln!("{}", ui::styled(ui::assistant_marker_style(), line));
+            }
+            if !relevance.is_empty() {
+                let _ = writeln!(out, "{}", ui::styled(ui::tool_style(), &relevance));
+            }
+        }
+        AgentEvent::RepoRelevanceUpdated { relevance } => {
+            let _ = writeln!(out, "{}", ui::styled(ui::tool_style(), &relevance));
+        }
+        AgentEvent::OrientationSaved { docs } => {
+            let mut written = Vec::new();
+            if docs.architecture {
+                written.push(".agent/architecture.md");
+            }
+            if docs.conventions {
+                written.push(".agent/conventions.md");
+            }
+            if written.is_empty() {
+                eprintln!(
+                    "{}",
+                    ui::styled(
+                        ui::warn_style(),
+                        "orientation docs could not be extracted (model didn't emit markers)"
+                    )
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    ui::styled(ui::assistant_marker_style(), &format!(
+                        "wrote {}",
+                        written.join(", ")
+                    ))
+                );
+            }
+        }
+        AgentEvent::ReviewUncommitted { persona, report } => {
+            let _ = writeln!(
+                out,
+                "{}",
+                ui::styled(ui::assistant_marker_style(), &format!(
+                    "review ({persona}) complete"
+                ))
+            );
+            let _ = writeln!(out, "{report}");
+        }
+        AgentEvent::FeaturesSuggested { report } => {
+            let _ = writeln!(
+                out,
+                "{}",
+                ui::styled(ui::assistant_marker_style(), "suggestions")
+            );
+            let _ = writeln!(out, "{report}");
+        }
     }
 }
 
@@ -1702,14 +2003,46 @@ async fn cmd_agent(
     provider_name: Option<String>,
     model: Option<String>,
     session: Option<String>,
+    resume: bool,
     plan: bool,
+    auto: bool,
+    workflow: Option<String>,
     yes: bool,
 ) -> Result<()> {
     let message = expand_slash_command(config, message);
+    let session = resolve_session(config, session, resume);
     let mut agent = build_agent(config, provider_name, model, session).await?;
 
     print_turn_header();
-    let result = if plan {
+    let is_workflow = workflow.is_some();
+    let result = if let Some(name) = workflow {
+        // `--workflow <name>`: run a named multi-specialist pipeline.
+        let workflows = discover_workflows(config.project_root.as_deref(), &config.global.root);
+        let wf = workflows
+            .iter()
+            .find(|w| w.id == name)
+            .with_context(|| format!("no workflow named '{name}' (run zeus /workflows to list)"))?;
+        agent
+            .run_workflow(&message, wf, print_agent_event, approver(yes))
+            .await
+            .map(|summary| TurnResult {
+                final_text: summary,
+                tool_calls: 0,
+                cancelled: false,
+                usage: Default::default(),
+            })
+    } else if auto {
+        // `--auto`: full orchestrated run — plan, execute, lead-reviewer gate.
+        agent
+            .orchestrate(&message, print_agent_event, approver(yes))
+            .await
+            .map(|summary| TurnResult {
+                final_text: summary,
+                tool_calls: 0,
+                cancelled: false,
+                usage: Default::default(),
+            })
+    } else if plan {
         // `--plan`: research read-only, persist .agent/tasks.json, don't
         // execute. Plan mode is forced on so no tool call can mutate.
         agent.set_plan_mode(true);
@@ -1727,6 +2060,9 @@ async fn cmd_agent(
         eprintln!(
             "— plan only: nothing was executed. Switch to auto mode and approve to run the plan."
         );
+    }
+    if auto || is_workflow {
+        eprintln!("— orchestrated run finished.");
     }
     eprintln!(
         "— session={} tool_calls={} cancelled={}",
@@ -1748,11 +2084,22 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("compact", "force context compaction now, even under the auto threshold"),
     ("autocompact", "toggle auto-compaction: /autocompact on|off"),
     ("context", "show token usage against the model's context window"),
+    ("diff", "show uncommitted changes: /diff or /diff staged"),
+    ("undo", "revert file changes made this session (confirm with /undo confirm)"),
+    ("settings", "view/change display settings: reduced_motion, notify, accent <#hex>|reset"),
     ("model", "switch model (opens a picker), or /model <name> directly"),
-    ("provider", "list providers, switch (<name>), or persist a key: /provider key <name> <KEY>"),
+    ("provider", "list providers, switch (<name>), or set a key: /provider key <name> (prompts, hidden)"),
     ("mode", "set agent mode: /mode build|plan|auto (Tab also cycles)"),
     ("plan", "plan-only turn: research a goal read-only, persist the plan, don't execute"),
+    ("understand", "read-only repository scan: what already exists for a topic (/understand auth)"),
+    ("orient", "write .agent/architecture.md + .agent/conventions.md (read-only scan)"),
+    ("review", "read-only review of uncommitted changes (copy passes, verdict at the end)"),
+    ("suggest", "read-only next-feature recommendations grounded in what already exists"),
+    ("workflow", "run a named multi-specialist pipeline: /workflow <name> <goal>"),
+    ("workflows", "list available workflows from .agent/workflows and ~/.zeus/workflows"),
+    ("bg", "run the workforce in the background (/bg <goal>); manage with `zeus bg ...`"),
     ("session", "show the current session id"),
+    ("sessions", "list saved sessions (opens a resume picker in the TUI)"),
     ("agents", "list the specialist-agents roster grouped by department (/agents count)"),
     ("copy", "copy the last assistant reply to the system clipboard"),
 ];
@@ -1774,10 +2121,112 @@ fn print_repl_help() {
     println!("{}", print_repl_help_lines());
 }
 
+/// Persists `key` for `name` to `~/.zeus/keys.toml` (owner-only permissions,
+/// see `KeysFile::save`) and applies it to the running process's env
+/// immediately. Shared by both the inline (`/provider key <name> <KEY>`,
+/// convenient for scripting but echoes the key to the terminal) and
+/// hidden-prompt (`/provider key <name>`, masked input) forms.
+fn save_provider_key(config: &Config, name: &str, key: &str) -> Result<()> {
+    let cfg = config
+        .providers
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider '{name}' — see `zeus key list` or /provider for the list"))?;
+    let mut keys = KeysFile::load(&config.global.keys_toml).context("read key store")?;
+    keys.keys.insert(name.to_string(), key.to_string());
+    keys.save(&config.global.keys_toml).context("save key store")?;
+    if let Some(var) = &cfg.api_key_env {
+        std::env::set_var(var, key);
+    }
+    Ok(())
+}
+
+/// Reads a line with terminal echo suppressed, printing `•` per keystroke
+/// instead of the character typed — the plain-REPL equivalent of the TUI's
+/// masked key-entry modal (`tui::mask_secret`). Returns `None` if the user
+/// cancels with Esc or Ctrl-C rather than pressing Enter.
+fn read_hidden_line(prompt: &str) -> io::Result<Option<String>> {
+    use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    print!("{prompt}");
+    io::stdout().flush()?;
+    enable_raw_mode()?;
+    let mut buf = String::new();
+    let outcome = loop {
+        match read()? {
+            Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                KeyCode::Enter => break Some(buf),
+                KeyCode::Esc => break None,
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                KeyCode::Backspace => {
+                    if buf.pop().is_some() {
+                        print!("\u{8} \u{8}");
+                        io::stdout().flush()?;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    buf.push(c);
+                    print!("•");
+                    io::stdout().flush()?;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    };
+    disable_raw_mode()?;
+    println!();
+    Ok(outcome)
+}
+
+/// The `/settings` slash command (plain REPL): view or change persisted
+/// display settings (`~/.zeus/settings.toml`, Global layer) without
+/// hand-editing the file. The plain REPL doesn't use the wordmark/bell
+/// these gate, so a change here just needs saving — the TUI's own
+/// `"settings"` match arm additionally applies it live via `theme::`.
+fn handle_settings_slash(arg: &str, config: &Config) {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    let path = &config.global.settings_toml;
+    match parts.as_slice() {
+        [] => {
+            println!("reduced_motion:       {}", config.settings.reduced_motion);
+            println!("notify_on_completion: {}", config.settings.notify_on_completion);
+            println!(
+                "accent_color:         {}",
+                config.settings.accent_color.as_deref().unwrap_or("(default violet)")
+            );
+            println!("Use /settings reduced_motion on|off, /settings notify on|off, /settings accent <#hex>|reset.");
+        }
+        ["reduced_motion", v @ ("on" | "off")] => {
+            let on = *v == "on";
+            match zeus_config::set_reduced_motion(path, on) {
+                Ok(()) => println!("reduced_motion: {on} (takes effect next launch)"),
+                Err(e) => eprintln!("couldn't save setting: {e}"),
+            }
+        }
+        ["notify", v @ ("on" | "off")] => {
+            let on = *v == "on";
+            match zeus_config::set_notify_on_completion(path, on) {
+                Ok(()) => println!("notify_on_completion: {on} (takes effect next launch)"),
+                Err(e) => eprintln!("couldn't save setting: {e}"),
+            }
+        }
+        ["accent", "reset"] => match zeus_config::set_accent_color(path, None) {
+            Ok(()) => println!("accent_color reset to default (takes effect next launch)"),
+            Err(e) => eprintln!("couldn't save setting: {e}"),
+        },
+        ["accent", hex] => match zeus_config::set_accent_color(path, Some((*hex).to_string())) {
+            Ok(()) => println!("accent_color: {hex} (takes effect next launch)"),
+            Err(e) => eprintln!("couldn't save setting: {e}"),
+        },
+        _ => eprintln!("usage: /settings [reduced_motion on|off] [notify on|off] [accent <#hex>|reset]"),
+    }
+}
+
 /// The `/provider` slash command (plain REPL): list all configured providers,
-/// switch the active one (persisting the choice), or set a cloud API key for
-/// this session. Mirrors Claude Code's `/login`-style flow — the key is kept
-/// in-process (an env var) and never written to disk.
+/// switch the active one (persisting the choice), or set a cloud API key —
+/// either inline (scriptable, echoes to the terminal) or via a hidden-input
+/// prompt when no key is given on the line.
 async fn handle_provider_slash(arg: &str, config: &Config, agent: &mut Agent) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     match parts.as_slice() {
@@ -1791,38 +2240,31 @@ async fn handle_provider_slash(arg: &str, config: &Config, agent: &mut Agent) {
             println!("Use /provider <name> to switch, /provider key <name> <KEY> to set a key.");
         }
         // `/provider key <name> <KEY>` — persist the key to ~/.zeus/keys.toml
-        // and apply it to the in-memory provider config right away.
-        ["key", name, key] => {
-            let cfg = match config.providers.get(name) {
-                Some(c) => c,
-                None => {
-                    eprintln!("unknown provider '{name}' — see /provider for the list");
-                    return;
-                }
-            };
-            let mut keys = match KeysFile::load(&config.global.keys_toml) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("couldn't read key store: {e:#}");
-                    return;
-                }
-            };
-            keys.keys.insert(name.to_string(), key.to_string());
-            if let Err(e) = keys.save(&config.global.keys_toml) {
-                eprintln!("couldn't save key store: {e:#}");
-                return;
-            }
-            // Apply immediately to the running session.
-            if let Some(var) = &cfg.api_key_env {
-                std::env::set_var(var, *key);
-            }
-            println!(
+        // and apply it to the in-memory provider config right away. Kept for
+        // scripting; it echoes the key to the terminal, so `/provider key
+        // <name>` (below) is the better default for interactive use.
+        ["key", name, key] => match save_provider_key(config, name, key) {
+            Ok(()) => println!(
                 "key saved for '{name}' in {} — persistent across restarts.",
                 config.global.keys_toml.display()
-            );
-        }
+            ),
+            Err(e) => eprintln!("{e:#}"),
+        },
+        // `/provider key <name>` — no key on the line, so prompt for one
+        // with echo suppressed instead of requiring it in cleartext.
+        ["key", name] => match read_hidden_line(&format!("Paste {name} API key (input hidden): ")) {
+            Ok(Some(key)) if !key.trim().is_empty() => match save_provider_key(config, name, key.trim()) {
+                Ok(()) => println!(
+                    "key saved for '{name}' in {} — persistent across restarts.",
+                    config.global.keys_toml.display()
+                ),
+                Err(e) => eprintln!("{e:#}"),
+            },
+            Ok(_) => eprintln!("cancelled — no key set"),
+            Err(e) => eprintln!("couldn't read key: {e}"),
+        },
         // `/provider key` with no args — usage hint, not a provider switch.
-        ["key"] => eprintln!("usage: /provider key <name> <KEY>"),
+        ["key"] => eprintln!("usage: /provider key <name> (prompts, hidden) or /provider key <name> <KEY>"),
         // `/provider <name>` — switch the active provider + persist default.
         [name] => {
             match create_provider(name, &config.providers) {
@@ -1879,10 +2321,51 @@ fn known_slash_commands(config: &Config) -> Vec<(String, String)> {
 /// variant when no provider is ready — used by interactive sessions so they
 /// can always launch/clear without a configured key.
 pub(crate) async fn build_agent_repl(config: &Config) -> Result<Agent> {
-    match build_agent(config, None, None, None).await {
+    build_agent_repl_with(config, None, None).await
+}
+
+/// Same as `build_agent_repl`, but for `/new` and `/clear` — those rebuild
+/// the agent from the *already-running* session, not a fresh process, so
+/// they must target whatever provider/model that session is actually using
+/// rather than `config.settings.model.*`. Persisting a provider switch
+/// (`persist_default_provider`) only writes to disk; it doesn't mutate the
+/// in-memory `Config` this process loaded at startup (which is passed
+/// around as `&Config`, not `&mut Config`, everywhere). Without this,
+/// setting up a provider mid-session and then running `/new` would rebuild
+/// against the stale startup default — which is likely still key-less —
+/// and silently drop back to the unconfigured placeholder even though the
+/// provider you just configured is sitting right there in `AppState`.
+pub(crate) async fn build_agent_repl_with(
+    config: &Config,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Result<Agent> {
+    match build_agent(config, provider, model, None).await {
         Ok(a) => Ok(a),
         Err(err) => {
-            warn!(error = %err, "no provider ready at startup; launching interactive session in setup mode");
+            warn!(error = %err, "no provider ready; launching interactive session in setup mode");
+            build_agent_unconfigured(config).await
+        }
+    }
+}
+
+/// Same as `build_agent_repl_with`, but loads an existing session's
+/// conversation history (`ConversationState`) instead of starting fresh —
+/// backs the TUI's `/sessions` picker. Note: this restores the *context*
+/// the model continues from, not a replay of old messages into the visible
+/// transcript — the same behavior `zeus agent --session <id> --resume`
+/// already has at the plain-REPL/one-shot level, just reachable from a
+/// picker instead of needing the id typed out.
+pub(crate) async fn build_agent_repl_with_session(
+    config: &Config,
+    provider: Option<String>,
+    model: Option<String>,
+    session_id: String,
+) -> Result<Agent> {
+    match build_agent(config, provider, model, Some(session_id)).await {
+        Ok(a) => Ok(a),
+        Err(err) => {
+            warn!(error = %err, "no provider ready; launching interactive session in setup mode");
             build_agent_unconfigured(config).await
         }
     }
@@ -1946,11 +2429,13 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
             match cmd {
                 "help" => print_repl_help(),
                 "clear" => {
-                    agent = build_agent_repl(config).await?;
+                    let (provider, model) = (agent.provider_id().to_string(), agent.model().to_string());
+                    agent = build_agent_repl_with(config, Some(provider), Some(model)).await?;
                     println!("cleared — new session={}", agent.session_id());
                 }
                 "new" => {
-                    agent = build_agent_repl(config).await?;
+                    let (provider, model) = (agent.provider_id().to_string(), agent.model().to_string());
+                    agent = build_agent_repl_with(config, Some(provider), Some(model)).await?;
                     println!("new session started — session={}", agent.session_id());
                 }
                 "compact" => match agent.compact_now().await {
@@ -1985,6 +2470,33 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     }
                     Err(e) => eprintln!("context lookup failed: {e:#}"),
                 },
+                "diff" => {
+                    let git = git_engine_for_agent(config, &agent);
+                    let staged = arg.eq_ignore_ascii_case("staged");
+                    match git.diff(staged, &[]) {
+                        Ok(out) if out.stdout.trim().is_empty() => println!("(no changes)"),
+                        Ok(out) => print!("{}", highlight::ansi_diff(&out.stdout)),
+                        Err(e) => eprintln!("diff failed: {e}"),
+                    }
+                }
+                "undo" => {
+                    let ws = agent.workspace();
+                    let turn_id = ws.files.turn_id.clone();
+                    let snaps = ws.files.checkpoints.load_snapshots(&turn_id).unwrap_or_default();
+                    if snaps.is_empty() {
+                        println!("(nothing to undo this session)");
+                    } else if arg.eq_ignore_ascii_case("confirm") {
+                        match ws.files.checkpoints.restore(&turn_id, &ws.project_root) {
+                            Ok(n) => println!("reverted {n} file change(s) made this session"),
+                            Err(e) => eprintln!("undo failed: {e}"),
+                        }
+                    } else {
+                        println!(
+                            "this will revert {} file change(s) made since this session started — run `/undo confirm` to proceed",
+                            snaps.len()
+                        );
+                    }
+                }
                 "copy" => {
                     if last_reply.is_empty() {
                         eprintln!("nothing to copy yet — send a message first");
@@ -2007,7 +2519,12 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     }
                 }
                 "provider" => handle_provider_slash(arg, config, &mut agent).await,
+                "settings" => handle_settings_slash(arg, config),
                 "session" => println!("session={}", agent.session_id()),
+                "sessions" => match render_sessions(config) {
+                    Ok(text) => println!("{text}"),
+                    Err(e) => eprintln!("couldn't list sessions: {e:#}"),
+                },
                 "agents" => {
                     if arg.eq_ignore_ascii_case("count") {
                         let pools = personas_by_department();
@@ -2065,6 +2582,162 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                             Err(e) => eprintln!(
                                 "\n{}",
                                 ui::styled(ui::error_style(), &format!("plan failed: {e:#}"))
+                            ),
+                        }
+                    }
+                }
+                "understand" => {
+                    if arg.is_empty() {
+                        eprintln!("usage: /understand <topic> — e.g. /understand authentication");
+                    } else {
+                        print_turn_header();
+                        if let Err(e) =
+                            agent.understand_topic(arg, print_agent_event, approver(yes)).await
+                        {
+                            eprintln!(
+                                "\n{}",
+                                ui::styled(
+                                    ui::error_style(),
+                                    &format!("understand failed: {e:#}")
+                                )
+                            );
+                        }
+                    }
+                }
+                "orient" => {
+                    print_turn_header();
+                    if let Err(e) = agent.orient_turn(print_agent_event, approver(yes)).await {
+                        eprintln!(
+                            "\n{}",
+                            ui::styled(
+                                ui::error_style(),
+                                &format!("orient failed: {e:#}")
+                            )
+                        );
+                    }
+                }
+                "review" => {
+                    print_turn_header();
+                    if let Err(e) = agent.review_turn(print_agent_event, approver(yes)).await {
+                        eprintln!(
+                            "\n{}",
+                            ui::styled(
+                                ui::error_style(),
+                                &format!("review failed: {e:#}")
+                            )
+                        );
+                    }
+                }
+                "suggest" => {
+                    print_turn_header();
+                    if let Err(e) = agent.suggest_turn(print_agent_event, approver(yes)).await {
+                        eprintln!(
+                            "\n{}",
+                            ui::styled(
+                                ui::error_style(),
+                                &format!("suggest failed: {e:#}")
+                            )
+                        );
+                    }
+                }
+                "workflow" | "wf" => {
+                    // /workflow <name> <goal...> — run a declarative
+                    // multi-specialist pipeline from .agent/workflows or
+                    // ~/.zeus/workflows.
+                    let mut parts = arg.splitn(2, char::is_whitespace);
+                    let name = parts.next().unwrap_or("").trim();
+                    let goal = parts.next().unwrap_or("").trim();
+                    if name.is_empty() || goal.is_empty() {
+                        eprintln!("usage: /workflow <name> <goal> — e.g. /workflow build-backend 'add a health endpoint'");
+                        eprintln!("  (/workflows lists available workflows)");
+                    } else {
+                        let workflows = discover_workflows(
+                            config.project_root.as_deref(),
+                            &config.global.root,
+                        );
+                        match workflows.iter().find(|w| w.id == name) {
+                            Some(wf) => {
+                                print_turn_header();
+                                if let Err(e) = agent
+                                    .run_workflow(goal, wf, print_agent_event, approver(yes))
+                                    .await
+                                {
+                                    eprintln!(
+                                        "\n{}",
+                                        ui::styled(
+                                            ui::error_style(),
+                                            &format!("workflow failed: {e:#}")
+                                        )
+                                    );
+                                }
+                            }
+                            None => {
+                                eprintln!(
+                                    "{}",
+                                    ui::styled(ui::warn_style(), &format!("no workflow named '{name}'"))
+                                );
+                                eprintln!("run /workflows to list available workflows");
+                            }
+                        }
+                    }
+                }
+                "workflows" => {
+                    let workflows = discover_workflows(
+                        config.project_root.as_deref(),
+                        &config.global.root,
+                    );
+                    if workflows.is_empty() {
+                        eprintln!(
+                            "{}",
+                            "no workflows found. Create `<project>/.agent/workflows/<name>.toml` or `~/.zeus/workflows/<name>.toml`."
+                        );
+                    } else {
+                        eprintln!("workflows:");
+                        for wf in workflows {
+                            eprintln!(
+                                "  {} — {} ({} phase(s))",
+                                ui::styled(ui::assistant_marker_style(), &wf.id),
+                                wf.description,
+                                wf.phases.len()
+                            );
+                        }
+                    }
+                }
+                "bg" => {
+                    // /bg <goal> [--workflow <name>] — run the workforce in the
+                    // background: detach a headless `agent --auto` run so you
+                    // keep your prompt while it plans, executes, and reviews.
+                    let mut parts = arg.splitn(2, char::is_whitespace);
+                    let rest = parts.next().unwrap_or("").trim();
+                    if rest.is_empty() {
+                        eprintln!("usage: /bg <goal> — run an orchestrated plan in the background");
+                        eprintln!("  /bg list | output <id> | stop <id>  manage background tasks");
+                        eprintln!("  append `@@workflow:<name>` to run a named workflow");
+                    } else if matches!(rest, "list" | "output" | "stop") {
+                        eprintln!("  for background tasks use the `zeus bg ...` subcommand:");
+                        eprintln!("  zeus bg list · zeus bg output <id> · zeus bg stop <id>");
+                    } else {
+                        let (goal, workflow) = match rest.rsplit_once("@@workflow:") {
+                            Some((g, name)) => (g.trim(), Some(name.trim())),
+                            None => (rest, None),
+                        };
+                        match spawn_bg_orchestrate(config, goal, workflow) {
+                            Ok(id) => {
+                                println!(
+                                    "{}",
+                                    ui::styled(
+                                        ui::assistant_marker_style(),
+                                        &format!("● background orchestration started id={id}")
+                                    )
+                                );
+                                println!("goal: {goal}");
+                                println!(
+                                    "follow: zeus bg output {id}   |   stop: zeus bg stop {id}"
+                                );
+                            }
+                            Err(e) => eprintln!(
+                                "\n{}",
+                                ui::styled(ui::error_style(), &format!("bg spawn failed: {e:#}"))
                             ),
                         }
                     }
@@ -2740,6 +3413,28 @@ fn list_md_names(dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Detached headless orchestration: re-invoke this binary as a background
+/// `agent --auto [--workflow]` run. Uses an argv-based spawn (not a shell
+/// wrapper) so the goal text survives untouched — nothing is quoted or
+/// expanded. Shared by `zeus bg orchestrate` and the REPL `/bg` command.
+pub(crate) fn spawn_bg_orchestrate(
+    config: &Config,
+    goal: &str,
+    workflow: Option<&str>,
+) -> anyhow::Result<u64> {
+    let ws = workspace(config)?;
+    let registry = BackgroundTaskRegistry::new(ws.project_root.join(".agent/background"));
+    let exe = std::env::current_exe().context("resolve own executable")?;
+    let mut args: Vec<String> = vec!["agent".into(), goal.into(), "--yes".into(), "--auto".into()];
+    if let Some(name) = workflow {
+        args.push("--workflow".into());
+        args.push(name.to_string());
+    }
+    registry
+        .spawn_argv(&exe.to_string_lossy(), args, &ws.project_root)
+        .context("spawn background orchestration")
+}
+
 fn cmd_bg(config: &Config, action: BgCmd) -> Result<()> {
     let ws = workspace(config)?;
     let registry = BackgroundTaskRegistry::new(ws.project_root.join(".agent/background"));
@@ -2747,6 +3442,18 @@ fn cmd_bg(config: &Config, action: BgCmd) -> Result<()> {
         BgCmd::Run { command } => {
             let id = registry.spawn(&command, &ws.project_root).context("spawn background task")?;
             println!("started background task id={id}: {command}");
+            Ok(())
+        }
+        BgCmd::Orchestrate { goal, workflow } => {
+            let id = spawn_bg_orchestrate(config, &goal, workflow.as_deref())?;
+            println!("started background orchestration id={id}");
+            let goal_flat = goal.replace('\n', " ");
+            println!("  goal:     {goal_flat}");
+            println!(
+                "  workflow: {}",
+                workflow.as_deref().unwrap_or("(auto-plan)")
+            );
+            println!("  follow:  zeus bg output {id}   |   stop: zeus bg stop {id}");
             Ok(())
         }
         BgCmd::List => {
@@ -2787,6 +3494,16 @@ fn git_engine(config: &Config) -> Result<GitEngine> {
     let ws = workspace(config)?;
     let gate = PermissionGate::new(config.settings.clone(), ws.project_root.clone());
     Ok(GitEngine::new(ws.project_root, gate))
+}
+
+/// Build a `GitEngine` bound to `agent`'s already-live project root — used by
+/// the `/diff` REPL and TUI commands, which need git access without
+/// re-deriving a whole `Workspace` (that would mint a fresh, unused
+/// checkpoint turn directory on every call).
+fn git_engine_for_agent(config: &Config, agent: &Agent) -> GitEngine {
+    let root = agent.workspace().project_root.clone();
+    let gate = PermissionGate::new(config.settings.clone(), root.clone());
+    GitEngine::new(root, gate)
 }
 
 /// Print a `GitOutput`'s stdout, and on failure also print stderr and

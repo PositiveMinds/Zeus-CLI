@@ -84,6 +84,23 @@ pub struct AgentSettings {
     /// auto-downloadable catalog of GGUF models.
     #[serde(default)]
     pub llamacpp: LlamaCppSettings,
+    /// Disables the TUI's animated wordmark/spinner in favor of static
+    /// text — for terminals/links where redrawing every 100ms is
+    /// unwelcome (slow SSH, a strong no-motion preference), or just a
+    /// quieter look. Off by default.
+    #[serde(default)]
+    pub reduced_motion: bool,
+    /// TUI brand accent color as a `#rrggbb` hex string, overriding the
+    /// default violet used for borders, the progress bar, and highlighted
+    /// rows. `None` (the default) keeps the built-in violet.
+    #[serde(default)]
+    pub accent_color: Option<String>,
+    /// Rings the terminal bell when a turn finishes — the cue that lets you
+    /// tab away during a long/Auto-mode run instead of watching it. On by
+    /// default; most terminals map BEL to a visual flash unless the user
+    /// has configured an audible one.
+    #[serde(default = "default_true")]
+    pub notify_on_completion: bool,
 }
 
 
@@ -381,6 +398,12 @@ struct PartialSettings {
     extra_model_dirs: Option<Vec<String>>,
     #[serde(default)]
     llamacpp: Option<LlamaCppSettings>,
+    #[serde(default)]
+    reduced_motion: Option<bool>,
+    #[serde(default)]
+    accent_color: Option<String>,
+    #[serde(default)]
+    notify_on_completion: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -446,6 +469,9 @@ impl SettingsStack {
                 mcp_servers: Some(Vec::new()),
                 extra_model_dirs: Some(Vec::new()),
                 llamacpp: Some(LlamaCppSettings::default()),
+                reduced_motion: Some(false),
+                accent_color: None,
+                notify_on_completion: Some(true),
             },
         ));
         s
@@ -496,6 +522,9 @@ impl SettingsStack {
             mcp_servers: Vec::new(),
             extra_model_dirs: Vec::new(),
             llamacpp: LlamaCppSettings::default(),
+            reduced_motion: false,
+            accent_color: None,
+            notify_on_completion: true,
         };
 
         for (_layer, partial) in &self.layers {
@@ -566,6 +595,15 @@ impl SettingsStack {
                 if let Some(file) = l.file {
                     out.logging.file = file;
                 }
+            }
+            if let Some(rm) = partial.reduced_motion {
+                out.reduced_motion = rm;
+            }
+            if let Some(color) = &partial.accent_color {
+                out.accent_color = Some(color.clone());
+            }
+            if let Some(v) = partial.notify_on_completion {
+                out.notify_on_completion = v;
             }
             if let Some(roots) = &partial.project_roots {
                 // Later layers replace the list entirely when present.
@@ -655,6 +693,50 @@ keep_recent_turns = 6
         std::fs::write(path, body).map_err(ConfigError::Io)?;
         Ok(())
     }
+}
+
+fn load_partial(path: &Path) -> Result<PartialSettings> {
+    if !path.exists() {
+        return Ok(PartialSettings::default());
+    }
+    let text = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
+    toml::from_str(&text).map_err(|source| ConfigError::TomlParse {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })
+}
+
+fn save_partial(path: &Path, partial: &PartialSettings) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+    }
+    let text = toml::to_string_pretty(partial).map_err(ConfigError::TomlSerialize)?;
+    std::fs::write(path, text).map_err(ConfigError::Io)
+}
+
+/// Reads the on-disk partial settings at `path` (or starts from an empty
+/// one if the file doesn't exist yet), flips one field, and rewrites it —
+/// backs the in-app `/settings` command so users never have to hand-edit
+/// `settings.toml`. `path` is normally `Config::global.settings_toml`.
+pub fn set_reduced_motion(path: &Path, value: bool) -> Result<()> {
+    let mut partial = load_partial(path)?;
+    partial.reduced_motion = Some(value);
+    save_partial(path, &partial)
+}
+
+/// Same, for `accent_color` (`None` clears the override back to the
+/// built-in violet).
+pub fn set_accent_color(path: &Path, value: Option<String>) -> Result<()> {
+    let mut partial = load_partial(path)?;
+    partial.accent_color = value;
+    save_partial(path, &partial)
+}
+
+/// Same, for `notify_on_completion`.
+pub fn set_notify_on_completion(path: &Path, value: bool) -> Result<()> {
+    let mut partial = load_partial(path)?;
+    partial.notify_on_completion = Some(value);
+    save_partial(path, &partial)
 }
 
 #[cfg(test)]

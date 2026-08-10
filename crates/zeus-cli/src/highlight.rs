@@ -3,11 +3,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SC, FontStyle as SF, Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 /// Code-block background, matching the demo bubble's dark `pre` backing.
 const CODE_BG: Color = Color::Rgb(0x0c, 0x0f, 0x16);
+/// Inline `` `code` `` foreground — warm amber, kept distinct from the
+/// cyan used for bullets/ordered-list markers/diff hunks so inline code
+/// reads as its own thing rather than reusing an unrelated marker color.
+const INLINE_CODE_FG: Color = Color::Rgb(0xe0, 0xaf, 0x68);
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
@@ -26,6 +30,55 @@ fn theme() -> &'static Theme {
 
 fn rat_color(c: SC) -> Color {
     Color::Rgb(c.r, c.g, c.b)
+}
+
+/// Best-effort language-token resolution for fenced code blocks. Syntect's
+/// bundled `load_defaults_newlines()` package is the old Sublime Text
+/// default set — it's missing several languages fences commonly name
+/// (TypeScript/TSX/JSX, TOML, Dockerfile, Vue/Svelte...). Rather than
+/// silently falling back to zero highlighting for those, try the raw
+/// token/extension first, then a small table of close substitutes, before
+/// giving up on plain text.
+fn resolve_syntax(lang: Option<&str>) -> &'static SyntaxReference {
+    let set = syntax_set();
+    let raw = match lang.map(|l| l.trim().to_lowercase()) {
+        Some(r) if !r.is_empty() => r,
+        _ => return set.find_syntax_plain_text(),
+    };
+    if let Some(s) = set
+        .find_syntax_by_token(&raw)
+        .or_else(|| set.find_syntax_by_extension(&raw))
+    {
+        return s;
+    }
+    for alias in lang_aliases(&raw) {
+        if let Some(s) = set
+            .find_syntax_by_token(alias)
+            .or_else(|| set.find_syntax_by_extension(alias))
+        {
+            return s;
+        }
+    }
+    set.find_syntax_plain_text()
+}
+
+/// Close substitutes to try, in order, when a fence's language token isn't
+/// directly known to the bundled syntax set — not a full alias system, just
+/// the common cases an AI coding agent's own fences actually use.
+fn lang_aliases(token: &str) -> &'static [&'static str] {
+    match token {
+        "ts" | "typescript" | "tsx" | "jsx" | "mjs" | "cjs" => &["js", "javascript"],
+        "yml" => &["yaml"],
+        "sh" | "shell" | "zsh" | "console" => &["bash", "sh"],
+        "c++" | "cplusplus" | "cxx" => &["cpp"],
+        "cs" | "c#" => &["csharp", "cs"],
+        "objc" | "objectivec" => &["objective-c"],
+        "toml" | "cfg" | "dotenv" | "env" => &["ini"],
+        "vue" | "svelte" => &["html"],
+        "md" => &["markdown"],
+        "dockerfile" | "docker" => &["bash"],
+        _ => &[],
+    }
 }
 
 fn rock_style(style: &syntect::highlighting::Style) -> Style {
@@ -60,16 +113,13 @@ pub fn markdown_lines(text: &str, plain_style: Style) -> Vec<Vec<Span<'static>>>
     let flush_plain =
         |out: &mut Vec<Vec<Span<'static>>>, plain: &Vec<String>| {
             for l in plain {
-                out.push(vec![Span::styled(l.clone(), plain_style)]);
+                out.push(style_markdown_line(l, plain_style));
             }
         };
     let flush_code = |out: &mut Vec<Vec<Span<'static>>>,
                       code: &Vec<String>,
                       lang: &Option<String>| {
-        let syntax = lang
-            .as_deref()
-            .and_then(|l| syntax_set().find_syntax_by_token(&l.to_lowercase()))
-            .unwrap_or_else(|| syntax_set().find_syntax_plain_text());
+        let syntax = resolve_syntax(lang.as_deref());
         let mut h = HighlightLines::new(syntax, theme());
         for line_w in LinesWithEndings::from(&code.join("\n")) {
             let line = line_w.trim_end_matches('\n');
@@ -116,6 +166,120 @@ pub fn markdown_lines(text: &str, plain_style: Style) -> Vec<Vec<Span<'static>>>
         flush_code(&mut out, &code, &lang);
     }
     out
+}
+
+/// Lightweight styling for a single non-fenced markdown line: a colored
+/// marker for headers/list items/blockquotes, plus inline `**bold**` and
+/// `` `code` `` spans within it. Not a full markdown parser (tables and
+/// nested structure aren't attempted) — just the handful of constructs
+/// that show up constantly in LLM prose and otherwise render as raw
+/// asterisks/backticks/hashes with no distinction at all.
+fn style_markdown_line(line: &str, base: Style) -> Vec<Span<'static>> {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let mut spans = Vec::new();
+    if indent_len > 0 {
+        spans.push(Span::styled(line[..indent_len].to_string(), base));
+    }
+
+    if let Some(rest) = trimmed
+        .strip_prefix("### ")
+        .or_else(|| trimmed.strip_prefix("## "))
+        .or_else(|| trimmed.strip_prefix("# "))
+    {
+        spans.extend(style_inline(rest, base.add_modifier(Modifier::BOLD)));
+        return spans;
+    }
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        spans.push(Span::styled("▍ ", Style::default().fg(META_FG)));
+        spans.extend(style_inline(rest, base.add_modifier(Modifier::ITALIC)));
+        return spans;
+    }
+    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        spans.push(Span::styled("• ", Style::default().fg(HUNK_FG).add_modifier(Modifier::BOLD)));
+        spans.extend(style_inline(rest, base));
+        return spans;
+    }
+    if let Some((marker, rest)) = split_ordered_marker(trimmed) {
+        spans.push(Span::styled(
+            format!("{marker} "),
+            Style::default().fg(HUNK_FG).add_modifier(Modifier::BOLD),
+        ));
+        spans.extend(style_inline(rest, base));
+        return spans;
+    }
+    spans.extend(style_inline(trimmed, base));
+    spans
+}
+
+/// Splits a `"1. rest"`-style ordered-list marker off the front of a line.
+fn split_ordered_marker(s: &str) -> Option<(&str, &str)> {
+    let dot = s.find(". ")?;
+    let num = &s[..dot];
+    if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+        Some((&s[..=dot], &s[dot + 2..]))
+    } else {
+        None
+    }
+}
+
+/// Splits `**bold**`, `` `code` ``, and `~~strikethrough~~` out of a line's
+/// remaining text into separately styled spans; everything else keeps
+/// `base`. Picks whichever delimiter opens earliest so the three compose
+/// correctly regardless of order.
+fn style_inline(text: &str, base: Style) -> Vec<Span<'static>> {
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Bold,
+        Code,
+        Strike,
+    }
+    let mut spans = Vec::new();
+    let mut rest = text;
+    loop {
+        let candidates = [
+            (rest.find("**"), Kind::Bold),
+            (rest.find('`'), Kind::Code),
+            (rest.find("~~"), Kind::Strike),
+        ];
+        let Some((pos, kind)) = candidates
+            .into_iter()
+            .filter_map(|(p, k)| p.map(|pv| (pv, k)))
+            .min_by_key(|(pv, _)| *pv)
+        else {
+            if !rest.is_empty() {
+                spans.push(Span::styled(rest.to_string(), base));
+            }
+            break;
+        };
+        let (delim, delim_len, style_for): (&str, usize, fn(&str, Style) -> Style) = match kind {
+            Kind::Bold => ("**", 2, |_, base| base.add_modifier(Modifier::BOLD)),
+            Kind::Code => ("`", 1, |_, _| Style::default().fg(INLINE_CODE_FG).bg(CODE_BG)),
+            Kind::Strike => ("~~", 2, |_, base| base.add_modifier(Modifier::CROSSED_OUT)),
+        };
+        match rest[pos + delim_len..].find(delim) {
+            Some(end_rel) => {
+                if pos > 0 {
+                    spans.push(Span::styled(rest[..pos].to_string(), base));
+                }
+                spans.push(Span::styled(
+                    rest[pos + delim_len..pos + delim_len + end_rel].to_string(),
+                    style_for(delim, base),
+                ));
+                rest = &rest[pos + delim_len + end_rel + delim_len..];
+            }
+            None => {
+                // Unmatched delimiter — no closing marker, so treat the
+                // remainder as plain text rather than eating it.
+                spans.push(Span::styled(rest.to_string(), base));
+                break;
+            }
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
 }
 
 #[cfg(test)]

@@ -16,8 +16,9 @@ pub use keys::KeysFile;
 pub use paths::{ensure_global_dirs, global_home, project_agent_dir, GlobalPaths, ProjectPaths};
 pub use providers::{ProviderConfig, ProvidersFile};
 pub use settings::{
-    AgentSettings, LlamaCppSettings, LocalModelEntry, McpServerConfig, PermissionDefault,
-    PermissionRule, PermissionState, SettingsLayer, SettingsStack,
+    set_accent_color, set_notify_on_completion, set_reduced_motion, AgentSettings,
+    LlamaCppSettings, LocalModelEntry, McpServerConfig, PermissionDefault, PermissionRule,
+    PermissionState, SettingsLayer, SettingsStack,
 };
 
 use std::path::{Path, PathBuf};
@@ -122,6 +123,16 @@ version = "0.1.0"
         }
         if !paths.index_json.exists() {
             std::fs::write(&paths.index_json, "{}\n").map_err(ConfigError::Io)?;
+        }
+        if !paths.instructions_md.exists() {
+            std::fs::write(
+                &paths.instructions_md,
+                "# Project Rules\n\n<!-- Project-specific conventions and constraints. The agent reads this \
+before any task. Fill in what applies to this repo; delete the rest. -->\n\n- Add new code in the project's \
+existing language(s) and structure.\n- Never modify generated files.\n- Run the project's test suite after backend \
+changes.\n- Use the project's existing error types and patterns.\n",
+            )
+            .map_err(ConfigError::Io)?;
         }
         // settings.local.toml is intentionally not created by default (gitignored personal overrides).
         Ok(paths)

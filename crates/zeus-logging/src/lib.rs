@@ -29,6 +29,14 @@ pub struct LoggingOptions {
     /// When true, also write to `logs_dir/zeus-YYYY-MM-DD.log`
     pub file: bool,
     pub logs_dir: Option<PathBuf>,
+    /// When false, skip the stderr layer entirely. Set this to false
+    /// whenever the caller is about to hand the terminal over to a raw-mode
+    /// alternate-screen UI (the ratatui TUI) — a log line written straight
+    /// to stderr mid-session corrupts that screen (the terminal ends up
+    /// with stray text interleaved into the TUI's own cell-addressed
+    /// output), since the UI assumes exclusive ownership of the display.
+    /// File logging (if enabled) is unaffected either way.
+    pub console: bool,
 }
 
 impl Default for LoggingOptions {
@@ -37,6 +45,7 @@ impl Default for LoggingOptions {
             level: "info".into(),
             file: true,
             logs_dir: None,
+            console: true,
         }
     }
 }
@@ -81,11 +90,16 @@ pub fn init(opts: LoggingOptions) -> Result<(), LoggingError> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(normalize_level(&opts.level)));
 
-    let console_layer = fmt::layer()
-        .with_target(true)
-        .with_thread_ids(false)
-        .with_ansi(console_ansi_supported())
-        .with_writer(io::stderr);
+    // `Option<Layer>` is itself a no-op `Layer` when `None` (a standard
+    // tracing-subscriber pattern) — this drops the stderr layer entirely
+    // rather than just filtering it, so nothing can write to the terminal.
+    let console_layer = opts.console.then(|| {
+        fmt::layer()
+            .with_target(true)
+            .with_thread_ids(false)
+            .with_ansi(console_ansi_supported())
+            .with_writer(io::stderr)
+    });
 
     let result = if opts.file {
         if let Some(dir) = &opts.logs_dir {

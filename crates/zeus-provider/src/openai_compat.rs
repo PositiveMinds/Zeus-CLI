@@ -88,7 +88,21 @@ fn role_str(role: Role) -> &'static str {
 }
 
 fn to_openai_message(m: &Message) -> Value {
-    let mut obj = json!({ "role": role_str(m.role), "content": m.content });
+    let mut obj = json!({ "role": role_str(m.role) });
+    if m.images.is_empty() {
+        obj["content"] = json!(m.content);
+    } else {
+        let mut parts: Vec<Value> = vec![json!({ "type": "text", "text": m.content })];
+        for img in &m.images {
+            parts.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", img.mime_type, img.data_base64)
+                }
+            }));
+        }
+        obj["content"] = json!(parts);
+    }
     if let Some(id) = &m.tool_call_id {
         obj["tool_call_id"] = json!(id);
     }
@@ -153,8 +167,15 @@ struct OaToolCall {
 struct OaMessage {
     #[serde(default)]
     content: Option<String>,
+    // `Option<Vec<_>>` rather than `Vec<_>` — some OpenAI-compatible
+    // providers (observed from deepseek/opencodezen) send an explicit
+    // `"tool_calls": null` instead of omitting the field or sending `[]`.
+    // `#[serde(default)]` alone only covers a *missing* key; an explicit
+    // `null` still fails a bare `Vec<_>` deserializer ("invalid type: null,
+    // expected a sequence"), whereas `Option`'s deserializer treats `null`
+    // as `None`.
     #[serde(default)]
-    tool_calls: Vec<OaToolCall>,
+    tool_calls: Option<Vec<OaToolCall>>,
 }
 #[derive(Debug, Deserialize)]
 struct OaUsage {
@@ -223,8 +244,9 @@ struct OaFunctionDelta {
 struct OaDelta {
     #[serde(default)]
     content: Option<String>,
+    // See the comment on `OaMessage::tool_calls` — same explicit-`null` issue.
     #[serde(default)]
-    tool_calls: Vec<OaToolCallDelta>,
+    tool_calls: Option<Vec<OaToolCallDelta>>,
 }
 #[derive(Debug, Deserialize)]
 struct OaStreamChoice {
@@ -270,6 +292,7 @@ impl ModelProvider for OpenAiCompatProvider {
         let oa_msg = choice.message.unwrap_or_default();
         let tool_calls: Vec<ToolCall> = oa_msg
             .tool_calls
+            .unwrap_or_default()
             .into_iter()
             .map(|c| ToolCall {
                 id: c.id,
@@ -405,7 +428,7 @@ impl ModelProvider for OpenAiCompatProvider {
                                 return;
                             }
                         }
-                        for tc in delta.tool_calls {
+                        for tc in delta.tool_calls.unwrap_or_default() {
                             saw_tool_call = true;
                             let id = tc
                                 .id
@@ -592,6 +615,14 @@ class Handler(BaseHTTPRequestHandler):
                                             "function": {"name": "shout", "arguments": "{\"text\":\"hi\"}"}}]},
                 "finish_reason": "tool_calls",
             }], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        elif model == "null-tool-calls-model":
+            # Some OpenAI-compatible providers (observed from deepseek /
+            # opencodezen) send an explicit `"tool_calls": null` instead of
+            # omitting the field — regression coverage for that shape.
+            resp = {"choices": [{
+                "message": {"role": "assistant", "content": "no tools here", "tool_calls": None},
+                "finish_reason": "stop",
+            }], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
         else:
             resp = {"choices": [{"message": {"role": "assistant", "content": "hello from test server"},
                                   "finish_reason": "stop"}],
@@ -608,6 +639,11 @@ class Handler(BaseHTTPRequestHandler):
                 {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"text\""}}]}, "finish_reason": None}]},
                 {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": ":\"hi\"}"}}]}, "finish_reason": None}]},
                 {"choices": [{"delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+            ]
+        elif model == "null-tool-calls-model":
+            chunks = [
+                {"choices": [{"delta": {"content": "hi", "tool_calls": None}, "finish_reason": None}]},
+                {"choices": [{"delta": {"tool_calls": None}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
             ]
         else:
             chunks = [
@@ -759,6 +795,45 @@ server.serve_forever()
         assert_eq!(name, Some("shout".to_string()));
         assert_eq!(arguments, r#"{"text":"hi"}"#);
         assert_eq!(finish, Some(FinishReason::ToolCalls));
+    }
+
+    /// Regression test for a provider (observed from deepseek/opencodezen)
+    /// sending an explicit `"tool_calls": null` in the message body rather
+    /// than omitting the field — used to fail deserialization with "invalid
+    /// type: null, expected a sequence".
+    #[tokio::test]
+    async fn chat_tolerates_explicit_null_tool_calls() {
+        let server = TestServer::start(18098);
+        let provider = OpenAiCompatProvider::new("test", &server.base_url);
+        let resp = provider
+            .chat(ChatRequest::new("null-tool-calls-model", vec![Message::user("hi")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.message.content, "no tools here");
+        assert!(resp.message.tool_calls.is_empty());
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+    }
+
+    /// Same regression, but for a streamed delta's `"tool_calls": null`.
+    #[tokio::test]
+    async fn stream_tolerates_explicit_null_tool_calls() {
+        let server = TestServer::start(18099);
+        let provider = OpenAiCompatProvider::new("test", &server.base_url);
+        let mut stream = provider
+            .stream(ChatRequest::new("null-tool-calls-model", vec![Message::user("hi")]))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        let mut finish = None;
+        while let Some(ev) = stream.next().await {
+            match ev.unwrap() {
+                StreamEvent::TextDelta { text: t } => text.push_str(&t),
+                StreamEvent::Done { finish_reason, .. } => finish = Some(finish_reason),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "hi");
+        assert_eq!(finish, Some(FinishReason::Stop));
     }
 
     #[tokio::test]

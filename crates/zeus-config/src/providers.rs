@@ -158,6 +158,78 @@ base_url = "http://127.0.0.1:8080/v1"
 default_model = "local-model"
 embeddings = true
 prompt_cache = true
+
+[providers.mistral]
+kind = "mistral"
+base_url = "https://api.mistral.ai/v1"
+api_key_env = "MISTRAL_API_KEY"
+default_model = "mistral-large-latest"
+embeddings = false
+prompt_cache = false
+
+[providers.groq]
+kind = "groq"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+default_model = "llama-3.3-70b-versatile"
+embeddings = false
+prompt_cache = false
+
+[providers.together]
+kind = "together"
+base_url = "https://api.together.xyz/v1"
+api_key_env = "TOGETHER_API_KEY"
+default_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+embeddings = false
+prompt_cache = false
+
+[providers.fireworks]
+kind = "fireworks"
+base_url = "https://api.fireworks.ai/inference/v1"
+api_key_env = "FIREWORKS_API_KEY"
+default_model = "accounts/fireworks/models/llama-v3p3-70b-instruct"
+embeddings = false
+prompt_cache = false
+
+[providers.perplexity]
+kind = "perplexity"
+base_url = "https://api.perplexity.ai"
+api_key_env = "PERPLEXITY_API_KEY"
+default_model = "sonar"
+embeddings = false
+prompt_cache = false
+
+[providers.cohere]
+kind = "cohere"
+base_url = "https://api.cohere.ai/compatibility/v1"
+api_key_env = "COHERE_API_KEY"
+default_model = "command-r-plus"
+embeddings = false
+prompt_cache = false
+
+[providers.cerebras]
+kind = "cerebras"
+base_url = "https://api.cerebras.ai/v1"
+api_key_env = "CEREBRAS_API_KEY"
+default_model = "llama-3.3-70b"
+embeddings = false
+prompt_cache = false
+
+[providers.deepinfra]
+kind = "deepinfra"
+base_url = "https://api.deepinfra.com/v1/openai"
+api_key_env = "DEEPINFRA_API_KEY"
+default_model = "meta-llama/Llama-3.3-70B-Instruct"
+embeddings = false
+prompt_cache = false
+
+[providers.novita]
+kind = "novita"
+base_url = "https://api.novita.ai/v3/openai"
+api_key_env = "NOVITA_API_KEY"
+default_model = "meta-llama/llama-3.3-70b-instruct"
+embeddings = false
+prompt_cache = false
 "#;
         std::fs::write(path, body).map_err(ConfigError::Io)?;
         Ok(())
@@ -283,6 +355,114 @@ prompt_cache = true
                 headers: HashMap::new(),
                 embeddings: true,
                 prompt_cache: true,
+            },
+        );
+        providers.insert(
+            "mistral".into(),
+            ProviderConfig {
+                kind: "mistral".into(),
+                base_url: Some("https://api.mistral.ai/v1".into()),
+                api_key_env: Some("MISTRAL_API_KEY".into()),
+                default_model: Some("mistral-large-latest".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "groq".into(),
+            ProviderConfig {
+                kind: "groq".into(),
+                base_url: Some("https://api.groq.com/openai/v1".into()),
+                api_key_env: Some("GROQ_API_KEY".into()),
+                default_model: Some("llama-3.3-70b-versatile".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "together".into(),
+            ProviderConfig {
+                kind: "together".into(),
+                base_url: Some("https://api.together.xyz/v1".into()),
+                api_key_env: Some("TOGETHER_API_KEY".into()),
+                default_model: Some("meta-llama/Llama-3.3-70B-Instruct-Turbo".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "fireworks".into(),
+            ProviderConfig {
+                kind: "fireworks".into(),
+                base_url: Some("https://api.fireworks.ai/inference/v1".into()),
+                api_key_env: Some("FIREWORKS_API_KEY".into()),
+                default_model: Some("accounts/fireworks/models/llama-v3p3-70b-instruct".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "perplexity".into(),
+            ProviderConfig {
+                kind: "perplexity".into(),
+                base_url: Some("https://api.perplexity.ai".into()),
+                api_key_env: Some("PERPLEXITY_API_KEY".into()),
+                default_model: Some("sonar".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "cohere".into(),
+            ProviderConfig {
+                kind: "cohere".into(),
+                base_url: Some("https://api.cohere.ai/compatibility/v1".into()),
+                api_key_env: Some("COHERE_API_KEY".into()),
+                default_model: Some("command-r-plus".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "cerebras".into(),
+            ProviderConfig {
+                kind: "cerebras".into(),
+                base_url: Some("https://api.cerebras.ai/v1".into()),
+                api_key_env: Some("CEREBRAS_API_KEY".into()),
+                default_model: Some("llama-3.3-70b".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "deepinfra".into(),
+            ProviderConfig {
+                kind: "deepinfra".into(),
+                base_url: Some("https://api.deepinfra.com/v1/openai".into()),
+                api_key_env: Some("DEEPINFRA_API_KEY".into()),
+                default_model: Some("meta-llama/Llama-3.3-70B-Instruct".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "novita".into(),
+            ProviderConfig {
+                kind: "novita".into(),
+                base_url: Some("https://api.novita.ai/v3/openai".into()),
+                api_key_env: Some("NOVITA_API_KEY".into()),
+                default_model: Some("meta-llama/llama-3.3-70b-instruct".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
             },
         );
         Self { providers }

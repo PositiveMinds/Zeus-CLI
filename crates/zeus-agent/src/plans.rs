@@ -111,11 +111,13 @@ mod tests {
             PlanStep {
                 id: 1,
                 description: "read the manifest".into(),
+                rationale: "need to see what's declared".into(),
                 persona: Some("qa".into()),
             },
             PlanStep {
                 id: 2,
                 description: "add the missing dep".into(),
+                rationale: "build fails without it".into(),
                 persona: None,
             },
         ];
@@ -148,11 +150,13 @@ mod tests {
             PlanStep {
                 id: 1,
                 description: "a".into(),
+                rationale: "one".into(),
                 persona: None,
             },
             PlanStep {
                 id: 2,
                 description: "b".into(),
+                rationale: "two".into(),
                 persona: None,
             },
         ];

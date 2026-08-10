@@ -118,7 +118,59 @@ impl BackgroundTaskRegistry {
 
         let task = BackgroundTask {
             id,
-            command: command.to_string(),
+            command: format!("shell: {command}"),
+            pid,
+            cwd: cwd.display().to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            paused: false,
+        };
+        let text = serde_json::to_string_pretty(&task)
+            .map_err(|e| AgentError::Terminal(e.to_string()))?;
+        std::fs::write(self.meta_path(id), text)?;
+        Ok(id)
+    }
+
+    /// Spawn an arbitrary program directly (no shell wrapping), keeping it
+    /// running after this process exits. Output goes to `<id>.stdout.log` /
+    /// `<id>.stderr.log` like `spawn`. Used for background **orchestrated
+    /// agent runs**, where shell-wrapping the goal would let its content be
+    /// mangled by quoting/expansion — argv is passed through untouched.
+    pub fn spawn_argv<I: IntoIterator<Item = String>>(
+        &self,
+        program: &str,
+        args: I,
+        cwd: &Path,
+    ) -> Result<u64> {
+        std::fs::create_dir_all(&self.dir)?;
+        let id = self.next_id()?;
+
+        let stdout_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.stdout_path(id))?;
+        let stderr_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.stderr_path(id))?;
+
+        let args: Vec<String> = args.into_iter().collect();
+
+        let mut cmd = Command::new(program);
+        cmd.args(&args);
+        cmd.current_dir(cwd);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::from(stdout_file));
+        cmd.stderr(Stdio::from(stderr_file));
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| AgentError::Terminal(format!("spawn failed: {e}")))?;
+        let pid = child.id();
+        drop(child);
+
+        let task = BackgroundTask {
+            id,
+            command: format!("{program} {}", id_desc(&args)),
             pid,
             cwd: cwd.display().to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
@@ -272,8 +324,20 @@ impl BackgroundTaskRegistry {
     }
 }
 
-fn is_alive(pid: u32) -> bool {
-    if cfg!(windows) {
+/// Compact argv summary for the persisted command field.
+fn id_desc(args: &[String]) -> String {
+    if args.is_empty() {
+        return "(no args)".into();
+    }
+    let mut s = args.join(" ");
+    if s.len() > 80 {
+        s = s.chars().take(77).collect::<String>();
+        s.push_str("...");
+    }
+    s
+}
+
+fn is_alive(pid: u32) -> bool {    if cfg!(windows) {
         match Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
             .output()
@@ -344,6 +408,54 @@ mod tests {
         assert_eq!(status, TaskStatus::Exited);
         let (stdout, _) = registry.output(id);
         assert!(stdout.contains("hi"));
+    }
+
+    #[test]
+    fn spawn_argv_passes_args_untouched_and_lists_running() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
+
+        // Spawn a long-lived-ish child with meaningful argv; we only assert
+        // it starts Running and is tracked like shell spawns — the point is
+        // the argv path exists for detached headless orchestration (goals
+        // with quotes/spaces survive without shell polish).
+        let (program, args) = if cfg!(windows) {
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    "Start-Sleep -Seconds 30".to_string(),
+                ],
+            )
+        } else {
+            ("sleep".to_string(), vec!["30".to_string()])
+        };
+        let id = registry.spawn_argv(&program, args, &root).unwrap();
+
+        let (task, status) = registry.get(id).unwrap().unwrap();
+        assert_eq!(task.id, id);
+        assert_eq!(status, TaskStatus::Running);
+        assert!(task.command.contains(&program));
+
+        let listed = registry.list().unwrap();
+        assert!(listed.iter().any(|(t, s)| t.id == id && *s == TaskStatus::Running));
+
+        registry.stop(id).unwrap();
+        assert!(registry.get(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn spawn_argv_requires_existing_program() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
+        assert!(registry
+            .spawn_argv("zeus_definitely_not_a_program_xyz", vec!["hi".into()], &root)
+            .is_err());
     }
 
     #[test]

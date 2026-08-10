@@ -24,10 +24,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 anstyle = "1.0.14"
 toml.workspace = true
-ratatui = "0.29"
+serde.workspace = true
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 syntect = { workspace = true }
 arboard = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

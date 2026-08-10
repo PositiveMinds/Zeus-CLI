@@ -10,7 +10,7 @@ use crate::mcp::McpClient;
 use crate::plugin::LoadedPlugin;
 use crate::terminal::{CommandProfile, Sandbox, TerminalOptions, TerminalRunner};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +25,9 @@ use zeus_provider::ToolSpec;
 pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
+    /// Vision-capable model attachments produced/returned by this tool call
+    /// (e.g. `read_image`). Plumbed into the conversation by the agent loop.
+    pub images: Vec<zeus_provider::ImagePart>,
 }
 
 impl ToolResult {
@@ -32,12 +35,14 @@ impl ToolResult {
         Self {
             content: content.into(),
             is_error: false,
+            images: Vec::new(),
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: true,
+            images: Vec::new(),
         }
     }
 }
@@ -211,6 +216,111 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": { "url": {"type": "string"} },
                 "required": ["url"]
+            }),
+        },
+        ToolSpec {
+            name: "web_fetch".into(),
+            description: "Fetch a URL over HTTP(S) and return its content as text. Use to scrape docs, read an API/endpoint response, download raw source, or inspect a web page the model needs to act on (the browser tool just opens it for a human — web_fetch returns the actual content here). max_chars caps the returned body (default 20000); selective=true strips HTML to approximate markdown text instead of returning raw HTML. Errors on non-2xx status and on obviously non-text content. Requires network access.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Absolute http(s) URL to fetch"},
+                    "max_chars": {"type": "integer", "description": "Cap on returned characters (default 20000)"},
+                    "selective": {"type": "boolean", "description": "Strip HTML tags to text (default true)"}
+                },
+                "required": ["url"]
+            }),
+        },
+        ToolSpec {
+            name: "web_search".into(),
+            description: "Search the web and return the top result titles, URLs, and snippets. Use when you need current or external information (latest library versions, API docs, third-party package details, known issues) rather than relying on possibly-stale training knowledge. `query` is the search string; `max_results` caps the returned results (default 6). Then call web_fetch on the most promising URL for full content. Requires network access.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "description": "Max results to return (default 10)"}
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolSpec {
+            name: "list_skills".into(),
+            description: "List available skills (project `<project>/.agent/skills`, user `~/.zeus/skills`, and built-ins). Skills are just-in-time expertise packages — SKILL.md directories with instructions and bundled resources. Returns <tier> name — description plus tags. Call read_skill before acting on a skill you intend to use.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "search": {"type": "string", "description": "Optional substring to filter names/descriptions/tags by"}
+                }
+            }),
+        },
+ToolSpec {
+            name: "read_skill".into(),
+            description: "Load a skill's full SKILL.md instructions into context by name. Use when a listed skill is relevant to the current task — it returns markdown instructions plus any bundled resource file names (which can then be read directly from the skill directory via the read tool). The skill's instructions may change HOW you approach the task, so read the full body, not just the description.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name as printed by list_skills"},
+                    "include_resources": {"type": "boolean", "description": "Also return bundled resource file contents (default true)"},
+                    "recursive": {"type": "boolean", "description": "Also load depends_on skills the skill composes (default true)"}
+                },
+                "required": ["name"]
+            }),
+        },
+ToolSpec {
+            name: "read_document".into(),
+            description: "Extract text from binary/office documents for the model to act on: PDF, DOCX, XLSX (each worksheet as a row grid), PPTX (slides). Also handles plain-text formats via the read tool. max_chars caps returned text (default 20000). Use instead of read for .pdf/.docx/.pptx/.xlsx files — read would return binary garbage for those. Returns unsupported/missing files as errors. For scanned/image PDFs (no text layer) it errors and you should use read_image + the ui-design skill.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or project-relative path to the document"},
+                    "max_chars": {"type": "integer", "description": "Cap on returned characters (default 100000)"}
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: "read_image".into(),
+            description: "Read a local image file so a vision-capable model can SEE it (the binary image data is attached to the message). Supports PNG, JPEG, GIF, WEBP, BMP. Use for screenshots, UI mockups/design images, diagrams, scanned docs — anything you must inspect visually or recreate/design from. The companion text result states the resolved path and dimensions hint if known. For scanned PDFs (no text layer) pair with the ui-design + document-reading skills.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or project-relative path to the image file"}
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: "understand_repo".into(),
+            description: "Repository understanding: returns a deterministic snapshot of the project (language stack, frameworks, package manager, database, entry points, build/test commands, git status) plus — when a `topic` is given (e.g. \"authentication\") — a list of existing files/modules whose names relate to that topic. Read this or a targeted grep BEFORE writing new code, so you reuse existing modules instead of duplicating them.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "Optional subject to find existing related code for"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "memory".into(),
+            description: "Long-term project memory under .agent/memory/: `list` shows note names + first lines; `read <name>` returns a note's full body. Used to persist decisions, conventions, and gotchas across sessions. Read before large/unknown tasks; check what the project already decided before exploring anew.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "read"]},
+                    "name": {"type": "string", "description": "note name (required for read)"}
+                },
+                "required": ["action"]
+            }),
+        },
+        ToolSpec {
+            name: "memory_write".into(),
+            description: "Write a long-term project memory note under .agent/memory/<name>.md (name: letters/digits/-/_). Content is a short markdown plan/decision/gotcha you want to persist across sessions. Overwrites the note if it exists. Ask the user first before writing non-obvious memories.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["name", "content"]
             }),
         },
         ToolSpec {
@@ -1256,11 +1366,17 @@ pub struct ToolManager {
     platform: PlatformEngine,
     device: DeviceEngine,
     cancel: Arc<AtomicBool>,
+    /// Global skills dir (`~/.zeus/skills`), injected by the CLI so the tools
+    /// can discover skills at both project and user scope.
+    global_skills_dir: Option<PathBuf>,
     /// Plan mode: read-only research/proposal, no mutating tool calls. Set
     /// via `set_plan_mode`; enforced centrally in `dispatch_with_approver`
     /// rather than per-tool, so it can't be bypassed by a tool that happens
     /// to be configured Allow in the permission settings.
     plan_mode: AtomicBool,
+    /// Cached repository fingerprint (repository understanding), shared with
+    /// the Agent so the `understand_repo` tool doesn't rescan the tree.
+    repo: Option<crate::analyze::RepoFingerprint>,
 }
 
 /// Tools that only observe state (files, git history, background task
@@ -1273,6 +1389,14 @@ fn is_read_only_tool(name: &str) -> bool {
             "read"
             | "grep"
             | "glob"
+            | "web_fetch"
+            | "web_search"
+            |             "list_skills"
+            | "read_skill"
+|             "read_document"
+            | "read_image"
+            | "understand_repo"
+            | "memory"
             | "code_index"
             | "code_symbols"
             | "code_defs"
@@ -1341,8 +1465,26 @@ impl ToolManager {
             platform,
             device,
             cancel,
+            global_skills_dir: None,
             plan_mode: AtomicBool::new(false),
+            repo: None,
         }
+    }
+
+    /// Share the cached repository fingerprint with the tool layer (used by
+    /// `understand_repo` so it doesn't rescan the tree).
+    pub fn set_repo(&mut self, repo: Option<crate::analyze::RepoFingerprint>) {
+        self.repo = repo;
+    }
+
+    pub fn project_root(&self) -> PathBuf {
+        self.workspace.project_root.clone()
+    }
+
+    /// Point the tools at the global skills dir (`~/.zeus/skills`). Project
+    /// skills are discovered under `<project>/.agent/skills` automatically.
+    pub fn set_global_skills_dir(&mut self, dir: Option<PathBuf>) {
+        self.global_skills_dir = dir;
     }
 
     pub fn set_plan_mode(&self, enabled: bool) {
@@ -1440,6 +1582,7 @@ impl ToolManager {
             Some(extra) => ToolResult {
                 content: format!("{}\n\n[post-tool-use hook output]\n{extra}", result.content),
                 is_error: result.is_error,
+                images: result.images,
             },
             None => result,
         })
@@ -1467,6 +1610,15 @@ impl ToolManager {
             "bash" => self.do_bash(&args, approver),
             "test" => self.do_test(&args, approver),
             "browser" => self.do_browser(&args),
+            "web_fetch" => self.do_web_fetch(&args),
+            "web_search" => self.do_web_search(&args),
+            "list_skills" => self.do_list_skills(&args),
+            "read_skill" => self.do_read_skill(&args),
+            "read_document" => self.do_read_document(&args),
+            "read_image" => self.do_read_image(&args),
+            "understand_repo" => self.do_understand_repo(&args),
+            "memory" => self.do_memory(&args),
+            "memory_write" => self.do_memory_write(&args, approver),
             "device" => self.do_device(&args, approver),
             "bg_list" => self.do_bg_list(),
             "bg_output" => self.do_bg_output(&args),
@@ -1627,6 +1779,7 @@ impl ToolManager {
             Ok(result) => Ok(ToolResult {
                 content: result.content,
                 is_error: result.is_error,
+                images: Vec::new(),
             }),
             Err(e) => Ok(ToolResult::err(format!(
                 "plugin '{plugin_name}' tool '{tool}' failed: {e}"
@@ -1670,6 +1823,7 @@ impl ToolManager {
             Ok(result) => Ok(ToolResult {
                 content: result.as_text(),
                 is_error: result.is_error,
+                images: Vec::new(),
             }),
             Err(e) => Ok(ToolResult::err(format!(
                 "mcp '{server}' tool '{tool}' failed: {e}"
@@ -2211,6 +2365,496 @@ impl ToolManager {
             Err(e) => Ok(ToolResult::err(format!(
                 "couldn't open {url}: {e}. On non-GUI/headless machines there may be no browser to launch."
             ))),
+        }
+    }
+
+    /// Fetch a URL over HTTP(S) and return its content to the model — the
+    /// actual web-scrape counterpart to `browser` (which only opens a page).
+    /// Follows redirects, caps the body, and strips HTML to approximate text
+    /// by default so the model gets readable content rather than raw markup.
+    fn do_web_fetch(&self, args: &Value) -> Result<ToolResult> {
+        let url = Self::str_arg(args, "url")?;
+        let url = url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Ok(ToolResult::err(format!(
+                "'{url}' isn't an http(s) URL — web_fetch needs an absolute http:// or https:// address"
+            )));
+        }
+        let max_chars = args
+            .get("max_chars")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20_000) as usize;
+        let selective = args
+            .get("selective")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        // Reject inner-IP/loopback targets just like `browser` does, so the
+        // tool can't be pointed at the user's local services.
+        if let Some(reason) = reject_web_target(url) {
+            return Ok(ToolResult::err(format!("web_fetch refused: {reason}")));
+        }
+
+        let client = match reqwest::blocking::Client::builder()
+            .user_agent("zeus-agent/0.1 (coding assistant; fetch-for-the-agent)")
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return Ok(ToolResult::err(format!("http client init failed: {e}"))),
+        };
+
+        let resp = match client.get(url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(ToolResult::err(format!(
+                    "request failed for {url}: {e} (network unreachable or DNS/TLS error)"
+                )))
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            return Ok(ToolResult::err(format!(
+                "HTTP {status} for {url} — fetch only returns 2xx content"
+            )));
+        }
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+        if content_type.contains("json") || content_type.contains("text") || content_type.contains("xml") {
+            // fine
+        } else {
+            return Ok(ToolResult::err(format!(
+                "refused to fetch {url}: content-type '{content_type}' isn't text/web content"
+            )));
+        }
+        let body = match resp.text() {
+            Ok(t) => t,
+            Err(e) => return Ok(ToolResult::err(format!("body read failed for {url}: {e}"))),
+        };
+        let mut content = if selective && content_type.contains("html") {
+            strip_html(&body)
+        } else {
+            body
+        };
+        if content.chars().count() > max_chars {
+            content = content.chars().take(max_chars).collect::<String>();
+            content.push_str("\n… (truncated, max_chars reached)");
+        }
+        Ok(ToolResult::ok(format!(
+            "# web_fetch {url}\n{content}"
+        )))
+    }
+
+    /// `web_search` — query a public web search endpoint and return the top
+    /// result titles/URLs/snippets. Uses DuckDuckGo's keyless HTML search
+    /// (fast, no account/API key), so it works out of the box; the model
+    /// should `web_fetch` the most promising result for full content.
+    fn do_web_search(&self, args: &Value) -> Result<ToolResult> {
+        let query = Self::str_arg(args, "query")?.trim().to_string();
+        if query.is_empty() {
+            return Ok(ToolResult::err("web_search needs a non-empty `query`"));
+        }
+        let max_results = args
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(6)
+            .clamp(1, 10) as usize;
+
+        let client = match reqwest::blocking::Client::builder()
+            .user_agent("Mozilla/5.0 (zeus-agent; coding assistant search)")
+            .timeout(std::time::Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return Ok(ToolResult::err(format!("http client init failed: {e}"))),
+        };
+        let endpoint = format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            urlencode(&query)
+        );
+        let resp = match client.get(&endpoint).send() {
+            Ok(r) => r,
+            Err(e) => return Ok(ToolResult::err(format!("search request failed: {e}"))),
+        };
+        if !resp.status().is_success() {
+            return Ok(ToolResult::err(format!(
+                "search request returned HTTP {}",
+                resp.status()
+            )));
+        }
+        let html = match resp.text() {
+            Ok(t) => t,
+            Err(e) => return Ok(ToolResult::err(format!("search body read failed: {e}"))),
+        };
+
+        // DuckDuckGo HTML results: <a class="result__a" href="URL">title</a>
+        // and <a class="result__snippet" ...>snippet</a>.
+        let mut results: Vec<(String, String, String)> = Vec::new();
+        for (_i, chunk) in html.split("result__a").skip(1).enumerate() {
+            if results.len() >= max_results {
+                break;
+            }
+            let Some(href_start) = chunk.find("href=\"") else { continue };
+            let url = &chunk[href_start + 6..chunk[href_start + 6..].find('"').map(|i| i + href_start + 6).unwrap_or(href_start + 6)];
+            let Some(title_end) = chunk.find("</a>") else { continue };
+            let title = strip_html(&chunk[..title_end]);
+            let snippet = chunk
+                .find("result__snippet")
+                .and_then(|s| {
+                    let seg = &chunk[s..];
+                    let o = seg.find(">").map(|o| o + 1);
+                    o.map(|o| seg[o..seg.len().min(o + 400)].to_string())
+                })
+                .map(|s| strip_html(&s))
+                .unwrap_or_default();
+            let url_clean = url.trim_start_matches("//").to_string();
+            results.push((title.trim().to_string(), url_clean, snippet.trim().to_string()));
+        }
+
+        if results.is_empty() {
+            return Ok(ToolResult::err(
+                "no results returned (network or provider issue; try again, or use web_fetch for a known URL)",
+            ));
+        }
+        let mut out = format!("Web search results for: `{query}`\n");
+        for (i, (title, url, snippet)) in results.iter().enumerate() {
+            out.push_str(&format!(
+                "\n{}. {title}\n   {url}\n   {}\n",
+                i + 1,
+                if snippet.is_empty() { "(no snippet)".to_string() } else { snippet.clone() }
+            ));
+        }
+        out.push_str("\nUse web_fetch on the most relevant URL above for full content.");
+        Ok(ToolResult::ok(out))
+    }
+
+    /// All discoverable skills (project > user > built-in), deduped by name
+    /// with highest tier winning.
+    fn all_skills(&self) -> Vec<crate::skills::Skill> {
+        use crate::skills::{builtin_skill, discover_in_dir, Skill, SkillTier, BUILTIN_SKILLS};
+        let mut by_name: std::collections::BTreeMap<String, Skill> =
+            std::collections::BTreeMap::new();
+        let project_dir = self.workspace.project_root.join(".agent").join("skills");
+        let user_dir = self.global_skills_dir.clone();
+        for tier in [SkillTier::Project, SkillTier::Global, SkillTier::Builtin] {
+            let candidates: Vec<Skill> = match tier {
+                SkillTier::Project => discover_in_dir(&project_dir, tier),
+                SkillTier::Global => user_dir
+                    .as_ref()
+                    .map(|d| discover_in_dir(d, tier))
+                    .unwrap_or_default(),
+                SkillTier::Builtin => vec![], // built-ins are registered below
+            };
+            for skill in candidates {
+                // Higher tiers already inserted win; lower tiers don't overwrite.
+                by_name.entry(skill.name.clone()).or_insert(skill);
+            }
+        }
+        // Built-in skills ship as static data, always last in precedence.
+        for def in BUILTIN_SKILLS {
+            by_name
+                .entry(def.0.to_string())
+                .or_insert_with(|| builtin_skill(def));
+        }
+        by_name.into_values().collect()
+    }
+
+    /// `list_skills` — the model's browseable catalog of available skills.
+    fn do_list_skills(&self, args: &Value) -> Result<ToolResult> {
+        let search = Self::opt_str_arg(args, "search")
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        let skills = self.all_skills();
+        if skills.is_empty() {
+            return Ok(ToolResult::ok(
+                "No skills installed. Create a `.agent/skills/<name>/SKILL.md` (project) or `~/.zeus/skills/<name>/SKILL.md` (user).",
+            ));
+        }
+        let mut lines = Vec::new();
+        for skill in skills {
+            let hay = format!(
+                "{} {} {:?}",
+                skill.name, skill.description, skill.tags
+            )
+            .to_lowercase();
+            if !search.is_empty() && !hay.contains(&search) {
+                continue;
+            }
+            let tier = skill.tier.label();
+            let tags = if skill.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", skill.tags.join(", "))
+            };
+            lines.push(format!(
+                "[{tier}] {name} — {desc}{tags}",
+                name = skill.name,
+                desc = if skill.description.is_empty() {
+                    "(no description)"
+                } else {
+                    &skill.description
+                },
+                tags = tags,
+            ));
+        }
+        if lines.is_empty() {
+            Ok(ToolResult::ok(format!(
+                "No skills match '{search}'. Run list_skills with no search to see everything."
+            )))
+        } else {
+            Ok(ToolResult::ok(format!(
+                "Available skills (call read_skill with the name to load one):\n{}",
+                lines.join("\n")
+            )))
+        }
+    }
+
+    /// `read_skill` — load a skill's SKILL.md body (+ bundled resources),
+    /// and optionally its `depends_on` chain so one call can compose a whole
+    /// workflow (e.g. database → backend → frontend → security → testing).
+    fn do_read_skill(&self, args: &Value) -> Result<ToolResult> {
+        let name = Self::str_arg(args, "name")?.to_lowercase();
+        use crate::skills::{read_skill_resource, skill_resources};
+        let include_resources = Self::opt_bool_arg(args, "include_resources").unwrap_or(true);
+        let recursive = Self::opt_bool_arg(args, "recursive").unwrap_or(true);
+        let all = self.all_skills();
+        // Resolve the skill plus its dependency closure (BFS, cycle-safe).
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        queue.push_back(name.clone());
+        let mut ordered: Vec<crate::skills::Skill> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        while let Some(n) = queue.pop_front() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            match all.iter().find(|s| s.name == n) {
+                Some(skill) => {
+                    ordered.push(skill.clone());
+                    if recursive {
+                        for dep in &skill.depends_on {
+                            if !seen.contains(dep) {
+                                queue.push_back(dep.clone());
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if n != name {
+                        missing.push(n);
+                    }
+                }
+            }
+        }
+        if ordered.is_empty() {
+            let available: Vec<String> = all.iter().map(|s| s.name.clone()).collect();
+            return Ok(ToolResult::err(format!(
+                "unknown skill '{name}'. Available: {}",
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            )));
+        }
+        let mut out = String::new();
+        for skill in ordered {
+            out.push_str(&format!(
+                "# skill: {} (tier: {})\n\n{}",
+                skill.name,
+                skill.tier.label(),
+                skill.instructions
+            ));
+            if !skill.depends_on.is_empty() {
+                out.push_str(&format!(
+                    "\n*(composes: {})*\n",
+                    skill.depends_on.join(", ")
+                ));
+            }
+            if !skill.resources_are_empty() {
+                let resources = skill_resources(&skill);
+                if include_resources {
+                    let mut inline = String::new();
+                    for res in &resources {
+                        if let Some(content) = read_skill_resource(&skill, res) {
+                            inline.push_str(&format!("\n--- {res} ---\n{content}\n"));
+                        }
+                    }
+                    out.push_str(&format!(
+                        "\n## bundled resources ({})\n{}\n{}",
+                        resources.join(", "),
+                        resources.join(", "),
+                        inline
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "\n## bundled resources ({})\n",
+                        resources.join(", ")
+                    ));
+                }
+            }
+            out.push('\n');
+        }
+        if !missing.is_empty() {
+            out.push_str(&format!(
+                "\n*(note: depended-on skill(s) not found: {})*\n",
+                missing.join(", ")
+            ));
+        }
+        Ok(ToolResult::ok(out))
+    }
+
+    /// `read_document` — extract text from office/binaries so the model can
+    /// read specs, reports, spreadsheets and slide decks.
+    fn do_read_document(&self, args: &Value) -> Result<ToolResult> {
+        let path = Self::str_arg(args, "path")?;
+        let max_chars = Self::usize_arg(args, "max_chars").unwrap_or(100_000).max(1000);
+        let root = self.workspace.project_root.clone();
+        let resolved = match zeus_fs::resolve_in_project(&root, Path::new(path)) {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::err(e.to_string())),
+        };
+        match crate::docread::extract(&resolved, max_chars) {
+            Ok(doc) => {
+                let mut text =
+                    format!("# {} — {}\n\n{}", resolved.display(), doc.summary, doc.text);
+                if text.chars().count() > max_chars {
+                    text = text.chars().take(max_chars).collect::<String>();
+                    text.push_str("\n…(truncated by tool cap)");
+                }
+                Ok(ToolResult::ok(text))
+            }
+            Err(e) => Ok(ToolResult::err(format!(
+                "could not extract {}: {e}",
+                resolved.display()
+            ))),
+        }
+    }
+
+    /// `read_image` — expose a local image's bytes to a vision-capable model.
+    /// The binary data rides along on the ToolResult so the agent loop can
+    /// attach it as a multimodal image part on the next request.
+    fn do_read_image(&self, args: &Value) -> Result<ToolResult> {
+        use base64::Engine;
+        use zeus_provider::ImagePart;
+
+        let path = Self::str_arg(args, "path")?;
+        let root = self.workspace.project_root.clone();
+        let resolved = match zeus_fs::resolve_in_project(&root, Path::new(path)) {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::err(e.to_string())),
+        };
+        let bytes = match std::fs::read(&resolved) {
+            Ok(b) => b,
+            Err(e) => return Ok(ToolResult::err(format!("could not read {}: {e}", resolved.display()))),
+        };
+        // Only raster formats are safe to hand to a vision model.
+        let mime = image_mime(&resolved);
+        let Some(mime) = mime else {
+            return Ok(ToolResult::err(format!(
+                "{} is not a supported image format (png/jpg/jpeg/gif/webp/bmp)",
+                resolved.display()
+            )));
+        };
+        if bytes.is_empty() {
+            return Ok(ToolResult::err(format!("{} is empty", resolved.display())));
+        }
+        let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let kb = bytes.len() as f64 / 1024.0;
+        Ok(ToolResult {
+            content: format!(
+                "Read image {} ({mime}, {kb:.0} KiB). The image data itself is attached to this message — describe what you see and use it as the design source.",
+                resolved.display(),
+            ),
+            is_error: false,
+            images: vec![ImagePart { mime_type: mime.to_string(), data_base64 }],
+        })
+    }
+
+    /// `understand_repo` — deterministic project understanding + (optionally)
+    /// existing files relevant to a subject. No model call; the fingerprint
+    /// is cached on the agent and shared so repeated calls are cheap.
+    fn do_understand_repo(&self, args: &Value) -> Result<ToolResult> {
+        let topic = Self::str_arg(args, "topic").unwrap_or_default();
+        let root = self.project_root();
+        let fp = match &self.repo {
+            Some(fp) => fp.clone(),
+            None => crate::project::load_or_analyze(&root),
+        };
+        let text = if topic.trim().is_empty() {
+            format!("Repository understanding:\n{}", fp.banner_lines().join("\n"))
+        } else {
+            fp.render(&topic)
+        };
+        Ok(ToolResult::ok(text))
+    }
+
+    /// `memory` — list or read a long-term project memory note.
+    fn do_memory(&self, args: &Value) -> Result<ToolResult> {
+        let action = Self::str_arg(args, "action")?.to_ascii_lowercase();
+        let root = self.project_root();
+        match action.as_str() {
+            "list" => {
+                let idx = crate::project::memory_index(&root);
+                if idx.is_empty() {
+                    return Ok(ToolResult::ok(
+                        "No long-term memory yet. Use `memory_write` to persist a decision/convention/gotcha across sessions.",
+                    ));
+                }
+                let lines: Vec<String> = idx
+                    .iter()
+                    .map(|(n, first)| format!("- {n}: {first}"))
+                    .collect();
+                Ok(ToolResult::ok(format!(
+                    ".agent/memory/ notes ({}):\n{}",
+                    idx.len(),
+                    lines.join("\n")
+                )))
+            }
+            "read" => {
+                let name = Self::str_arg(args, "name")?;
+                match crate::project::memory_read(&root, name) {
+                    Some(body) => Ok(ToolResult::ok(format!(".agent/memory/{name}.md:\n{body}"))),
+                    None => Ok(ToolResult::err(format!(
+                        "no memory note named `{name}`"
+                    ))),
+                }
+            }
+            other => Ok(ToolResult::err(format!(
+                "unknown memory action `{other}` (expected list|read)"
+            ))),
+        }
+    }
+
+    /// `memory_write` — persist a long-term project memory note.
+    fn do_memory_write<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        let name = Self::str_arg(args, "name")?;
+        let content = Self::str_arg(args, "content")?.to_string();
+        let path_name = match crate::project::safe_memory_name(name) {
+            Some(safe) => safe,
+            None => {
+                return Ok(ToolResult::err(
+                    "invalid memory name (letters, digits, `-`, `_`)",
+                ))
+            }
+        };
+        let rel = format!(".agent/memory/{path_name}.md");
+        match self.workspace.files.write(
+            Path::new(&rel),
+            &content,
+            WriteOptions::default(),
+            &mut *approver,
+        ) {
+            Ok(()) => Ok(ToolResult::ok(format!("wrote .agent/memory/{path_name}.md"))),
+            Err(e) => Ok(ToolResult::err(e.to_string())),
         }
     }
 
@@ -2893,7 +3537,7 @@ fn device_result(out: zeus_fs::DeviceOutput) -> ToolResult {
 /// Detect the most likely test command for a project by looking at its
 /// manifests. Best-effort; the tool falls back to an explicit override when
 /// nothing matches.
-fn detect_test_command(root: &Path) -> Option<String> {
+pub(crate) fn detect_test_command(root: &Path) -> Option<String> {
     let dir = |name: &str| root.join(name);
     // Ordered by likelihood/portability. `cargo test` and `go test ./...`
     // are the two that never need an extra runner installed.
@@ -2996,9 +3640,120 @@ fn open_browser_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Map an image file extension to its MIME type; `None` for non-raster
+/// formats that a vision model cannot ingest.
+fn image_mime(path: &Path) -> Option<&'static str> {
+    let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" | "jpe" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+/// Returns `Some(reason)` if `url` points at a loopback/private target that
+/// `web_fetch` should refuse to scrape (the fetch tool retrieves content for
+/// the model, so pointing it at the user's local services would leak them).
+fn reject_web_target(url: &str) -> Option<String> {
+    let host = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let host = host.rsplit('@').next().unwrap_or("").trim();
+    let host = host.trim_matches(|c| c == '[' || c == ']'); // IPv6 brackets
+    if host.is_empty() {
+        return Some("no host in url".into());
+    }
+    for bad in [
+        "localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", "169.254.169.254", "metadata.google.internal",
+    ] {
+        if host == bad {
+            return Some(format!("'{host}' resolves to the loopback/metadata services"));
+        }
+    }
+    None
+}
+
+/// Public alias for the doc-extraction module to reuse.
+pub(crate) fn strip_html_pub(html: &str) -> String {
+    strip_html(html)
+}
+
+/// Crude-but-effective HTML → text: drops scripts/styles/head, then tags,
+/// then decodes common entities and collapses whitespace. Good enough for
+/// scraping docs/pages into something the model can read.
+fn strip_html(html: &str) -> String {
+    let mut clipped: String = html.to_string();
+    for (open_tag, close_tag) in [("<script", "</script"), ("<style", "</style")] {
+        let mut buffer = String::with_capacity(clipped.len());
+        let mut rest = clipped.as_str();
+        while let Some(start) = rest.find(open_tag) {
+            buffer.push_str(&rest[..start]);
+            rest = &rest[start..];
+            match rest.find(close_tag) {
+                Some(end) => rest = &rest[end..],
+                None => break,
+            }
+        }
+        buffer.push_str(rest);
+        clipped = buffer;
+    }
+    let without_tags = clipped;
+    let mut text = String::with_capacity(without_tags.len());
+    for seg in without_tags.split('<') {
+        match seg.find('>') {
+            Some(idx) if !seg[..idx].trim().is_empty() => text.push('\n'),
+            _ => {}
+        }
+        if let Some(idx) = seg.find('>') {
+            text.push_str(&seg[idx + 1..]);
+        } else {
+            text.push_str(seg);
+        }
+    }
+    for (entity, ch) in [
+        ("&amp;", '&'),
+        ("&lt;", '<'),
+        ("&gt;", '>'),
+        ("&quot;", '"'),
+        ("&#39;", '\''),
+        ("&nbsp;", ' '),
+    ] {
+        text = text.replace(entity, &ch.to_string());
+    }
+    let text = text.replace('\r', "");
+    text.split('\n')
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Percent-encode a string for use inside a URL query value.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use tempfile::TempDir;
     use zeus_config::{AgentSettings, Config, GlobalPaths, ProvidersFile};
 
@@ -3116,6 +3871,241 @@ mod tests {
             .dispatch_with_approver("frobnicate", "{}", approve)
             .unwrap_err();
         assert!(matches!(err, AgentError::UnknownTool(_)));
+    }
+
+    #[test]
+    fn builtin_skills_are_listed_and_readable() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        // list_skills includes all shipped built-ins.
+        let listed = tm
+            .dispatch_with_approver("list_skills", "{}", approve)
+            .unwrap();
+        assert!(!listed.is_error, "{}", listed.content);
+        assert!(listed.content.contains("build-app"));
+        assert!(listed.content.contains("database"));
+        assert!(listed.content.contains("ui-design"));
+        // Search narrows the catalog.
+        let searched = tm
+            .dispatch_with_approver("list_skills", r#"{"search":"xlsx"}"#, approve)
+            .unwrap();
+        assert!(!searched.is_error);
+        assert!(searched.content.contains("document-reading"));
+        assert!(!searched.content.contains("build-app"));
+        // read_skill loads instructions.
+        let read = tm
+            .dispatch_with_approver("read_skill", r#"{"name":"git-workflows"}"#, approve)
+            .unwrap();
+        assert!(!read.is_error, "{}", read.content);
+        assert!(read.content.contains("Before committing"));
+        // Unknown skill errors.
+        let missing = tm
+            .dispatch_with_approver("read_skill", r#"{"name":"nope"}"#, approve)
+            .unwrap();
+        assert!(missing.is_error);
+    }
+
+    #[test]
+    fn read_skill_recursively_composes_depends_on_chain() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        // build-app composes project-orientation, database, api, frontend,
+        // security, qa-testing, documentation — a single read_skill call
+        // loads the whole chain.
+        let r = tm
+            .dispatch_with_approver("read_skill", r#"{"name":"build-app","recursive":true}"#, approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("skill: build-app"));
+        assert!(r.content.contains("skill: database"));
+        assert!(r.content.contains("skill: api"));
+        assert!(r.content.contains("skill: frontend"));
+        assert!(r.content.contains("skill: security"));
+        assert!(r.content.contains("skill: qa-testing"));
+        assert!(r.content.contains("skill: documentation"));
+        assert!(r.content.contains("skill: project-orientation"));
+    }
+
+    #[test]
+    fn project_skill_shadows_builtin() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join(".agent/skills/database")).unwrap();
+        std::fs::write(
+            root.join(".agent/skills/database/SKILL.md"),
+            "---\nname: database\ndescription: PROJECT-OVERRIDE\n---\n# Project DB rules",
+        )
+        .unwrap();
+        let tm = tool_manager(&root);
+        let read = tm
+            .dispatch_with_approver("read_skill", r#"{"name":"database"}"#, approve)
+            .unwrap();
+        assert!(!read.is_error);
+        assert!(!read.content.contains("Design schemas, SQL, and migrations"));
+        assert!(read.content.contains("Project DB rules"));
+        assert!(read.content.contains("skill: database (tier: project)"));
+    }
+
+    #[test]
+    fn read_document_extracts_text_and_errors_on_binary() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.md"), "# Notes\n\nplain markdown text here").unwrap();
+        let tm = tool_manager(&root);
+
+        let r = tm
+            .dispatch_with_approver("read_document", r#"{"path":"notes.md"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("plain markdown text here"));
+
+        let missing = tm
+            .dispatch_with_approver("read_document", r#"{"path":"nope.pdf"}"#, approve)
+            .unwrap();
+        assert!(missing.is_error);
+    }
+
+    #[test]
+    fn read_image_attaches_base64_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        // 1x1 transparent PNG.
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+            .unwrap();
+        std::fs::write(root.join("pixel.png"), &png).unwrap();
+        let tm = tool_manager(&root);
+
+        let r = tm
+            .dispatch_with_approver("read_image", r#"{"path":"pixel.png"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(r.images.len(), 1);
+        assert_eq!(r.images[0].mime_type, "image/png");
+        assert!(!r.images[0].data_base64.is_empty());
+
+        // Non-image / missing paths error cleanly.
+        let bad = tm
+            .dispatch_with_approver("read_image", r#"{"path":"pixel.txt"}"#, approve)
+            .unwrap();
+        assert!(bad.is_error);
+        let missing = tm
+            .dispatch_with_approver("read_image", r#"{"path":"absent.png"}"#, approve)
+            .unwrap();
+        assert!(missing.is_error);
+    }
+
+    #[test]
+    fn understand_repo_reports_stack_and_relevance() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join("src/auth")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"x\"\n[dependencies]\naxum=\"0.7\"\nsqlx=\"0.8\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("src/auth/login.rs"), "pub fn login() {}").unwrap();
+        let tm = tool_manager(&root);
+
+        let r = tm
+            .dispatch_with_approver("understand_repo", r#"{"topic":"authentication"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("Repository understanding"));
+        assert!(r.content.contains("Axum"));
+        assert!(r.content.contains("authentication") || r.content.contains("auth"));
+
+        let no_topic = tm
+            .dispatch_with_approver("understand_repo", "{}", approve)
+            .unwrap();
+        assert!(!no_topic.is_error);
+        assert!(no_topic.content.contains("Rust"));
+    }
+
+    #[test]
+    fn urlencode_encodes_query() {
+        assert_eq!(urlencode("offline sync"), "offline+sync");
+        assert_eq!(urlencode("a&b?"), "a%26b%3F");
+        assert_eq!(urlencode("rust"), "rust");
+    }
+
+    #[test]
+    fn web_search_rejects_empty_query() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let tm = tool_manager(&root);
+        let r = tm
+            .dispatch_with_approver("web_search", r#"{"query":""}"#, approve)
+            .unwrap();
+        assert!(r.is_error);
+        assert!(r.content.contains("non-empty"));
+        let missing = tm.dispatch_with_approver("web_search", "{}", approve);
+        assert!(missing.is_err(), "missing `query` should surface as a dispatch error");
+    }
+
+#[test]
+    fn web_search_is_read_only_tool() {
+        assert!(is_read_only_tool("web_search"), "web_search must run in plan mode");
+        assert!(is_read_only_tool("web_fetch"));
+        assert!(!is_read_only_tool("bash"));
+    }
+
+    #[test]
+    fn memory_tools_list_read_write() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let tm = tool_manager(&root);
+        let approve = |_p: &PermissionRequest| ApprovalDecision::Approved;
+
+        let empty = tm
+            .dispatch_with_approver("memory", r#"{"action":"list"}"#, approve)
+            .unwrap();
+        assert!(!empty.is_error);
+        assert!(empty.content.contains("No long-term memory"));
+
+        let w = tm
+            .dispatch_with_approver("memory_write", r#"{"name":"auth","content":"token-based auth"}"#, approve)
+            .unwrap();
+        assert!(!w.is_error, "{}", w.content);
+        let path = root.join(".agent/memory/auth.md");
+        assert!(path.exists());
+
+        let list = tm
+            .dispatch_with_approver("memory", r#"{"action":"list"}"#, approve)
+            .unwrap();
+        assert!(list.content.contains("auth"));
+
+        let read = tm
+            .dispatch_with_approver("memory", r#"{"action":"read","name":"auth"}"#, approve)
+            .unwrap();
+        assert!(read.content.contains("token-based"));
+
+        let bad_name = tm
+            .dispatch_with_approver("memory_write", r#"{"name":"BAD NAME","content":"x"}"#, approve)
+            .unwrap();
+        assert!(bad_name.is_error);
+    }
+
+    #[test]
+    fn memory_tools_blocked_in_plan_mode() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let tm = tool_manager(&root);
+        tm.set_plan_mode(true);
+        let approve = |_p: &PermissionRequest| ApprovalDecision::Approved;
+        let r = tm
+            .dispatch_with_approver("memory_write", r#"{"name":"x","content":"y"}"#, approve)
+            .unwrap();
+        assert!(r.is_error, "memory_write must be blocked in plan mode");
     }
 
     #[test]

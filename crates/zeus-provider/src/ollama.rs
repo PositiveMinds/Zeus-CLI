@@ -114,6 +114,13 @@ fn to_ollama_message(m: &Message) -> Value {
             .collect();
         obj["tool_calls"] = json!(calls);
     }
+    if !m.images.is_empty() {
+        obj["images"] = json!(m
+            .images
+            .iter()
+            .map(|img| img.data_base64.clone())
+            .collect::<Vec<_>>());
+    }
     obj
 }
 
