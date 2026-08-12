@@ -34,3 +34,8 @@ Thumbs.db
 # Standalone UI/design prototypes (not part of the zeus project)
 /supercode ui/
 *.webp
+
+# npm platform packages — the release workflow drops the actual prebuilt
+# binary into each of these right before `npm publish`; never checked in.
+npm/zeus-code-*/bin/zeus
+npm/zeus-code-*/bin/zeus.exe

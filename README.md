@@ -20,6 +20,14 @@ are attached to each [release](https://github.com/PositiveMinds/Zeus-CLI-release
 The binaries are published from the private source repo to this public mirror, so
 no Rust toolchain is required to install.
 
+**npm** (any platform, if you already have Node — this is the cleanest option):
+```bash
+npm install -g zeus-code
+```
+Installs a small wrapper that fetches the right prebuilt binary for your OS/arch
+as an optional dependency (same trick esbuild/swc/opencode use) — see
+[`npm/README.md`](./npm/README.md) for how the packages are built and published.
+
 **PowerShell** (Windows 10/11):
 ```powershell
 irm https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI-releases/main/install.ps1 | iex
@@ -30,9 +38,16 @@ irm https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI-releases/main/insta
 curl -L https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI-releases/main/install.bat | cmd
 ```
 
-Either installer puts `zeus` in `%LOCALAPPDATA%\zeus` and adds it to your user
-PATH. Pin a specific version with `$env:ZEUS_VERSION = "0.1.0"` before running the
-PowerShell installer.
+Either Windows installer puts `zeus` in `%LOCALAPPDATA%\zeus` and adds it to your
+user PATH. Pin a specific version with `$env:ZEUS_VERSION = "0.1.0"` before running
+the PowerShell installer.
+
+**macOS / Linux**:
+```bash
+curl -fsSL https://raw.githubusercontent.com/PositiveMinds/Zeus-CLI-releases/main/install.sh | sh
+```
+Puts `zeus` in `~/.local/share/zeus/bin` and prints a one-time PATH hint. Pin a
+specific version with `ZEUS_VERSION=0.1.0 curl ... | sh`.
 
 **From source** (all platforms, requires Rust):
 ```bash

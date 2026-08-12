@@ -13,19 +13,128 @@ const CODE_BG: Color = Color::Rgb(0x0c, 0x0f, 0x16);
 /// reads as its own thing rather than reusing an unrelated marker color.
 const INLINE_CODE_FG: Color = Color::Rgb(0xe0, 0xaf, 0x68);
 
+/// Fenced-code syntax theme — magenta/purple keywords, warm tan strings,
+/// muted green comments, soft-green numbers, cyan function names, on the
+/// same dark background the rest of a code block uses. Picked to match a
+/// specific reference screenshot rather than any bundled syntect theme
+/// (the closest built-in, base16-ocean, doesn't have the purple keyword —
+/// hence a small hand-built `.tmTheme` instead of `ThemeSet::load_defaults`).
+const CODE_THEME_TMTHEME: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>name</key>
+	<string>zeus-dark</string>
+	<key>settings</key>
+	<array>
+		<dict>
+			<key>settings</key>
+			<dict>
+				<key>background</key>
+				<string>#0C0F16</string>
+				<key>foreground</key>
+				<string>#D4D4D4</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>scope</key>
+			<string>comment</string>
+			<key>settings</key>
+			<dict>
+				<key>foreground</key>
+				<string>#6A7280</string>
+				<key>fontStyle</key>
+				<string>italic</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>scope</key>
+			<string>keyword, keyword.control, storage.type, storage.modifier, keyword.operator.word</string>
+			<key>settings</key>
+			<dict>
+				<key>foreground</key>
+				<string>#C586C0</string>
+				<key>fontStyle</key>
+				<string>italic</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>scope</key>
+			<string>string</string>
+			<key>settings</key>
+			<dict>
+				<key>foreground</key>
+				<string>#CE9178</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>scope</key>
+			<string>constant.numeric, constant.language</string>
+			<key>settings</key>
+			<dict>
+				<key>foreground</key>
+				<string>#B5CEA8</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>scope</key>
+			<string>entity.name.function, support.function, meta.function-call</string>
+			<key>settings</key>
+			<dict>
+				<key>foreground</key>
+				<string>#58C0FF</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>scope</key>
+			<string>entity.name.class, entity.name.type, support.type, support.class</string>
+			<key>settings</key>
+			<dict>
+				<key>foreground</key>
+				<string>#4EC9B0</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>scope</key>
+			<string>variable.parameter</string>
+			<key>settings</key>
+			<dict>
+				<key>foreground</key>
+				<string>#9CDCFE</string>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>
+"##;
+
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
+static CODE_THEME: OnceLock<Theme> = OnceLock::new();
 
 fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
 fn theme() -> &'static Theme {
-    THEME_SET
-        .get_or_init(ThemeSet::load_defaults)
-        .themes
-        .get("base16-ocean.dark")
-        .expect("default syntect theme present")
+    CODE_THEME.get_or_init(|| {
+        match ThemeSet::load_from_reader(&mut std::io::Cursor::new(CODE_THEME_TMTHEME.as_bytes())) {
+            Ok(t) => t,
+            // A broken embedded .tmTheme (a plist typo, a bad hex color —
+            // exactly the class of mistake this hand-authored string has
+            // already had once) would otherwise panic the whole app the
+            // first time any fenced code block renders, rather than at
+            // startup where it'd be caught immediately. Degrade to the
+            // bundled default instead of taking the app down over syntax
+            // highlighting colors.
+            Err(e) => {
+                eprintln!("warning: embedded zeus-dark .tmTheme failed to parse ({e}), falling back to default theme");
+                ThemeSet::load_defaults()
+                    .themes
+                    .remove("base16-ocean.dark")
+                    .expect("syntect's bundled base16-ocean.dark theme exists")
+            }
+        }
+    })
 }
 
 fn rat_color(c: SC) -> Color {
@@ -323,13 +432,29 @@ mod tests {
 // Diff rendering
 // ---------------------------------------------------------------------------
 
-const ADD_FG: Color = Color::Rgb(0x5a, 0xaf, 0x8a);
-const DEL_FG: Color = Color::Rgb(0xe0, 0x61, 0x71);
+// Colors + whole-line tint strength picked to match a specific reference
+// screenshot: a fairly visible dark-teal bar behind added lines and a
+// dark-maroon bar behind removed ones (not the barely-there tint this used
+// to be), with off-white body text and a brighter sign color for the
+// leading `+`/`-` itself.
+const ADD_FG: Color = Color::Rgb(0xd4, 0xf5, 0xe8);
+const DEL_FG: Color = Color::Rgb(0xf5, 0xd9, 0xe0);
 const HUNK_FG: Color = Color::Rgb(0x56, 0xb6, 0xc2);
 const META_FG: Color = Color::Rgb(0x8f, 0x9b, 0xb0);
-const ADD_BG: Color = Color::Rgb(0x0c, 0x12, 0x0e);
-const DEL_BG: Color = Color::Rgb(0x16, 0x0e, 0x10);
+// Brightened from the original #0d2b28/#331224 — those sat at almost
+// exactly `tui::theme::CARD_BG`'s luminance (contrast ~1.05:1), so a diff
+// tint inside a tool-result card was separated from the card background by
+// hue alone. Foreground text stays comfortably legible on the brighter
+// versions (still 10:1+); the leading sign color's contrast was the actual
+// limit on how far these could move (see `ADD_SIGN_FG`/`DEL_SIGN_FG`).
+const ADD_BG: Color = Color::Rgb(0x16, 0x3d, 0x37);
+const DEL_BG: Color = Color::Rgb(0x50, 0x1d, 0x38);
 const HUNK_BG: Color = Color::Rgb(0x0a, 0x18, 0x1d);
+// Brighter than `ADD_FG`/`DEL_FG` — just the leading `+`/`-` marker gets
+// this, so it reads as a distinct "sign" against the softer body-text
+// color, the way a gutter marker does in an editor's diff view.
+const ADD_SIGN_FG: Color = Color::Rgb(0x4d, 0xe3, 0xb0);
+const DEL_SIGN_FG: Color = Color::Rgb(0xf0, 0x6a, 0x9a);
 
 /// Heuristic: is this text a unified diff we should pass to `diff_lines`?
 pub fn looks_like_diff(text: &str) -> bool {
@@ -345,10 +470,48 @@ pub fn looks_like_diff(text: &str) -> bool {
         })
 }
 
+/// A changed line's background tint should read as a solid bar across the
+/// available width (like an editor's diff gutter), not just hug the text —
+/// this pads short lines with trailing spaces so the `bg` color fills the
+/// row. `width` is a best-effort target: callers that already know the live
+/// render width pass it exactly, callers that don't (e.g. `compute_lines`,
+/// memoized independent of terminal size) pass a fixed reasonable default.
+fn pad_to(line: &str, width: usize) -> String {
+    let len = line.chars().count();
+    if len >= width {
+        line.to_string()
+    } else {
+        format!("{line}{}", " ".repeat(width - len))
+    }
+}
+
+/// A changed line's leading `+`/`-` gets a brighter "sign" color than the
+/// rest of the line, both sharing the same background tint — reads as a
+/// distinct gutter marker rather than one flat-colored run of text.
+fn diff_body_spans(line: &str, sign_fg: Color, body_fg: Color, bg: Color, width: usize) -> Vec<Span<'static>> {
+    let mut chars = line.chars();
+    let sign = chars.next().unwrap_or(' ');
+    let rest: String = chars.collect();
+    let padded_rest = pad_to(&format!("{sign}{rest}"), width);
+    let rest_with_pad = padded_rest.chars().skip(1).collect::<String>();
+    vec![
+        Span::styled(sign.to_string(), Style::default().fg(sign_fg).bg(bg).add_modifier(Modifier::BOLD)),
+        Span::styled(rest_with_pad, Style::default().fg(body_fg).bg(bg)),
+    ]
+}
+
+/// Fixed fallback width for callers that can't supply the live render width
+/// (diff bodies rendered from `compute_lines`, which is memoized independent
+/// of terminal size) — wide enough to fully tint the vast majority of real
+/// terminal widths; harmless overshoot on anything wider just means the tint
+/// doesn't quite reach the far edge.
+pub const DIFF_DEFAULT_WIDTH: usize = 120;
+
 /// Colorize a unified diff into styled spans for the TUI. Lines are colored by
 /// their leading marker: `+` green, `-` red, `@@` hunks cyan, file metadata
 /// (diff/---/+++/index/new file) dim, unchanged lines keep `plain_style`.
-pub fn diff_lines(text: &str, plain_style: Style) -> Vec<Vec<Span<'static>>> {
+/// `width` sets how far the changed-line background tint extends.
+pub fn diff_lines(text: &str, plain_style: Style, width: usize) -> Vec<Vec<Span<'static>>> {
     text.lines()
         .map(|l| {
             let tag = l.chars().next().unwrap_or(' ');
@@ -371,9 +534,9 @@ pub fn diff_lines(text: &str, plain_style: Style) -> Vec<Vec<Span<'static>>> {
                 '#' if l.starts_with("Binary files ") => {
                     vec![Span::styled(l.to_string(), Style::default().fg(META_FG))]
                 }
-                '+' => vec![Span::styled(l.to_string(), Style::default().fg(ADD_FG).bg(ADD_BG))],
-                '-' => vec![Span::styled(l.to_string(), Style::default().fg(DEL_FG).bg(DEL_BG))],
-                '@' => vec![Span::styled(l.to_string(), Style::default().fg(HUNK_FG).bg(HUNK_BG))],
+                '+' => diff_body_spans(l, ADD_SIGN_FG, ADD_FG, ADD_BG, width),
+                '-' => diff_body_spans(l, DEL_SIGN_FG, DEL_FG, DEL_BG, width),
+                '@' => vec![Span::styled(pad_to(l, width), Style::default().fg(HUNK_FG).bg(HUNK_BG))],
                 _ => vec![Span::styled(l.to_string(), plain_style)],
             };
             spans

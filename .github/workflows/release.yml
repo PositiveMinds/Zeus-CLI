@@ -100,13 +100,95 @@ jobs:
       - name: Create/Update release (public mirror)
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          # `inputs.tag` only exists on a manual `workflow_dispatch` run (and
+          # even then only when the field was filled in) — a plain `git push
+          # --tags` never sets it, so falling back to `github.ref_name` (the
+          # pushed tag itself) is required or this resolves to an empty
+          # string and every `gh release` call below operates on tag "".
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          if gh release view "${{ inputs.tag }}" --repo PositiveMinds/Zeus-CLI-releases >/dev/null 2>&1; then
-            gh release upload "${{ inputs.tag }}" dist/* \
+          if gh release view "$TAG" --repo PositiveMinds/Zeus-CLI-releases >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* \
               --repo PositiveMinds/Zeus-CLI-releases --clobber
           else
-            gh release create "${{ inputs.tag }}" dist/* \
+            gh release create "$TAG" dist/* \
               --repo PositiveMinds/Zeus-CLI-releases \
-              --title "${{ inputs.tag }}" \
-              --notes "Prebuilt binaries for Zeus ${{ inputs.tag }}."
+              --title "$TAG" \
+              --notes "Prebuilt binaries for Zeus $TAG."
           fi
+
+  publish-npm:
+    name: Publish npm packages
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      # The Windows archive is a zip whose entries sit at its root (built via
+      # `Compress-Archive -Path "$staging/*"`); the Unix archives are tarballs
+      # of the whole staging *directory* (built via `tar -czf ... "$staging"`),
+      # so `zeus` lands nested one level down at `zeus-<target>/zeus` instead.
+      - name: Extract binaries into platform packages
+        run: |
+          set -eu
+          mkdir -p extract/win extract/linux extract/mac-x64 extract/mac-arm64
+          unzip -q dist/zeus-x86_64-pc-windows-msvc.zip -d extract/win
+          tar -xzf dist/zeus-x86_64-unknown-linux-gnu.tar.gz -C extract/linux
+          tar -xzf dist/zeus-x86_64-apple-darwin.tar.gz -C extract/mac-x64
+          tar -xzf dist/zeus-aarch64-apple-darwin.tar.gz -C extract/mac-arm64
+
+          cp extract/win/zeus.exe npm/zeus-code-windows-x64/bin/zeus.exe
+          cp extract/linux/zeus-x86_64-unknown-linux-gnu/zeus npm/zeus-code-linux-x64/bin/zeus
+          cp extract/mac-x64/zeus-x86_64-apple-darwin/zeus npm/zeus-code-darwin-x64/bin/zeus
+          cp extract/mac-arm64/zeus-aarch64-apple-darwin/zeus npm/zeus-code-darwin-arm64/bin/zeus
+          chmod +x npm/zeus-code-linux-x64/bin/zeus npm/zeus-code-darwin-x64/bin/zeus npm/zeus-code-darwin-arm64/bin/zeus
+
+      - name: Sync package versions to the release tag
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          version="${TAG#v}"
+          for dir in npm/zeus-code npm/zeus-code-windows-x64 npm/zeus-code-linux-x64 npm/zeus-code-darwin-x64 npm/zeus-code-darwin-arm64; do
+            node -e "
+              const fs = require('fs');
+              const path = process.argv[1] + '/package.json';
+              const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+              pkg.version = process.argv[2];
+              for (const dep of Object.keys(pkg.optionalDependencies || {})) {
+                pkg.optionalDependencies[dep] = process.argv[2];
+              }
+              fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            " "$dir" "$version"
+          done
+
+      # No NPM_TOKEN secret configured yet is expected, not an error — this
+      # step is a no-op until one's added (see npm/README.md for the manual
+      # first-publish path, and for how to add the secret).
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN secret not set — skipping npm publish."
+            echo "See npm/README.md to publish by hand, or add the secret to publish automatically from now on."
+            exit 0
+          fi
+          # Platform packages first — the main package's optionalDependencies
+          # pin exact versions of these, so they must exist before it does.
+          for dir in npm/zeus-code-windows-x64 npm/zeus-code-linux-x64 npm/zeus-code-darwin-x64 npm/zeus-code-darwin-arm64 npm/zeus-code; do
+            (cd "$dir" && npm publish --access public)
+          done

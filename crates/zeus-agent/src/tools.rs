@@ -53,6 +53,27 @@ impl ToolResult {
 pub fn builtin_tool_specs() -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
+            name: "todowrite".into(),
+            description: "Replace your own progress checklist for this session with the given list — call this whenever you break a request into multiple steps, and again every time a step's status changes. You own this list entirely: pass the FULL list every time (not a diff), including items already completed. Mark exactly one item in_progress at a time (the one you're actively working on), never more; mark an item completed only once you've actually verified it, not just attempted it. Skip this tool for a single trivial action.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "Short imperative description of the step"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["todos"]
+            }),
+        },
+        ToolSpec {
             name: "read".into(),
             description: "Read a project file (line-numbered output). The result is prefixed with the exact line window shown (e.g. lines 1-500 of 3200) — if it says the file continues, pass offset=<next line> to keep reading; never treat a partial read as the whole file.".into(),
             parameters: json!({
@@ -1413,6 +1434,10 @@ fn is_read_only_tool(name: &str) -> bool {
             | "git_remote_list"
             | "git_tag_list"
             | "git_stash_list"
+            // Pure bookkeeping, no filesystem/process side effects — safe
+            // to let a read-only Plan-mode turn use for progress tracking
+            // too, same as the reference product's own `todowrite` tool.
+            | "todowrite"
     )
 }
 
@@ -1534,6 +1559,19 @@ impl ToolManager {
         specs
     }
 
+    /// Read-only subset of `all_tool_specs` — used for a `delegate`d
+    /// specialist consultation, which is deliberately restricted to
+    /// inspecting the workspace and never mutating it regardless of what
+    /// that persona's own tool allow-list would otherwise permit: the
+    /// primary agent stays the only thing that writes/edits/runs, a
+    /// delegated specialist only ever gives it an informed opinion to act on.
+    pub fn read_only_tool_specs(&self) -> Vec<ToolSpec> {
+        self.all_tool_specs()
+            .into_iter()
+            .filter(|s| is_read_only_tool(&s.name))
+            .collect()
+    }
+
     /// Execute a named tool call with JSON-object arguments. Permission
     /// "ask" prompts are routed through `approver`. Wrapped by the
     /// `pre-tool-use` hook (can block or rewrite the arguments) and the
@@ -1571,7 +1609,22 @@ impl ToolManager {
         };
         let arguments = arguments.as_str();
 
-        let result = self.dispatch_inner(name, arguments, &mut approver)?;
+        let result = match self.dispatch_inner(name, arguments, &mut approver) {
+            Ok(r) => r,
+            // The model called a tool with bad/missing arguments, or a
+            // name that doesn't exist — its own mistake, and a recoverable
+            // one: report it back as a normal (failed) tool result so the
+            // model sees exactly what went wrong and can retry with
+            // corrected arguments in the same turn, rather than one bad
+            // call via `?` killing the entire turn outright with no way
+            // for the model to self-correct. Anything else (`Provider`/
+            // `Fs`/`Terminal`/`Session`/`Io`) is a real system failure a
+            // retry can't fix, and still aborts the turn as before.
+            Err(e @ (AgentError::InvalidArguments { .. } | AgentError::UnknownTool(_))) => {
+                ToolResult::err(e.to_string())
+            }
+            Err(e) => return Err(e),
+        };
 
         Ok(match self.hooks.run_post_tool_use(
             name,
@@ -1594,6 +1647,7 @@ impl ToolManager {
     {
         let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
         match name {
+            "todowrite" => self.do_todowrite(&args),
             "read" => self.do_read(&args),
             "write" => self.do_write(&args, approver),
             "edit" => self.do_edit(&args, approver),
@@ -1859,6 +1913,33 @@ impl ToolManager {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default()
+    }
+
+    /// The actual checklist state update happens one layer up, in
+    /// `Agent::drive_turn` (it inspects this call's arguments after
+    /// dispatch and emits `AgentEvent::TodosUpdated`) — `ToolManager` has
+    /// no channel back to the UI, only validates the shape here and echoes
+    /// a summary the model can see in its own tool-result.
+    fn do_todowrite(&self, args: &Value) -> Result<ToolResult> {
+        let Some(todos) = args.get("todos").and_then(|v| v.as_array()) else {
+            return Ok(ToolResult::err("missing required \"todos\" array"));
+        };
+        for t in todos {
+            if t.get("content").and_then(|v| v.as_str()).is_none_or(str::is_empty) {
+                return Ok(ToolResult::err("each todo needs a non-empty \"content\" string"));
+            }
+            match t.get("status").and_then(|v| v.as_str()) {
+                Some("pending" | "in_progress" | "completed") => {}
+                _ => return Ok(ToolResult::err(
+                    "each todo needs \"status\" to be one of pending/in_progress/completed",
+                )),
+            }
+        }
+        let done = todos
+            .iter()
+            .filter(|t| t.get("status").and_then(|v| v.as_str()) == Some("completed"))
+            .count();
+        Ok(ToolResult::ok(format!("{done}/{} done", todos.len())))
     }
 
     fn do_read(&self, args: &Value) -> Result<ToolResult> {
@@ -3864,13 +3945,16 @@ mod tests {
 
     #[test]
     fn unknown_tool_errors() {
+        // Calling an unknown tool is the model's own mistake, and
+        // recoverable — it comes back as a failed `ToolResult` (so the
+        // model sees the mistake and can retry) rather than a hard `Err`
+        // that would kill the whole turn with no chance to self-correct.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("proj");
         let tm = tool_manager(&root);
-        let err = tm
-            .dispatch_with_approver("frobnicate", "{}", approve)
-            .unwrap_err();
-        assert!(matches!(err, AgentError::UnknownTool(_)));
+        let result = tm.dispatch_with_approver("frobnicate", "{}", approve).unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("frobnicate"));
     }
 
     #[test]
@@ -4046,8 +4130,12 @@ mod tests {
             .unwrap();
         assert!(r.is_error);
         assert!(r.content.contains("non-empty"));
-        let missing = tm.dispatch_with_approver("web_search", "{}", approve);
-        assert!(missing.is_err(), "missing `query` should surface as a dispatch error");
+        // Missing `query` is the model's own mistake, and recoverable —
+        // it comes back as a failed `ToolResult` (so the model sees the
+        // mistake and can retry) rather than a hard dispatch error that
+        // would kill the whole turn with no chance to self-correct.
+        let missing = tm.dispatch_with_approver("web_search", "{}", approve).unwrap();
+        assert!(missing.is_error, "missing `query` should surface as a failed tool result");
     }
 
 #[test]
@@ -4285,12 +4373,22 @@ mod tests {
         let root = tmp.path().join("proj");
         let tm = tool_manager(&root);
         for spec in builtin_tool_specs() {
-            let err = tm.dispatch_with_approver(&spec.name, "{}", approve);
-            // Missing required args should surface as InvalidArguments, not
-            // UnknownTool — proves the name is wired to a real handler.
-            if let Err(AgentError::UnknownTool(_)) = err {
-                panic!("tool spec '{}' has no handler", spec.name)
-            }
+            let result = tm.dispatch_with_approver(&spec.name, "{}", approve).unwrap();
+            // `dispatch_with_approver` now soft-fails both InvalidArguments
+            // and UnknownTool into `Ok(ToolResult::err(...))` instead of
+            // returning `Err`, so `Err(AgentError::UnknownTool(_))` can no
+            // longer surface here at all — checking for it (the old form of
+            // this test) would pass unconditionally regardless of whether a
+            // spec has a real handler. Check the error text `dispatch_inner`
+            // actually produces for an unmatched name instead: missing
+            // required args on a *wired* tool surfaces as some other
+            // message ("missing/invalid '...'" etc.), never this one.
+            assert!(
+                !(result.is_error && result.content.starts_with("unknown tool:")),
+                "tool spec '{}' has no handler: {}",
+                spec.name,
+                result.content
+            );
         }
     }
 

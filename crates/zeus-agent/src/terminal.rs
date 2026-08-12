@@ -68,6 +68,27 @@ impl TerminalOptions {
             // "wait the full timeout, then report timed_out=true", even for
             // a trivial `echo hi`), which is worse than no PTY at all. Real,
             // opt-in via `use_pty: true`; not yet trustworthy as a default.
+            //
+            // Investigated further: this matches a documented class of
+            // portable-pty/Windows ConPTY issue, not something specific to
+            // this codebase's usage — see wezterm/wezterm#1396 and the
+            // ConPTY exit-code-handle discussion linked from it. Tried
+            // bypassing `try_wait()` entirely on Windows by calling
+            // `GetExitCodeProcess` directly on the handle from
+            // `Child::as_raw_handle()`, on the theory that portable-pty's
+            // own wrapper queries a stale/wrong handle internally. That
+            // produced a *worse* failure mode empirically: the test process
+            // (and a lingering `conhost.exe`) hung for 19+ minutes with zero
+            // progress — no timeout ever fired, a regression from the
+            // original bounded ~85s worst case — so it was reverted rather
+            // than risk shipping an unbounded hang behind an opt-in flag.
+            // portable-pty is already at its latest release (0.9.0) as of
+            // this writing, so a version bump isn't available either.
+            // Next things worth trying: a raw `WaitForSingleObject` with an
+            // explicit timeout (rather than a zero-timeout poll) on a
+            // background thread so a hang can't block the caller; or
+            // dropping portable-pty for the Windows path entirely in favor
+            // of a direct ConPTY binding.
             use_pty: false,
         }
     }

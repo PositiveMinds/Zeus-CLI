@@ -5,6 +5,7 @@ mod ui;
 mod highlight;
 mod clipboard;
 mod decor;
+mod update;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -143,6 +144,13 @@ enum Commands {
 
     /// List saved sessions (id, message count, last user message)
     Sessions,
+
+    /// Check for (and optionally install) a newer zeus release
+    Update {
+        /// Only report whether a newer version is available; don't install it
+        #[arg(long)]
+        check: bool,
+    },
 
     /// Set or list provider API keys (~/.zeus/keys.toml) without opening a
     /// session — the one-shot equivalent of the REPL's `/provider key`
@@ -703,6 +711,7 @@ async fn run() -> Result<()> {
         )
         .await,
         Some(Commands::Sessions) => cmd_sessions(&config),
+        Some(Commands::Update { check }) => update::cmd_update(check).await,
         Some(Commands::Key { action }) => cmd_key(&config, action),
         Some(Commands::Tokens {
             message,
@@ -745,7 +754,7 @@ async fn run() -> Result<()> {
         Some(Commands::Glob { pattern, max }) => cmd_glob(&config, pattern, max),
         Some(Commands::Rewind { turn_id }) => cmd_rewind(&config, turn_id),
         Some(Commands::Checkpoints) => cmd_checkpoints(&config),
-        Some(Commands::Doctor) => cmd_doctor(&config),
+        Some(Commands::Doctor) => cmd_doctor(&config).await,
         Some(Commands::Bg { action }) => cmd_bg(&config, action),
         Some(Commands::Git { action }) => cmd_git(&config, action, cli.yes),
         Some(Commands::Pull { source }) => cmd_pull(&config, source).await,
@@ -1822,6 +1831,13 @@ fn print_agent_event(ev: AgentEvent) {
             eprintln!("{}", ui::styled(ui::warn_style(), "(cancelled)"));
         }
         AgentEvent::Done => {}
+        AgentEvent::TodosUpdated { todos } => {
+            let done = todos.iter().filter(|t| t.status == "completed").count();
+            eprintln!(
+                "{}",
+                ui::styled(ui::dim_style(), &format!("(todos: {done}/{} done)", todos.len()))
+            );
+        }
         AgentEvent::PlanGenerated { steps } => {
             let roster = steps
                 .iter()
@@ -3579,7 +3595,57 @@ fn cmd_git(config: &Config, action: GitCmd, yes: bool) -> Result<()> {
     }
 }
 
-fn cmd_doctor(config: &Config) -> Result<()> {
+/// One provider's health, checked without necessarily constructing a real
+/// client — local providers (ollama/lmstudio/llamacpp) get an actual
+/// reachability probe rather than being assumed "ready" just because their
+/// `kind` matches, since a stopped local server is exactly the kind of
+/// thing `zeus doctor` exists to catch.
+struct ProviderHealth {
+    ok: bool,
+    detail: String,
+}
+
+async fn provider_health(cfg: &zeus_config::ProviderConfig) -> ProviderHealth {
+    if matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp") {
+        let Some(base) = &cfg.base_url else {
+            return ProviderHealth {
+                ok: false,
+                detail: "local provider has no base_url configured".to_string(),
+            };
+        };
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1500))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return ProviderHealth { ok: false, detail: format!("couldn't build http client: {e}") }
+            }
+        };
+        // Any response at all (2xx, 404, whatever) means something is
+        // listening — that's the actual question, not whether the root
+        // path happens to be a valid route for this server.
+        match client.get(base).send().await {
+            Ok(_) => ProviderHealth { ok: true, detail: format!("reachable at {base}") },
+            Err(e) => ProviderHealth {
+                ok: false,
+                detail: format!("unreachable at {base} ({e}) — is it running?"),
+            },
+        }
+    } else if cfg.headers.contains_key("Authorization") {
+        ProviderHealth { ok: true, detail: "auth header configured".to_string() }
+    } else {
+        match &cfg.api_key_env {
+            Some(var) => match std::env::var(var) {
+                Ok(k) if !k.is_empty() => ProviderHealth { ok: true, detail: format!("key set via ${var}") },
+                _ => ProviderHealth { ok: false, detail: format!("no key — set ${var}") },
+            },
+            None => ProviderHealth { ok: true, detail: "no key required".to_string() },
+        }
+    }
+}
+
+async fn cmd_doctor(config: &Config) -> Result<()> {
     println!("zeus — Foundation + Safety Core");
     println!("  version:      {}", env!("CARGO_PKG_VERSION"));
     println!("  global_home:  {}", config.global.root.display());
@@ -3644,11 +3710,38 @@ fn cmd_doctor(config: &Config) -> Result<()> {
     println!("  [x] device tool: adb-driven app testing over USB debug / wireless (connect, install, launch, logcat, screenshot, shell)");
     println!();
     let default_provider = config.settings.model.provider.clone();
+
+    println!("Providers:");
+    let mut names: Vec<&String> = config.providers.providers.keys().collect();
+    names.sort();
+    let mut default_ready = false;
+    for name in &names {
+        let cfg = &config.providers.providers[*name];
+        let health = provider_health(cfg).await;
+        if **name == default_provider {
+            default_ready = health.ok;
+        }
+        let icon = if health.ok { "✓" } else { "✗" };
+        let marker = if **name == default_provider { " (default)" } else { "" };
+        println!("  [{icon}] {name}{marker} — {}: {}", cfg.kind, health.detail);
+    }
+    println!();
+
+    if !default_ready {
+        bail!(
+            "default provider '{default_provider}' isn't ready — see the Providers list above \
+             (missing key, or a local server that isn't running)."
+        );
+    }
+
+    // Stronger than the health check above: actually constructs the
+    // client, catching config-shape errors (a malformed base_url, an
+    // unsupported `kind`) the lighter per-provider check above can't see.
     match create_default(&default_provider, &config.providers) {
-        Ok(_) => println!("doctor: provider '{default_provider}' OK"),
+        Ok(_) => println!("doctor: default provider '{default_provider}' constructs OK"),
         Err(e) => {
             error!(provider = %default_provider, error = ?e, "default provider failed");
-            bail!("default provider '{default_provider}' failed: {e}");
+            bail!("default provider '{default_provider}' failed to construct: {e}");
         }
     }
     Ok(())

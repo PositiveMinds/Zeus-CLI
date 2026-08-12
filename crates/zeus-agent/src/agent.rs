@@ -10,10 +10,10 @@
 
 use crate::context::{CompactResult, ContextManager};
 use crate::error::{AgentError, Result};
-use crate::personas::{persona_by_id, recommend_persona, recommend_reviewer, Persona};
+use crate::personas::{persona_by_id, personas_by_department, recommend_persona, recommend_reviewer, Persona};
 use crate::plans::TaskPlan;
 use crate::session::{ConversationState, SessionStore};
-use crate::tools::ToolManager;
+use crate::tools::{ToolManager, ToolResult};
 use futures::StreamExt;
 use std::collections::HashMap;
 use tokio::sync::watch;
@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 use zeus_fs::{ApprovalDecision, PermissionRequest};
 use zeus_provider::{
     ChatRequest, FinishReason, Message, ModelProvider, Role, StreamEvent, TokenCountRequest,
-    TokenUsage, ToolCall,
+    TokenUsage, ToolCall, ToolSpec,
 };
 
 #[derive(Debug, Clone)]
@@ -78,6 +78,10 @@ pub enum AgentEvent {
     Compacted(CompactResult),
     Cancelled,
     Done,
+    /// The model called `todowrite` — it owns and replaces its whole
+    /// checklist on every call (not an incremental patch), so the UI should
+    /// just overwrite whatever it was showing rather than merge.
+    TodosUpdated { todos: Vec<TodoStatus> },
     /// Orchestrated `/plan` runs: the planning pass produced an ordered
     /// list of subtasks to execute.
     PlanGenerated { steps: Vec<PlanStep> },
@@ -121,6 +125,16 @@ pub enum AgentEvent {
     /// A `/suggest` pass produced next-feature recommendations grounded in the
     /// project's current implementation; `report` is the ranked list.
     FeaturesSuggested { report: String },
+}
+
+/// One row of the model-owned checklist the `todowrite` tool writes —
+/// mirrors that tool's own JSON shape (`content`/`status`) rather than a
+/// richer type, since it's parsed straight out of the tool call's raw
+/// arguments after dispatch.
+#[derive(Debug, Clone)]
+pub struct TodoStatus {
+    pub content: String,
+    pub status: String,
 }
 
 /// One subtask in an orchestrated `/plan` run.
@@ -331,7 +345,7 @@ impl Agent {
         // Fresh cancellation scope for this turn.
         let _ = self.cancel_tx.send(false);
         let report = self.repo_context(user_message, &mut on_event);
-        let content = if report.is_empty() {
+        let mut content = if report.is_empty() {
             // Small talk / meta (see `request_likely_needs_context`) — no
             // repo banner, project rules, memory, or "verify with grep"
             // nudge wrapped around it; none of that helps answer "hello"
@@ -341,19 +355,32 @@ impl Agent {
         } else {
             format!("{report}\n\n---\nUser: {user_message}")
         };
+        // Auto mode used to mean "plan the request into steps up front,
+        // execute each as its own turn" (`orchestrate`) — dropped in favor
+        // of the same continuous loop every other mode uses, driven by a
+        // prompt nudge instead of a separate code path. A plan drawn up
+        // before any work starts goes stale the moment step 1 reveals
+        // something step 3 assumed wasn't true; a model tracking its own
+        // checklist (`todowrite`) as it actually learns things doesn't
+        // have that failure mode. `delegate` covers the other half of what
+        // the old planner did (assigning a specialist to a step) without
+        // requiring the assignment to be decided before execution begins.
+        // `zeus agent --auto`/`/bg orchestrate` still get the full
+        // reviewable upfront plan via `orchestrate()` directly, for
+        // whoever explicitly wants that ceremony.
+        if self.auto_mode() {
+            content.push_str(
+                "\n\n---\nAuto mode: work through this fully autonomously. Break multi-step \
+                 work down with `todowrite` and keep it current as you go; reach for `delegate` \
+                 when part of the work clearly calls for a specific specialist's expertise \
+                 (see its tool description for the roster). Keep going until the request is \
+                 genuinely done rather than stopping to check in early.",
+            );
+        }
         self.state.messages.push(Message::user(content));
 
         if let Some(result) = self.maybe_compact().await? {
             on_event(AgentEvent::Compacted(result));
-        }
-
-        // Auto mode: plan the request, then execute each planned step.
-        if self.auto_mode() {
-            let summary = self.orchestrate(user_message, on_event, approver).await?;
-            return Ok(TurnResult {
-                final_text: summary,
-                ..TurnResult::default()
-            });
         }
 
         self.drive_turn(on_event, approver).await
@@ -1267,6 +1294,149 @@ fn step_preview(step: &PlanStep) -> String {
         }
     }
 
+    /// `delegate` tool: lets the model consult a specialist mid-turn for
+    /// expert input, instead of every specialist assignment requiring a
+    /// plan drawn up before execution starts (see `orchestrate`'s doc
+    /// comment for how the two coexist — this doesn't replace it, it's
+    /// what a plain `run_turn`/Auto-mode continuous loop reaches for when
+    /// it recognizes work matching a specialist's domain).
+    ///
+    /// Deliberately bounded and read-only: the specialist gets its own
+    /// short-lived message list (not the primary conversation) and only
+    /// read-only tools (`read`/`grep`/`glob`/etc, regardless of what that
+    /// persona's own tool allow-list would otherwise permit in a planned
+    /// step) so it can ground its answer in the real codebase without
+    /// being able to mutate anything itself — only the primary agent that
+    /// called `delegate` writes/edits/runs, acting on the recommendation.
+    /// Returns `(result, usage, was_cancelled)` — `was_cancelled` tells the
+    /// caller to treat the *whole* turn as cancelled rather than feeding
+    /// `result` back to the model as a normal tool result, so a cancel that
+    /// lands mid-consultation gets the same clean "(cancelled)" outcome as
+    /// every other cancellation point in `drive_turn` instead of either a
+    /// hard turn-abort or a fabricated-looking successful answer.
+    async fn run_delegate(&self, arguments: &str) -> Result<(ToolResult, TokenUsage, bool)> {
+        #[derive(serde::Deserialize)]
+        struct DelegateArgs {
+            persona: String,
+            task: String,
+        }
+        let args: DelegateArgs = match serde_json::from_str(arguments) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok((
+                    ToolResult::err(format!("bad delegate arguments: {e}")),
+                    TokenUsage::default(),
+                    false,
+                ))
+            }
+        };
+        let Some(persona) = persona_by_id(&args.persona) else {
+            let roster: Vec<&str> = personas_by_department()
+                .into_iter()
+                .flat_map(|(_, ps)| ps.into_iter().map(|p| p.id))
+                .collect();
+            return Ok((
+                ToolResult::err(format!(
+                    "unknown specialist id '{}' — see /agents for the roster: {}",
+                    args.persona,
+                    roster.join(", ")
+                )),
+                TokenUsage::default(),
+                false,
+            ));
+        };
+
+        let mut messages = vec![Message::system(persona.system_prompt()), Message::user(args.task)];
+        let mut usage = TokenUsage::default();
+        const MAX_ITERATIONS: usize = 5;
+        for _ in 0..MAX_ITERATIONS {
+            if *self.cancel_rx.borrow() {
+                return Ok((ToolResult::ok(String::new()), usage, true));
+            }
+            let request = ChatRequest {
+                model: self.options.model.clone(),
+                messages: messages.clone(),
+                tools: self.tools.read_only_tool_specs(),
+                temperature: self.options.temperature,
+                max_tokens: self.options.max_tokens,
+                cancel: Some(self.cancel_rx.clone()),
+            };
+            let mut stream = match self.provider.stream(request).await {
+                Ok(s) => s,
+                Err(zeus_provider::ProviderError::Cancelled) => {
+                    return Ok((ToolResult::ok(String::new()), usage, true));
+                }
+                Err(e) => return Err(AgentError::Provider(e)),
+            };
+            let mut text = String::new();
+            let mut calls: HashMap<String, (Option<String>, String)> = HashMap::new();
+            let mut call_order: Vec<String> = Vec::new();
+            let mut finish = FinishReason::Stop;
+            while let Some(ev) = stream.next().await {
+                match ev.map_err(AgentError::Provider)? {
+                    StreamEvent::TextDelta { text: t } => text.push_str(&t),
+                    StreamEvent::ToolCallDelta { id, name, arguments_delta } => {
+                        let entry = calls.entry(id.clone()).or_insert_with(|| {
+                            call_order.push(id.clone());
+                            (None, String::new())
+                        });
+                        if let Some(n) = name {
+                            entry.0 = Some(n);
+                        }
+                        entry.1.push_str(&arguments_delta);
+                    }
+                    StreamEvent::Done { finish_reason, usage: u } => {
+                        usage.prompt_tokens += u.prompt_tokens;
+                        usage.completion_tokens += u.completion_tokens;
+                        usage.total_tokens += u.total_tokens;
+                        finish = finish_reason;
+                    }
+                }
+            }
+            if finish == FinishReason::Cancelled {
+                return Ok((ToolResult::ok(text), usage, true));
+            }
+            if calls.is_empty() {
+                let content = format!("[{} ({})]\n{}", persona.role, persona.id, text);
+                return Ok((ToolResult::ok(content), usage, false));
+            }
+            let tool_calls: Vec<ToolCall> = call_order
+                .iter()
+                .filter_map(|id| {
+                    let (name, arguments) = calls.get(id)?;
+                    Some(ToolCall {
+                        id: id.clone(),
+                        name: name.clone().unwrap_or_default(),
+                        arguments: arguments.clone(),
+                    })
+                })
+                .collect();
+            let mut assistant_msg = Message::assistant(text);
+            assistant_msg.tool_calls = tool_calls.clone();
+            messages.push(assistant_msg);
+            for call in &tool_calls {
+                // Every tool exposed here is already filtered to
+                // read-only via `read_only_tool_specs`, so there's
+                // nothing an "ask" response would meaningfully gate —
+                // auto-approve rather than surface a second, confusing
+                // permission prompt for a sub-consultation the user
+                // didn't directly initiate.
+                let result = self.tools.dispatch_with_approver(&call.name, &call.arguments, |_: &PermissionRequest| {
+                    ApprovalDecision::Approved
+                })?;
+                messages.push(Message::tool_result(call.id.clone(), result.content));
+            }
+        }
+        Ok((
+            ToolResult::ok(format!(
+                "({} consultation hit its step limit without a final answer — try a narrower task)",
+                persona.id
+            )),
+            usage,
+            false,
+        ))
+    }
+
     /// The tool-calling loop proper: stream the provider, execute any tool
     /// calls (permission-gated via `approver`), feed results back, repeat
     /// until a plain-text final answer or the iteration budget runs out.
@@ -1299,10 +1469,35 @@ fn step_preview(step: &PlanStep) -> String {
                 });
             }
 
+            // Plan mode was advertising the *entire* tool list — every
+            // mutating tool included (write/edit/delete/bash/every git
+            // write op/...) — even though `ToolManager::dispatch_inner`
+            // rejects every one of them in Plan mode anyway. That's pure
+            // dead weight on every single Plan-mode request: more than
+            // half of Zeus's 60+ built-in tools are mutating, so Plan mode
+            // was carrying the same tool-list size/complexity as Build for
+            // zero actual capability. Confirmed in practice this alone was
+            // enough to make a smaller/free model fail to converge — so
+            // Plan mode now only ever sees the tools it could actually use.
+            let mut tools = if self.plan_mode() {
+                self.tools.read_only_tool_specs()
+            } else {
+                self.tools.all_tool_specs()
+            };
+            // `delegate` isn't in `ToolManager` (it needs `self.provider`
+            // to run a nested consultation, which the tool dispatcher has
+            // no access to) — appended here instead, and intercepted below
+            // before reaching `dispatch_with_approver`. Auto-mode only:
+            // it exists to replace the old planner's specialist-assignment
+            // for the continuous loop, so Build/Plan turns (which never
+            // used that) don't need the added size/complexity.
+            if self.auto_mode() {
+                tools.push(delegate_tool_spec());
+            }
             let request = ChatRequest {
                 model: self.options.model.clone(),
                 messages: self.state.messages.clone(),
-                tools: self.tools.all_tool_specs(),
+                tools,
                 temperature: self.options.temperature,
                 max_tokens: self.options.max_tokens,
                 cancel: Some(self.cancel_rx.clone()),
@@ -1434,9 +1629,30 @@ fn step_preview(step: &PlanStep) -> String {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 });
-                let result =
+                let result = if call.name == "delegate" {
+                    let (result, delegate_usage, was_cancelled) =
+                        self.run_delegate(&call.arguments).await?;
+                    total_usage.prompt_tokens += delegate_usage.prompt_tokens;
+                    total_usage.completion_tokens += delegate_usage.completion_tokens;
+                    total_usage.total_tokens += delegate_usage.total_tokens;
+                    if was_cancelled {
+                        on_event(AgentEvent::Cancelled);
+                        self.persist()?;
+                        self.tools
+                            .hooks()
+                            .run_on_stop(&self.state.session_id, "cancelled mid-stream");
+                        return Ok(TurnResult {
+                            final_text: String::new(),
+                            tool_calls: total_tool_calls,
+                            cancelled: true,
+                            usage: total_usage,
+                        });
+                    }
+                    result
+                } else {
                     self.tools
-                        .dispatch_with_approver(&call.name, &call.arguments, &mut approver)?;
+                        .dispatch_with_approver(&call.name, &call.arguments, &mut approver)?
+                };
                 total_tool_calls += 1;
                 on_event(AgentEvent::ToolCallFinished {
                     id: call.id.clone(),
@@ -1444,6 +1660,11 @@ fn step_preview(step: &PlanStep) -> String {
                     result: result.content.clone(),
                     is_error: result.is_error,
                 });
+                if call.name == "todowrite" && !result.is_error {
+                    if let Some(todos) = parse_todowrite_args(&call.arguments) {
+                        on_event(AgentEvent::TodosUpdated { todos });
+                    }
+                }
                 self.state
                     .messages
                     .push(Message::tool_result(call.id.clone(), result.content));
@@ -1695,6 +1916,63 @@ async fn run_headless_step(
         }
     }
     Ok(text)
+}
+
+/// The `delegate` tool's spec — built fresh (not a `const`) since the
+/// roster of specialist ids in its description comes from `ALL_PERSONAS`
+/// at runtime rather than being hand-copied and left to drift out of sync.
+fn delegate_tool_spec() -> ToolSpec {
+    // Department names only (not all ~40 individual specialist ids) — the
+    // full roster used to be embedded here on every single request, which
+    // meaningfully bloats an already-large tool list and measurably hurt
+    // smaller/free models' tool-calling reliability in practice (they'd
+    // return empty/malformed responses or never converge — the exact
+    // failure `drive_turn` already has a fallback message for). The model
+    // can call `/agents`-equivalent info via the roster departments here
+    // and pick a specific id from context/its own knowledge; getting an
+    // unknown id back is handled gracefully (`run_delegate` reports it).
+    let departments: Vec<&str> = personas_by_department().into_iter().map(|(d, _)| d).collect();
+    ToolSpec {
+        name: "delegate".to_string(),
+        description: format!(
+            "Consult a specialist for expert input on part of the current task — use this \
+             when a piece of work clearly calls for specific expertise instead of guessing \
+             yourself. Read-only: the specialist can inspect the codebase but not write/edit/run \
+             anything; it returns a recommendation for you to act on. Not for delegating whole \
+             tasks wholesale. Departments: {}. Give a persona id matching the relevant \
+             department (e.g. \"security-engineer\", \"backend-engineer\") — an unrecognized id \
+             is reported back rather than failing silently.",
+            departments.join(", ")
+        ),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "persona": {"type": "string", "description": "specialist id, e.g. \"security-engineer\""},
+                "task": {"type": "string", "description": "the specific question or subtask for them to address"}
+            },
+            "required": ["persona", "task"]
+        }),
+    }
+}
+
+/// Parses a `todowrite` call's raw arguments (already schema-validated by
+/// `ToolManager::do_todowrite`) back into `TodoStatus` rows for the UI.
+/// Returns `None` on anything unexpected rather than erroring the turn —
+/// this is a best-effort UI update, not something that should fail the
+/// tool call itself (which already succeeded by the time this runs).
+fn parse_todowrite_args(arguments: &str) -> Option<Vec<TodoStatus>> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let todos = value.get("todos")?.as_array()?;
+    Some(
+        todos
+            .iter()
+            .filter_map(|t| {
+                let content = t.get("content")?.as_str()?.to_string();
+                let status = t.get("status")?.as_str()?.to_string();
+                Some(TodoStatus { content, status })
+            })
+            .collect(),
+    )
 }
 
 fn split_orientation_docs(text: &str) -> (Option<String>, Option<String>) {

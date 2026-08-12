@@ -1,0 +1,13 @@
+{
+  "name": "zeus-code-darwin-arm64",
+  "version": "0.1.1",
+  "description": "Prebuilt zeus binary for macOS arm64 (Apple Silicon) — an optional dependency of zeus-code, not meant to be installed directly.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PositiveMinds/Zeus-CLI.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin"]
+}

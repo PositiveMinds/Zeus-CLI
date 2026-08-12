@@ -120,6 +120,13 @@ impl Block_ {
     /// everything else off screen.
     const MAX_TOOL_LINES: usize = 40;
 
+    /// Reading-width cap for assistant replies and tool-result cards on a
+    /// wide/ultrawide terminal. Without it, prose and tool output stretch
+    /// to the full chat-column width — hundreds of columns on an ultrawide
+    /// monitor — both a real readability regression and an asymmetry with
+    /// the user's own messages, which already cap at 84 (see `bubble_lines`).
+    const MAX_CONTENT_W: usize = 100;
+
     fn new(role: Role, text: String) -> Self {
         Self {
             role,
@@ -174,14 +181,94 @@ impl Block_ {
 
     /// Rendered lines for the transcript, `width` columns wide. User and
     /// Assistant turns render as bordered chat bubbles (`bubble_lines`,
-    /// matching `zeus-cli.html`'s `.bubble` rows); everything else (tool
-    /// status lines, errors, info) stays plain marker-prefixed text like a
-    /// log line, matching the HTML's unbubbled `·`/`✗` status rows.
+    /// matching `zeus-cli.html`'s `.bubble` rows); a tool call that actually
+    /// produced output gets a card (`tool_card_lines`) instead of blending
+    /// into the log — everything else (a bare tool-call-started line, plain
+    /// status/error/info lines) stays plain marker-prefixed text like a log
+    /// line, matching the HTML's unbubbled `·`/`✗` status rows. This mirrors
+    /// a two-tier "inline vs card" split a reference product uses: cheap
+    /// tool activity reads as a log line, a tool call with a real result
+    /// (a diff, a file read, command output) reads as a distinct block.
     fn to_lines(&self, width: u16) -> Vec<Line<'static>> {
         match self.role {
             Role::User | Role::Assistant => self.bubble_lines(width),
+            Role::Tool | Role::ToolError if self.has_output_body() => self.tool_card_lines(width),
             _ => self.marked_lines(),
         }
+    }
+
+    /// Whether this Tool/ToolError block's `text` has a body past its
+    /// header line (see `style_tool_header`'s header/body split) — a bare
+    /// `ToolCallStarted` line, or a `ToolCallFinished` whose result was
+    /// truly empty, has none.
+    fn has_output_body(&self) -> bool {
+        self.text
+            .splitn(2, '\n')
+            .nth(1)
+            .is_some_and(|body| !body.trim().is_empty())
+    }
+
+    /// A tool call that produced real output gets a left-accent-bar card —
+    /// the same visual language the composer already uses (`Borders::LEFT`
+    /// + a filled panel background) — instead of blending into the plain
+    /// log lines around it. Built by hand (spans with an explicit `bg`
+    /// filled out to `width`) rather than an actual `ratatui::widgets::Block`
+    /// because the whole transcript is one flattened `Text` rendered by a
+    /// single `Paragraph`, the same reason `bubble_lines` draws its own
+    /// border characters instead of nesting a real bordered widget.
+    fn tool_card_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let is_error = self.role == Role::ToolError;
+        let accent = if is_error { theme::red() } else { theme::cyan() };
+        let bg = theme::CARD_BG;
+        let avail = (width as usize).saturating_sub(2).clamp(20, Self::MAX_CONTENT_W);
+
+        let pad_row = || {
+            Line::from(vec![
+                Span::styled("▎", accent.bg(bg)),
+                Span::styled(" ".repeat(avail + 1), Style::default().bg(bg)),
+            ])
+        };
+        let content = self.content_lines();
+        let mut out = Vec::with_capacity(content.len() + 2);
+        out.push(pad_row());
+        for line in content {
+            let mut spans = vec![Span::styled("▎ ", accent.bg(bg))];
+            let mut used = 2usize;
+            for s in line.spans {
+                if used >= avail + 1 {
+                    break;
+                }
+                // Preserve a span's own background (e.g. a diff +/- line's
+                // tint) instead of flattening it into the card's panel bg.
+                let style = if s.style.bg.is_some() { s.style } else { s.style.bg(bg) };
+                let remaining = avail + 1 - used;
+                let content_len = s.content.chars().count();
+                if content_len > remaining {
+                    // Diff lines are pre-padded to a fixed width (see
+                    // `DIFF_DEFAULT_WIDTH`) independent of the real live
+                    // width, since that padding is baked in at memoization
+                    // time before this function ever sees a terminal size.
+                    // Clip here — the one place that knows the real width —
+                    // so an over-wide span can't escape the card and get
+                    // re-wrapped by the transcript's own `Paragraph::wrap`,
+                    // which would otherwise leave a near-empty tinted
+                    // "ghost" row trailing every diff line on any terminal
+                    // narrower than that fixed pad width.
+                    let clipped: String = s.content.chars().take(remaining).collect();
+                    used += remaining;
+                    spans.push(Span::styled(clipped, style));
+                    break;
+                }
+                used += content_len;
+                spans.push(Span::styled(s.content, style));
+            }
+            if used < avail + 1 {
+                spans.push(Span::styled(" ".repeat(avail + 1 - used), Style::default().bg(bg)));
+            }
+            out.push(Line::from(spans));
+        }
+        out.push(pad_row());
+        out
     }
 
     fn marked_lines(&self) -> Vec<Line<'static>> {
@@ -241,7 +328,7 @@ impl Block_ {
             // never pre-wrapped to any width on its own, so a long
             // paragraph or a wide highlighted line needs its own pass here
             // rather than sailing straight past the terminal edge.
-            let max_inner_w = avail.saturating_sub(2).max(10);
+            let max_inner_w = avail.saturating_sub(2).clamp(10, Self::MAX_CONTENT_W);
             let content: Vec<Line<'static>> = self
                 .content_lines()
                 .into_iter()
@@ -321,7 +408,7 @@ impl Block_ {
 
             let mut lines: Vec<Line<'static>> = vec![style_tool_header(header, self.role == Role::ToolError)];
             let mut body_lines: Vec<Line<'static>> = if super::highlight::looks_like_diff(body) {
-                super::highlight::diff_lines(body, text_style)
+                super::highlight::diff_lines(body, text_style, super::highlight::DIFF_DEFAULT_WIDTH)
                     .into_iter()
                     .map(Line::from)
                     .collect()
@@ -333,7 +420,11 @@ impl Block_ {
                 body_lines.truncate(Self::MAX_TOOL_LINES);
                 body_lines.push(Line::from(Span::styled(
                     format!("… {omitted} more line(s) — click this message to expand"),
-                    theme::faint().add_modifier(Modifier::ITALIC),
+                    // `dim()` not `faint()` — this is an actionable
+                    // instruction, not decoration, and `faint()` measures
+                    // well under WCAG AA contrast against the surrounding
+                    // card background.
+                    theme::dim().add_modifier(Modifier::ITALIC),
                 )));
             }
             lines.append(&mut body_lines);
@@ -352,12 +443,14 @@ impl Block_ {
 }
 
 /// A tool call's header line: `"toolname {raw args}"` (just started) or
-/// `"toolname (done)"`/`"toolname (failed)"` (finished) — a fixed format
-/// this module itself writes in `apply_agent_event`, not external input, so
-/// splitting on the first space/parenthesized status is safe. Bolds the
-/// tool name, colors the status word, and dims+caps raw call arguments so a
-/// long inline JSON blob (a big grep pattern, a large file write) doesn't
-/// dominate the line the way the unstyled flat dump used to.
+/// `"toolname (done)"`/`"toolname (done, 297ms)"`/`"toolname (failed)"`
+/// (finished, with a timing suffix appended whenever `apply_agent_event`
+/// knows how long the call took) — a fixed format this module itself
+/// writes, not external input, so splitting on the first space/
+/// parenthesized status is safe. Bolds the tool name, colors the status
+/// word, and dims+caps raw call arguments so a long inline JSON blob (a
+/// big grep pattern, a large file write) doesn't dominate the line the way
+/// the unstyled flat dump used to.
 fn style_tool_header(header: &str, is_error: bool) -> Line<'static> {
     let (name, rest) = header.split_once(' ').unwrap_or((header, ""));
     let name_style = if is_error {
@@ -370,10 +463,15 @@ fn style_tool_header(header: &str, is_error: bool) -> Line<'static> {
         spans.push(Span::raw(" "));
         match rest.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
             Some(status) => {
-                let status_style = if status == "done" {
-                    theme::green().add_modifier(Modifier::BOLD)
-                } else {
+                // Trust the block's actual role for color rather than
+                // re-parsing the status word: it now carries a variable
+                // ", <N>ms" timing suffix ("done, 297ms"), and an exact
+                // `== "done"` match would silently miscolor every timed
+                // success red, as if every tool call had failed.
+                let status_style = if is_error {
                     theme::red().add_modifier(Modifier::BOLD)
+                } else {
+                    theme::green().add_modifier(Modifier::BOLD)
                 };
                 spans.push(Span::styled(format!("· {status}"), status_style));
             }
@@ -451,16 +549,12 @@ struct ApprovalRequestMsg {
 enum UiEvent {
     Agent(AgentEvent),
     Approval(ApprovalRequestMsg),
-    /// Top-right provider dropdown finished probing configured providers —
-    /// see the doc comment on `fetching_providers` for why this is spawned
-    /// rather than awaited inline. Carries the raw per-provider model scan
-    /// too, so the main loop can cache it (`AppState::model_cache`) for the
-    /// next dropdown/picker open.
-    DropdownReady(Vec<ProviderEntry>, Vec<(String, Vec<zeus_provider::ModelInfo>)>),
     /// `/model`'s picker finished probing — empty entries means "no models found".
     ModelPickerReady(Vec<PickerEntry>, usize, Vec<(String, Vec<zeus_provider::ModelInfo>)>),
-    /// `/provider`'s picker finished probing — empty entries means "no providers".
-    ProviderPickerReady(Vec<ProviderEntry>, usize, Vec<(String, Vec<zeus_provider::ModelInfo>)>),
+    /// The one-shot startup version check (see `run_app`) found a newer
+    /// release than `update::current_version()`. Carries the latest version
+    /// string, shown as a small dim notice — never auto-installed.
+    UpdateAvailable(String),
 }
 
 enum Mode {
@@ -499,24 +593,17 @@ enum PickerEntry {
 /// selection.
 #[derive(Clone)]
 enum ProviderEntry {
+    /// A non-selectable category label ("Popular"/"Providers").
     Header(String),
-    /// A vendor-family grouping nested under a provider's `Header` — see
-    /// `PickerEntry::SubHeader`. Non-selectable, same as `Header`.
-    SubHeader(String),
     Provider {
         name: String,
+        /// Short descriptor shown next to the name — see
+        /// `provider_short_desc` (not the raw `providers.toml` `kind`).
         kind: String,
-        model: String,
         /// True when the provider can be used right now (local kind, stored
         /// key, or env key present) — false means "needs a key" and Enter
         /// jumps to `KeyEntry` instead of switching.
         ready: bool,
-    },
-    Model {
-        provider: String,
-        model: ModelInfo,
-        /// Tagged free (heuristic on the model id) vs paid.
-        free: bool,
     },
 }
 
@@ -548,49 +635,12 @@ fn provider_picker_move(entries: &[ProviderEntry], selected: usize, dir: isize) 
     let mut idx = selected as isize;
     loop {
         idx = (idx + dir).rem_euclid(len);
-        if !matches!(entries[idx as usize], ProviderEntry::Header(_) | ProviderEntry::SubHeader(_)) {
+        if !matches!(entries[idx as usize], ProviderEntry::Header(_)) {
             return idx as usize;
         }
     }
 }
 
-/// Move the dropdown highlight one row toward the end, skipping group
-/// headers (not selectable). Wraps around the list.
-fn dropdown_next_selectable(entries: &[ProviderEntry], selected: usize) -> usize {
-    if entries.is_empty() {
-        return 0;
-    }
-    let mut idx = selected;
-    for _ in 0..entries.len() {
-        idx = (idx + 1) % entries.len();
-        if !matches!(entries.get(idx), Some(ProviderEntry::Header(_) | ProviderEntry::SubHeader(_))) {
-            return idx;
-        }
-    }
-    selected
-}
-
-/// Move the dropdown highlight one row toward the start, skipping group
-/// headers (not selectable). Wraps around the list.
-fn dropdown_prev_selectable(entries: &[ProviderEntry], selected: usize) -> usize {
-    if entries.is_empty() {
-        return 0;
-    }
-    let mut idx = selected;
-    for _ in 0..entries.len() {
-        idx = (idx + entries.len() - 1) % entries.len();
-        if !matches!(entries.get(idx), Some(ProviderEntry::Header(_) | ProviderEntry::SubHeader(_))) {
-            return idx;
-        }
-    }
-    selected
-}
-
-/// Applies the chosen model: switches provider first if it differs from the
-/// one currently in use (conversation history carries over — only the
-/// provider handle and model name change), then sets the model. Closes the
-/// picker either way; a provider-construction failure is reported in the
-/// transcript rather than left unexplained.
 /// Applies a chosen (provider, model id) pair: switches provider first if
 /// it differs from the one currently in use (conversation history carries
 /// over — only the provider handle and model name change), then sets the
@@ -656,14 +706,19 @@ fn apply_model_choice_or_key_entry(
 }
 
 /// Persist an API key for a provider (to `~/.zeus/keys.toml`), apply it as
-/// the provider's env var for the running session, then switch the agent to
-/// that provider's default model. Pushes a transcript line on success/failure.
+/// the provider's env var for the running session, then — instead of
+/// silently landing on that provider's default model — auto-chain straight
+/// into the model picker scoped to it, the same way the reference product's
+/// key-entry prompt auto-opens its model dialog on submit. The actual
+/// provider/model switch happens once a model is picked there
+/// (`apply_model_choice_or_key_entry` → `apply_picker_choice`), which
+/// already handles a provider failing to construct.
 fn persist_key_and_switch(
     provider: &str,
     key: &str,
     config: &Config,
-    agent_slot: &mut Option<Agent>,
     state: &mut AppState,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     let mut keys = match KeysFile::load(&config.global.keys_toml) {
         Ok(k) => k,
@@ -678,43 +733,33 @@ fn persist_key_and_switch(
         return;
     }
     // A newly-keyed provider can now list models it couldn't before —
-    // drop the cached scan so the next picker/dropdown open re-probes
-    // instead of showing it as still empty.
+    // drop the cached scan so the picker fetch below (and any later
+    // picker/dropdown open) re-probes instead of showing it as still empty.
     state.model_cache = None;
     if let Some(cfg) = config.providers.get(provider) {
         if let Some(var) = &cfg.api_key_env {
             std::env::set_var(var, key);
         }
     }
-    match create_provider(provider, &config.providers) {
-        Ok(handle) => {
-            if let Some(agent) = agent_slot.as_mut() {
-                agent.set_provider(handle);
-            }
-            let model = config
-                .providers
-                .get(provider)
-                .and_then(|c| c.default_model.clone())
-                .unwrap_or_else(|| state.model.clone());
-            if let Some(agent) = agent_slot.as_mut() {
-                agent.set_model(model.clone());
-            }
-            state.provider = provider.to_string();
-            state.model = model.clone();
-            state.context_window = None;
-            let saved = config.global.keys_toml.display();
-            match persist_default_provider(config, provider, Some(&model)) {
-                Ok(path) => state.push_info(format!(
-                    "key saved for '{provider}' ({saved}) — switched to {provider} / {model} (default saved to {})",
-                    path.display()
-                )),
-                Err(e) => state.push_info(format!(
-                    "key saved for '{provider}' ({saved}) — switched to {provider} / {model}, but saving default failed: {e:#}"
-                )),
-            }
-        }
-        Err(e) => state.push_error(format!("couldn't switch to '{provider}': {e:#}")),
-    }
+    state.push_info(format!(
+        "key saved for '{provider}' ({}) — choose a model",
+        config.global.keys_toml.display()
+    ));
+
+    state.model_picker_search.clear();
+    state.fetching_providers = true;
+    let cfg = config.clone();
+    let provider = provider.to_string();
+    let current_model = state.model.clone();
+    let recent = state.recent_models.clone();
+    let favorites = state.favorite_models.clone();
+    let tx = ui_tx.clone();
+    tokio::spawn(async move {
+        let groups = list_models_by_provider(&cfg).await;
+        let (entries, selected) =
+            build_model_picker_entries(&groups, &provider, &current_model, &recent, &favorites);
+        let _ = tx.send(UiEvent::ModelPickerReady(entries, selected, groups));
+    });
 }
 
 /// Apply a provider-picker choice. Ready providers switch immediately; a
@@ -761,47 +806,6 @@ fn apply_provider_picker_choice(
         state.input.clear();
         state.cursor = 0;
         state.mode = Mode::KeyEntry { provider: name };
-    }
-}
-
-/// Apply a pick inside the top-right provider dropdown. Ready providers/model
-/// switch immediately (dropdown closes); a provider that still needs a key
-/// keeps the dropdown open but swaps it into the inline API-key entry view.
-fn dropdown_apply(
-    state: &mut AppState,
-    agent_slot: &mut Option<Agent>,
-    config: &Config,
-    entry: &ProviderEntry,
-) {
-    match entry {
-        ProviderEntry::Provider { name, ready, .. } => {
-            if *ready {
-                apply_provider_picker_choice(name.clone(), true, config, agent_slot, state);
-                state.dropdown = None;
-            } else {
-                open_dropdown_key(state, name);
-            }
-        }
-        ProviderEntry::Model { provider, model, .. } => {
-            if provider_status_ok(config, provider) {
-                apply_picker_choice(provider.clone(), model.id.clone(), state, agent_slot, config);
-                state.dropdown = None;
-            } else {
-                open_dropdown_key(state, provider);
-            }
-        }
-        // A header row isn't a choice — leave the dropdown open rather
-        // than silently closing it on a stray Enter.
-        ProviderEntry::Header(_) | ProviderEntry::SubHeader(_) => {}
-    }
-}
-
-/// Swap the dropdown's list for its inline key-entry view for `provider`
-/// (preserving the entry list so Esc can step back out).
-fn open_dropdown_key(state: &mut AppState, provider: &str) {
-    if let Some(d) = state.dropdown.as_mut() {
-        d.keying = Some(KeyingState { provider: provider.to_string(), key: String::new() });
-        d.selected = 0;
     }
 }
 
@@ -899,77 +903,69 @@ fn group_models_by_family(
 /// free or paid — a single provider like OpenRouter can offer both. A
 /// provider that can't list models (no key, server down) still shows as a
 /// switchable row.
-fn provider_picker_entries(
-    config: &Config,
-    current: &str,
-    current_model: &str,
-    models: &[(String, Vec<zeus_provider::ModelInfo>)],
-) -> (Vec<ProviderEntry>, usize) {
+/// A few providers surfaced first under a "Popular" category, matching the
+/// reference product's own priority list — everything else follows,
+/// alphabetical, under a plain "Providers" category. Picking a provider no
+/// longer shows its models inline (that's a separate, deliberate step —
+/// see `apply_provider_picker_choice`/`persist_key_and_switch`'s auto-chain
+/// into the model picker), so opening this list needs no network probe at
+/// all and is instant regardless of how many providers are configured.
+const POPULAR_PROVIDERS: [&str; 4] = ["opencodezen", "openrouter", "anthropic", "openai"];
+
+/// A short, provider-specific descriptor shown next to its name — the
+/// reference product bakes in strings like "(Recommended)"/"(API key)"
+/// rather than leaving the row bare; unrecognized providers just fall back
+/// to their `kind`.
+fn provider_short_desc(name: &str, kind: &str) -> String {
+    match name {
+        "opencodezen" => "(Recommended)".to_string(),
+        "openrouter" | "anthropic" | "openai" | "deepseek" | "mistral" | "groq" | "together" | "fireworks" => {
+            "(API key)".to_string()
+        }
+        "ollama" | "lmstudio" | "llamacpp" => "(local)".to_string(),
+        _ => format!("({kind})"),
+    }
+}
+
+fn provider_picker_entries(config: &Config, current: &str) -> (Vec<ProviderEntry>, usize) {
     let mut names: Vec<&String> = config.providers.providers.keys().collect();
     names.sort();
-    if let Some(pos) = names.iter().position(|n| n.as_str() == current) {
-        let cur = names.remove(pos);
-        names.insert(0, cur);
-    }
-    // Pull a few recommended providers (skipping the current one, already
-    // up front) just after it, in a fixed order — a lightweight take on
-    // other tools' "Popular" section, without a whole separate no-models
-    // "connect a provider" screen.
-    const POPULAR: [&str; 4] = ["opencodezen", "openrouter", "anthropic", "openai"];
-    let mut names = names;
-    let mut ordered: Vec<&String> = Vec::with_capacity(names.len());
-    if !names.is_empty() {
-        ordered.push(names.remove(0));
-    }
-    for pop in POPULAR {
-        if let Some(pos) = names.iter().position(|n| n.as_str() == pop) {
-            ordered.push(names.remove(pos));
+
+    let mut popular: Vec<&String> = Vec::new();
+    let mut rest: Vec<&String> = Vec::new();
+    for name in names {
+        if POPULAR_PROVIDERS.contains(&name.as_str()) {
+            popular.push(name);
+        } else {
+            rest.push(name);
         }
     }
-    ordered.extend(names);
-    let names = ordered;
+    popular.sort_by_key(|n| POPULAR_PROVIDERS.iter().position(|p| *p == n.as_str()).unwrap_or(usize::MAX));
 
     let mut entries = Vec::new();
-    // Defaults to the current provider's row (always index 1: its header
-    // goes in first since `current` was moved to the front of `names`
-    // above) rather than 0, which is always a header — so Enter works
-    // immediately without needing an arrow key press first.
-    let mut selected = 1;
-    for name in names {
-        let Some(cfg) = config.providers.get(name) else { continue };
-        let ready = provider_status_ok(config, name);
-        entries.push(ProviderEntry::Header(name.clone()));
-        if name.as_str() == current && ready {
-            selected = entries.len();
+    let mut selected = 0;
+    let mut push_group = |entries: &mut Vec<ProviderEntry>, title: &str, names: &[&String]| {
+        if names.is_empty() {
+            return;
         }
-        entries.push(ProviderEntry::Provider {
-            name: name.to_string(),
-            kind: cfg.kind.clone(),
-            model: cfg.default_model.clone().unwrap_or_default(),
-            ready,
-        });
-        // Models for this provider, if reachable, right under its row —
-        // sub-grouped by vendor family for an aggregator (OpenRouter,
-        // OpenCode Zen) whose catalog spans more than one recognizable
-        // vendor, so it doesn't dump 30+ unrelated models in one flat list.
-        if let Some((_, provider_models)) = models.iter().find(|(n, _)| n == name) {
-            for (family, family_models) in group_models_by_family(provider_models) {
-                if let Some(family) = family {
-                    entries.push(ProviderEntry::SubHeader(family));
-                }
-                for m in family_models {
-                    if m.id == current_model && name.as_str() == current {
-                        selected = entries.len();
-                    }
-                    let free = is_free_model(&m.id);
-                    entries.push(ProviderEntry::Model {
-                        provider: name.to_string(),
-                        model: m,
-                        free,
-                    });
-                }
+        entries.push(ProviderEntry::Header(title.to_string()));
+        for name in names {
+            let Some(cfg) = config.providers.get(name.as_str()) else { continue };
+            let ready = provider_status_ok(config, name);
+            if name.as_str() == current {
+                selected = entries.len();
             }
+            entries.push(ProviderEntry::Provider {
+                name: name.to_string(),
+                kind: provider_short_desc(name, &cfg.kind),
+                ready,
+            });
         }
+    };
+    push_group(&mut entries, "Popular", &popular);
+    push_group(&mut entries, "Providers", &rest);
+    if selected == 0 {
+        selected = provider_picker_move(&entries, 0, 1);
     }
     (entries, selected)
 }
@@ -1048,32 +1044,18 @@ fn first_selectable_picker(entries: &[PickerEntry]) -> usize {
     entries.iter().position(|e| matches!(e, PickerEntry::Model { .. })).unwrap_or(0)
 }
 
-/// Opens the `/provider` grouped picker popup — shared by the `/provider`
-/// command and the "no provider connected yet" nudge on a failed send. A
-/// cached scan opens it instantly; otherwise probing every configured
-/// provider can take several seconds (each has up to a 3s timeout), so
-/// that's spawned rather than awaited here — awaiting inline would freeze
-/// the whole render loop for that long.
-fn open_provider_picker(state: &mut AppState, config: &Config, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
-    if let Some(groups) = state.model_cache.clone() {
-        let (entries, selected) = provider_picker_entries(config, &state.provider, &state.model, &groups);
-        if entries.is_empty() {
-            state.push_error("no providers configured — see config.toml / providers.toml");
-        } else {
-            state.mode = Mode::ProviderPicker { entries, selected };
-        }
+/// Opens the `/provider` picker popup — shared by the `/provider` command
+/// and the "no provider connected yet" nudge on a failed send. Lists
+/// providers only (no per-provider model listing — that's a separate,
+/// deliberate step reached by picking a provider), so unlike the old
+/// merged picker this needs no network probe and opens instantly no matter
+/// how many providers are configured or how slow any of them are to reach.
+fn open_provider_picker(state: &mut AppState, config: &Config) {
+    let (entries, selected) = provider_picker_entries(config, &state.provider);
+    if entries.is_empty() {
+        state.push_error("no providers configured — see config.toml / providers.toml");
     } else {
-        state.fetching_providers = true;
-        state.push_info("fetching providers…");
-        let cfg = config.clone();
-        let provider = state.provider.clone();
-        let model = state.model.clone();
-        let tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let groups = list_models_by_provider(&cfg).await;
-            let (entries, selected) = provider_picker_entries(&cfg, &provider, &model, &groups);
-            let _ = tx.send(UiEvent::ProviderPickerReady(entries, selected, groups));
-        });
+        state.mode = Mode::ProviderPicker { entries, selected };
     }
 }
 
@@ -1086,12 +1068,11 @@ async fn handle_provider_tui(
     config: &Config,
     agent_slot: &mut Option<Agent>,
     state: &mut AppState,
-    ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     match parts.as_slice() {
         // `/provider` with no args — open the grouped picker popup.
-        [] => open_provider_picker(state, config, ui_tx),
+        [] => open_provider_picker(state, config),
         ["key", name, key] => {
             let cfg = match config.providers.get(name) {
                 Some(c) => c,
@@ -1210,6 +1191,12 @@ struct AppState {
     /// Char index (not byte index) into `input`.
     cursor: usize,
     busy: bool,
+    /// Messages submitted while a turn was already in flight — matches the
+    /// reference product's own queued-message behavior: Enter while busy
+    /// doesn't get dropped, it appears in the transcript immediately and
+    /// waits its turn, draining one at a time as each turn finishes rather
+    /// than making the user wait for the composer to unlock before typing.
+    queued_messages: std::collections::VecDeque<String>,
     quit: bool,
     mode: Mode,
     agent_mode: AgentMode,
@@ -1220,6 +1207,10 @@ struct AppState {
     /// Project-root info for the header "directory" panel (workspace name,
     /// root path, git branch if any, file count).
     dir: DirInfo,
+    /// Set once by the one-shot startup version check (`run_app`) if a
+    /// newer release exists — `None` means either still checking, offline,
+    /// or already up to date, all of which render identically (silent).
+    update_available: Option<String>,
 /// Highlighted row in the slash-command dropdown; clamped against the
     /// current match count wherever it's read; reset to 0 whenever the
     /// input text changes so the highlight always starts back at the top
@@ -1231,10 +1222,6 @@ struct AppState {
     model_picker_area: Option<Rect>,
     /// Same for the provider picker popup.
     provider_picker_area: Option<Rect>,
-    /// Bare-provider dropdown (top-right corner, like the HTML page) — same
-    /// `ProviderEntry` shape as the `/provider` picker but rendered as a
-    /// compact popover under the provider button. `None` when hidden.
-    dropdown: Option<DropdownState>,
     /// TODO checklist for the right sidebar (mirrors the HTML sample data).
     todos: Vec<TodoItem>,
     /// True from `PlanGenerated` until the orchestrated run ends. While a
@@ -1246,18 +1233,12 @@ struct AppState {
     /// from the step actually in progress and leaving the checklist telling
     /// a false story about what's finished.
     plan_active: bool,
-    /// The provider-picker dropdown has a free-text search bar, like the
-    /// HTML `.provider-search` box.
-    drop_search: String,
     /// Rendered rect of the TODO list — maps mouse clicks to rows.
     todo_area: Option<Rect>,
-    /// Rendered rect of the top-right provider button — maps a click to
-    /// opening/closing the dropdown.
-    provider_btn_area: Option<Rect>,
     /// When the session started — drives the "Session" readout in the sidebar.
     started: std::time::Instant,
     /// Rendered rects of the empty-state's three example chips, for mouse
-    /// hit-testing — same pattern as `provider_btn_area`.
+    /// hit-testing.
     chip_areas: Vec<Rect>,
     /// Cached provider → models scan (`list_models_by_provider`'s result),
     /// populated on the first dropdown/`/model`/`/provider` open this
@@ -1369,26 +1350,9 @@ struct AppState {
     files_touched: Vec<String>,
 }
 
-struct DropdownState {
-    entries: Vec<ProviderEntry>,
-    selected: usize,
-    /// Where the popover gets drawn. `None` until the first render computes it.
-    area: Option<Rect>,
-    /// When set, the dropdown swaps its list for an inline API-key entry for
-    /// the given provider (still inside the same popover), instead of kicking
-    /// the user out to the full-screen `KeyEntry` mode.
-    keying: Option<KeyingState>,
-}
-
-struct KeyingState {
-    provider: String,
-    key: String,
-}
-
 /// Transcript search — an overlay on top of `Mode::Chat`, not a `Mode`
-/// variant of its own, the same "extra popup state alongside normal chat"
-/// pattern `DropdownState` already uses; a new `Mode` would need updating
-/// every exhaustive match on it across this file for one narrow feature.
+/// variant of its own, so a new `Mode` doesn't need updating every
+/// exhaustive match on it across this file for one narrow feature.
 struct SearchState {
     query: String,
     /// Indices into `AppState::transcript` whose text matches `query`
@@ -1405,6 +1369,22 @@ struct SearchState {
 struct SessionPickerState {
     entries: Vec<SessionSummary>,
     selected: usize,
+    /// Type-to-filter query — same convention as the model picker's own
+    /// search, matched against a session's id and last-message preview.
+    search: String,
+}
+
+/// Sessions matching `picker.search` (id or last-user-message substring,
+/// case-insensitive) — everything when the query is empty.
+fn session_picker_filtered<'a>(picker: &'a SessionPickerState) -> Vec<&'a SessionSummary> {
+    let q = picker.search.to_lowercase();
+    picker
+        .entries
+        .iter()
+        .filter(|s| {
+            q.is_empty() || s.id.to_lowercase().contains(&q) || s.last_user.to_lowercase().contains(&q)
+        })
+        .collect()
 }
 
 struct TodoItem {
@@ -1415,65 +1395,6 @@ struct TodoItem {
     /// still pending/active, or one completed by the generic
     /// `complete_task` heuristic (which has no start time to measure from).
     duration: Option<std::time::Duration>,
-}
-
-/// Builds the compact provider/model rows for the top-right dropdown,
-/// regrouping configured providers so the current one leads, then the rest in
-/// alphabetical order — same scanning approach as the full `/provider` picker.
-fn build_dropdown_entries(
-    config: &Config,
-    current: &str,
-    _current_model: &str,
-    models: &[(String, Vec<zeus_provider::ModelInfo>)],
-) -> Vec<ProviderEntry> {
-    let mut names: Vec<&String> = config.providers.providers.keys().collect();
-    names.sort();
-    if let Some(pos) = names.iter().position(|n| n.as_str() == current) {
-        let cur = names.remove(pos);
-        names.insert(0, cur);
-    }
-    let mut entries = Vec::new();
-    let mut any = false;
-    for name in names {
-        let Some(cfg) = config.providers.get(name) else { continue };
-        let ready = provider_status_ok(config, name);
-        any = true;
-        entries.push(ProviderEntry::Header(name.to_string()));
-        let provider_models = models
-            .iter()
-            .find(|(n, _)| n == (name as &String))
-            .map(|(_, m)| m.as_slice())
-            .unwrap_or(&[]);
-        if provider_models.is_empty() {
-            // Nothing fetched yet (needs a key, or unreachable) — a single
-            // status row instead of repeating the header with no models
-            // under it.
-            entries.push(ProviderEntry::Provider {
-                name: name.to_string(),
-                kind: cfg.kind.clone(),
-                model: cfg.default_model.clone().unwrap_or_default(),
-                ready,
-            });
-        } else {
-            for (family, family_models) in group_models_by_family(provider_models) {
-                if let Some(family) = family {
-                    entries.push(ProviderEntry::SubHeader(family));
-                }
-                for m in family_models {
-                    let free = is_free_model(&m.id);
-                    entries.push(ProviderEntry::Model {
-                        provider: name.to_string(),
-                        model: m,
-                        free,
-                    });
-                }
-            }
-        }
-    }
-    if any {
-        entries.push(ProviderEntry::Header("manage providers — /provider".to_string()));
-    }
-entries
 }
 
 /// Git branch shown in the side-panel session footer. Single field only —
@@ -1497,6 +1418,7 @@ impl AppState {
             input: String::new(),
             cursor: 0,
             busy: false,
+            queued_messages: std::collections::VecDeque::new(),
             quit: false,
             mode: Mode::Chat,
             agent_mode: if start_in_plan { AgentMode::Plan } else { AgentMode::Build },
@@ -1505,15 +1427,13 @@ impl AppState {
             session_id: agent.session_id().to_string(),
             known_commands,
             dir,
+            update_available: None,
             command_selected: 0,
             model_picker_area: None,
             provider_picker_area: None,
-            dropdown: None,
             todos: Vec::new(),
             plan_active: false,
-            drop_search: String::new(),
             todo_area: None,
-            provider_btn_area: None,
             started: std::time::Instant::now(),
             chip_areas: Vec::new(),
             model_cache: None,
@@ -1667,6 +1587,22 @@ impl AppState {
                 self.plan_active = false;
             }
             AgentEvent::Done => self.flush_current_reply(),
+            AgentEvent::TodosUpdated { todos } => {
+                // The model owns this list and sends the full state every
+                // call (not a diff) — replace wholesale, same convention
+                // the reference product's own todo tool uses. This works
+                // in any mode (Build included), unlike the old checklist
+                // which only ever populated from an orchestrated `/plan`.
+                self.todos = todos
+                    .into_iter()
+                    .map(|t| TodoItem {
+                        done: t.status == "completed",
+                        active: t.status == "in_progress",
+                        text: t.content,
+                        duration: None,
+                    })
+                    .collect();
+            }
             AgentEvent::PlanGenerated { steps } => {
                 let roster = steps
                     .iter()
@@ -2064,8 +2000,28 @@ mod theme {
     pub const PANEL: Color = Color::Rgb(0x0d, 0x10, 0x17);
     /// `--panel-2`: slightly lighter panel (`#11141c`).
     pub const PANEL2: Color = Color::Rgb(0x11, 0x14, 0x1c);
-    /// `--elevated`: dropdown/elevated surface (`#161a24`).
-    pub const ELEVATED: Color = Color::Rgb(0x16, 0x1a, 0x24);
+    /// Solid near-black background for every full-screen modal (model,
+    /// provider, key-entry, session picker, approval, command palette) —
+    /// `PANEL` (`#0d1017`) sits so close to `VOID` (`#07080d`) that those
+    /// modals read as translucent, with the transcript text behind them
+    /// still legible through the low-contrast fill. These are meant to be
+    /// fully opaque overlays (matching the reference product's own solid
+    /// black popup), so they get a
+    /// distinctly darker, higher-contrast fill instead of reusing `PANEL`.
+    pub const MODAL_BG: Color = Color::Rgb(0x00, 0x00, 0x00);
+    /// Full-width selected-row highlight for those same popups — a solid
+    /// warm bar instead of `PANEL2` + colored text, matching the reference
+    /// product's own selection style.
+    pub const MODAL_SELECTED_BG: Color = Color::Rgb(0xd9, 0x8a, 0x4f);
+    /// Tool-call card background (`Block_::tool_card_lines`) — deliberately
+    /// much lighter than `PANEL2`/`ELEVATED`, which read as barely-there
+    /// against the transcript's `VOID` background once real syntax-
+    /// highlighted or diff-tinted text sits on top of them (the same
+    /// too-subtle-to-read-as-a-surface mistake `MODAL_BG` already fixed
+    /// for the popups, just needing the opposite direction here — a card
+    /// embedded in a dark transcript needs to read as clearly *elevated*,
+    /// not clearly *opaque*).
+    pub const CARD_BG: Color = Color::Rgb(0x1c, 0x22, 0x30);
     /// `--border`: borders (`#20242f`).
     pub const BORDER: Color = Color::Rgb(0x20, 0x24, 0x2f);
     /// `--border-soft`: soft borders (`#181c26`).
@@ -2198,18 +2154,6 @@ mod theme {
         NOTIFY_ON_COMPLETION.store(v, Ordering::Relaxed);
     }
 
-    /// A muted (60% brightness) variant of `accent()` for subtle borders.
-    pub fn accent_dim() -> Color {
-        match accent() {
-            Color::Rgb(r, g, b) => Color::Rgb(
-                (r as f32 * 0.6) as u8,
-                (g as f32 * 0.6) as u8,
-                (b as f32 * 0.6) as u8,
-            ),
-            other => other,
-        }
-    }
-
     pub fn muted() -> Style {
         Style::default().fg(MUTED)
     }
@@ -2268,11 +2212,16 @@ fn menu_height(matches: &[(&str, &str)]) -> u16 {
 /// rows: `.pc` command labels colored `--mode-color`, `.pd` descriptions
 /// dim, `.active` row tinted with the mode color).
 fn render_menu(f: &mut Frame, area: Rect, matches: &[(&str, &str)], selected: usize, accent: Color) -> Rect {
+    // Backdrop-dim, opaque fill, violet chrome, solid selection bar — the
+    // same modal treatment as the picker family, since this is a real modal
+    // (opened by typing "/" or ctrl+p) rather than a passive dropdown, even
+    // though it was originally styled as the latter.
+    dim_backdrop(f, f.area());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::BORDER))
-        .style(Style::default().bg(theme::ELEVATED));
+        .border_style(border_style())
+        .style(Style::default().bg(theme::MODAL_BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2288,7 +2237,7 @@ fn render_menu(f: &mut Frame, area: Rect, matches: &[(&str, &str)], selected: us
         })
         .collect();
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::PANEL2).fg(accent).add_modifier(Modifier::BOLD),
+        Style::default().bg(theme::MODAL_SELECTED_BG).fg(theme::VOID).add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(selected.min(matches.len().saturating_sub(1))));
@@ -2303,7 +2252,10 @@ fn render_menu(f: &mut Frame, area: Rect, matches: &[(&str, &str)], selected: us
 /// color and status line repaint whenever the mode switches.
 fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u16) {
     let accent = mode_accent(state.agent_mode);
-    let focused = !state.busy && matches!(state.mode, Mode::Chat);
+    // Typing (to queue the next message) works even mid-turn now, so the
+    // composer stays "focused" while busy too — only an actual picker/modal
+    // mode takes the cursor away.
+    let focused = matches!(state.mode, Mode::Chat);
     let bar = if focused { accent } else { theme::BORDER };
     // A single thick accent bar down the left edge on a flat elevated panel
     // — no full box border, no `›` caret — rather than the earlier
@@ -2360,18 +2312,20 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
         return;
     }
 
-    let input_line = if state.busy {
+    let input_line = if !state.input.is_empty() {
+        // A queued draft takes priority over the busy placeholder — typing
+        // the next message mid-turn should actually show what you typed.
+        Line::from(Span::raw(state.input.clone()))
+    } else if state.busy {
         Line::from(Span::styled(
-            format!("{} zeus is working…", spinner_glyph(state)),
+            format!("{} zeus is working… (you can type the next message)", spinner_glyph(state)),
             placeholder_style(),
         ))
-    } else if state.input.is_empty() {
+    } else {
         Line::from(vec![
             Span::styled("Ask anything… ", placeholder_style()),
             Span::styled("\"Fix a TODO in the codebase\"", placeholder_style()),
         ])
-    } else {
-        Line::from(Span::raw(state.input.clone()))
     };
     f.render_widget(Paragraph::new(input_line).wrap(Wrap { trim: false }), text_row);
 
@@ -2409,7 +2363,9 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
 fn hint_pair(key: &str, label: &str) -> Vec<Span<'static>> {
     vec![
         Span::styled(key.to_string(), theme::text().add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {label}"), theme::faint()),
+        // `dim()` not `faint()` — these are the app's primary discoverable
+        // keybinding hints, not decoration; `faint()` fails WCAG contrast.
+        Span::styled(format!(" {label}"), theme::dim()),
     ]
 }
 
@@ -2418,7 +2374,7 @@ fn hint_pair(key: &str, label: &str) -> Vec<Span<'static>> {
 fn render_hints(f: &mut Frame, area: Rect, _state: &AppState) {
     let mut spans = hint_pair("tab", "agents");
     spans.push(Span::raw("    "));
-    spans.extend(hint_pair("/", "commands"));
+    spans.extend(hint_pair("/ ctrl+p", "commands"));
     spans.push(Span::raw("    "));
     spans.extend(hint_pair("click msg", "copy"));
     spans.push(Span::raw("    "));
@@ -2512,7 +2468,7 @@ fn render_search_bar(f: &mut Frame, area: Rect, search: &SearchState) {
             Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
         )))
         .title_bottom(
-            Line::from(Span::styled(" enter next · esc close ", theme::faint())).alignment(Alignment::Center),
+            Line::from(Span::styled(" enter next · esc close ", theme::dim())).alignment(Alignment::Center),
         );
     let inner = block.inner(bar_area);
     f.render_widget(block, bar_area);
@@ -2525,9 +2481,10 @@ fn render_search_bar(f: &mut Frame, area: Rect, search: &SearchState) {
 /// hit-testing.
 fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionPickerState) -> Rect {
     let width = area.width.saturating_sub(6).clamp(40, 96);
-    let height = (picker.entries.len() as u16 + 4)
+    let filtered = session_picker_filtered(picker);
+    let height = (filtered.len() as u16 + 5)
         .min(PICKER_MAX_H)
-        .clamp(8, area.height.saturating_sub(4).max(8));
+        .clamp(9, area.height.saturating_sub(4).max(9));
     let popup = centered_rect(width, height, area);
 
     f.render_widget(Clear, popup);
@@ -2535,25 +2492,42 @@ fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionPickerState)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style())
-        .style(Style::default().bg(theme::PANEL))
+        .style(Style::default().bg(theme::MODAL_BG))
         .title(Line::from(vec![Span::styled(
-            " resume session ",
-            theme::green().add_modifier(Modifier::BOLD),
+            " Resume session ",
+            theme::text().add_modifier(Modifier::BOLD),
         )]))
         .title(
-            Line::from(Span::styled(format!("{} ", picker.entries.len()), theme::faint()))
-                .alignment(Alignment::Right),
+            Line::from(vec![
+                Span::styled(format!("{} ", filtered.len()), theme::faint()),
+                Span::styled("esc ", theme::dim()),
+            ])
+            .alignment(Alignment::Right),
         )
         .title_bottom(
-            Line::from(Span::styled(" ↑/↓ navigate · enter resume · esc dismiss ", theme::faint()))
+            Line::from(Span::styled(" ↑/↓ navigate · enter resume · esc dismiss ", theme::dim()))
                 .alignment(Alignment::Center),
         );
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let inner_w = inner.width as usize;
-    let items: Vec<ListItem> = picker
-        .entries
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let search_line = if picker.search.is_empty() {
+        Line::from(vec![
+            Span::styled("▸ ", theme::violet()),
+            Span::styled("Search sessions…", placeholder_style()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("▸ ", theme::violet()),
+            Span::styled(picker.search.clone(), theme::text()),
+        ])
+    };
+    f.render_widget(Paragraph::new(search_line), rows[0]);
+
+    let list_area = rows[1];
+    let inner_w = list_area.width as usize;
+    let items: Vec<ListItem> = filtered
         .iter()
         .map(|s| {
             let preview = if s.last_user.is_empty() {
@@ -2572,13 +2546,13 @@ fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionPickerState)
         })
         .collect();
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::PANEL2).fg(theme::accent()).add_modifier(Modifier::BOLD),
+        Style::default().bg(theme::MODAL_SELECTED_BG).fg(theme::VOID).add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
-    list_state.select(Some(picker.selected.min(picker.entries.len().saturating_sub(1))));
-    f.render_stateful_widget(list, inner, &mut list_state);
+    list_state.select(Some(picker.selected.min(filtered.len().saturating_sub(1))));
+    f.render_stateful_widget(list, list_area, &mut list_state);
 
-    inner
+    list_area
 }
 
 /// Resets everything tied to *this conversation's view* — transcript,
@@ -2635,14 +2609,20 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     let menu_h = menu_height(&state.command_matches());
     // The text row grows with the input — a long message used to be
     // capped at a single fixed row and silently clip everything past the
-    // first wrapped line, with no indication anything was cut off. Capped
-    // at 6 rows so a very long paste can't eat the whole transcript; a
-    // second, always-1-row line underneath carries mode/model/provider
-    // status normally (a prompt/preview line for the TUI-only
-    // `Approval`/`KeyEntry` states) — no top/bottom border to add for
-    // (the box only has a left accent bar, not a full box border).
+    // first wrapped line, with no indication anything was cut off. The cap
+    // itself scales with the available screen height (up to a third of
+    // the chat column, floor 6 rows, ceiling 20) rather than a fixed small
+    // number, so genuinely long pasted/typed text keeps expanding the
+    // composer instead of scrolling invisibly inside a tiny fixed box —
+    // while still guaranteeing at least ~2/3 of the screen stays available
+    // for the transcript on any terminal size. A second, always-1-row line
+    // underneath carries mode/model/provider status normally (a
+    // prompt/preview line for the TUI-only `Approval`/`KeyEntry` states) —
+    // no top/bottom border to add for (the box only has a left accent bar,
+    // not a full box border).
     let composer_inner_w = area.width.saturating_sub(3).max(10) as usize;
-    let input_text_h = wrap_text(&state.input, composer_inner_w).len().clamp(1, 6) as u16;
+    let max_input_rows = (area.height / 3).clamp(6, 20) as usize;
+    let input_text_h = wrap_text(&state.input, composer_inner_w).len().clamp(1, max_input_rows) as u16;
     // +1 for the status row, +1 for a blank row of top padding — a
     // one-line-tall composer (the common case: a short command) otherwise
     // reads as barely a sliver next to the transcript above it.
@@ -2688,14 +2668,48 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     state.transcript_applied_scroll = scroll;
     state.transcript_block_rows = transcript_block_rows(state, rows[0].width);
 
+    render_input_box(f, rows[2], state, input_text_h);
+    render_hints(f, rows[3], state);
+    // Drawn last, once everything else in the column is already on the
+    // buffer — `render_menu` dims the whole frame as a backdrop before
+    // drawing itself, and that only dims what's already been painted.
+    // Drawing it earlier (its position doesn't depend on draw order, since
+    // `rows[1]` was already computed above) would leave the composer/hints
+    // drawn fresh and undimmed right next to a dimmed transcript.
     state.command_menu_area = if menu_h > 0 {
         let matches = state.command_matches();
         Some(render_menu(f, rows[1], &matches, state.command_selected, mode_accent(state.agent_mode)))
     } else {
         None
     };
-    render_input_box(f, rows[2], state, input_text_h);
-    render_hints(f, rows[3], state);
+}
+
+/// Darkens every cell in `area` toward black — approximates the reference
+/// product's semi-transparent black backdrop behind an open modal. Ratatui
+/// has no real alpha blending, so this directly blends each already-
+/// rendered cell's fg/bg color toward black instead of compositing a
+/// translucent layer; the modal drawn immediately afterward fully repaints
+/// its own footprint anyway; so it doesn't matter that this dims that too.
+fn dim_backdrop(f: &mut Frame, area: Rect) {
+    fn dim(c: Color) -> Color {
+        match c {
+            Color::Rgb(r, g, b) => Color::Rgb(
+                (r as f32 * 0.45) as u8,
+                (g as f32 * 0.45) as u8,
+                (b as f32 * 0.45) as u8,
+            ),
+            other => other,
+        }
+    }
+    let buf = f.buffer_mut();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.fg = dim(cell.fg);
+                cell.bg = dim(cell.bg);
+            }
+        }
+    }
 }
 
 /// Centers a `width`x`height` box within `area` (clamped to fit).
@@ -2718,8 +2732,16 @@ fn render_key_entry_modal(f: &mut Frame, area: Rect, provider: &str, input: &str
     let (blurb, url) = provider_blurb(provider);
     let width = area.width.saturating_sub(10).clamp(40, 76);
     let blurb_lines = textwrap_len(blurb, width as usize - 4);
-    // title, blank, blurb lines, blank, url line (if any), blank, input box (3), blank, footer
-    let height = (3 + blurb_lines + if url.is_some() { 2 } else { 0 } + 5)
+    // A pasted key is one long unbroken token — masked or not, it's the
+    // same length as typed, so a long one (some provider tokens run past
+    // 100 chars) needs the same wrap-and-grow treatment as any other input
+    // box instead of running off the edge of a fixed single-line field.
+    let key_display_len = if input.is_empty() { 0 } else { char_count(input) };
+    let input_text_h = wrap_text(&"x".repeat(key_display_len), (width as usize).saturating_sub(6).max(10))
+        .len()
+        .clamp(1, 5) as u16;
+    // title, blank, blurb lines, blank, url line (if any), blank, input box (border×2 + text), blank, footer
+    let height = (3 + blurb_lines + if url.is_some() { 2 } else { 0 } + 4 + input_text_h as usize)
         .clamp(9, area.height.saturating_sub(4).max(9) as usize) as u16;
     let popup = centered_rect(width, height, area);
 
@@ -2728,14 +2750,14 @@ fn render_key_entry_modal(f: &mut Frame, area: Rect, provider: &str, input: &str
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style())
-        .style(Style::default().bg(theme::PANEL))
+        .style(Style::default().bg(theme::MODAL_BG))
         .title(Line::from(vec![Span::styled(
             " API key ",
-            theme::green().add_modifier(Modifier::BOLD),
+            theme::text().add_modifier(Modifier::BOLD),
         )]))
-        .title(Line::from(Span::styled(" esc ", theme::faint())).alignment(Alignment::Right))
+        .title(Line::from(Span::styled(" esc ", theme::dim())).alignment(Alignment::Right))
         .title_bottom(
-            Line::from(Span::styled(" enter submit ", theme::faint())).alignment(Alignment::Center),
+            Line::from(Span::styled(" enter submit ", theme::dim())).alignment(Alignment::Center),
         );
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -2745,11 +2767,16 @@ fn render_key_entry_modal(f: &mut Frame, area: Rect, provider: &str, input: &str
         rows.push(Constraint::Length(1));
     }
     if url.is_some() {
-        rows.push(Constraint::Length(1));
+        // `Min(0)` rather than `Length(1)` — a blank spacer, so on a short
+        // terminal it's the first thing the layout solver sacrifices down
+        // to zero height instead of squeezing the input box itself (which
+        // stays `Length`-fixed below). On a tall enough terminal it simply
+        // absorbs the little slack `height`'s own clamp already builds in.
+        rows.push(Constraint::Min(0));
         rows.push(Constraint::Length(1));
     }
-    rows.push(Constraint::Length(1));
-    rows.push(Constraint::Length(3));
+    rows.push(Constraint::Min(0));
+    rows.push(Constraint::Length(input_text_h + 2));
     let rows = Layout::vertical(rows).split(inner);
 
     let mut r = 0usize;
@@ -2776,18 +2803,26 @@ fn render_key_entry_modal(f: &mut Frame, area: Rect, provider: &str, input: &str
     }
     r += 1; // blank spacer row before the input box
 
+    // Violet border (matching the outer modal's own chrome) and plain text
+    // color — this used to be a one-off teal border with green typed text,
+    // an unexplained divergence from every other input field in the app.
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::TEAL));
+        .border_style(border_style());
     let input_inner = input_block.inner(rows[r]);
     f.render_widget(input_block, rows[r]);
-    let key_line = if input.is_empty() {
-        Line::from(Span::styled("paste or type your key…", placeholder_style()))
+    if input.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("paste or type your key…", placeholder_style()))),
+            input_inner,
+        );
     } else {
-        Line::from(Span::styled(mask_secret(input), theme::green()))
-    };
-    f.render_widget(Paragraph::new(key_line), input_inner);
+        f.render_widget(
+            Paragraph::new(mask_secret(input)).style(theme::text()).wrap(Wrap { trim: false }),
+            input_inner,
+        );
+    }
 
     input_inner
 }
@@ -2803,7 +2838,7 @@ fn render_approval_modal(f: &mut Frame, area: Rect, pending: &ApprovalRequestMsg
     let width = area.width.saturating_sub(8).clamp(50, 120);
     let preview_w = width.saturating_sub(4) as usize;
     let preview_lines: Vec<Line> = if super::highlight::looks_like_diff(preview) {
-        super::highlight::diff_lines(preview, placeholder_style())
+        super::highlight::diff_lines(preview, placeholder_style(), preview_w)
             .into_iter()
             .map(Line::from)
             .collect()
@@ -2828,16 +2863,19 @@ fn render_approval_modal(f: &mut Frame, area: Rect, pending: &ApprovalRequestMsg
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        // Gold border/title stays — a permission ask is deliberately
+        // distinct from a neutral picker — but the fill and title casing
+        // still match the rest of the modal family for consistency.
         .border_style(Style::default().fg(theme::GOLD))
-        .style(Style::default().bg(theme::PANEL))
+        .style(Style::default().bg(theme::MODAL_BG))
         .title(Line::from(vec![Span::styled(
-            " permission needed ",
+            " Permission needed ",
             theme::gold().add_modifier(Modifier::BOLD),
         )]))
         .title_bottom(
             Line::from(Span::styled(
                 " y approve · s approve for session · n/esc deny ",
-                theme::faint(),
+                theme::dim(),
             ))
             .alignment(Alignment::Center),
         );
@@ -2869,14 +2907,40 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
-        let candidate_len = if current.is_empty() { word.len() } else { current.len() + 1 + word.len() };
-        if candidate_len > width && !current.is_empty() {
-            lines.push(std::mem::take(&mut current));
+        let mut remaining = word;
+        loop {
+            let word_len = char_count(remaining);
+            let candidate_len = if current.is_empty() {
+                word_len
+            } else {
+                char_count(&current) + 1 + word_len
+            };
+            if candidate_len <= width {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(remaining);
+                break;
+            }
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                continue;
+            }
+            // `remaining` alone is still longer than `width` — a pasted API
+            // key, URL, or path with no whitespace to break on. Ratatui's
+            // real `Paragraph` wrap hard-breaks an overlong word at the
+            // column boundary rather than letting it run past the edge, so
+            // this has to match that or every caller sizing a box / placing
+            // a cursor from this function's line count disagrees with what
+            // actually gets drawn.
+            let chunk: String = remaining.chars().take(width).collect();
+            let chunk_bytes = chunk.len();
+            lines.push(chunk);
+            remaining = &remaining[chunk_bytes..];
+            if remaining.is_empty() {
+                break;
+            }
         }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
     }
     if !current.is_empty() {
         lines.push(current);
@@ -3016,23 +3080,23 @@ fn render_model_picker(
     f.render_widget(Clear, popup);
     let corner = Line::from(vec![
         Span::styled(format!("{} ", filtered.len()), theme::faint()),
-        Span::styled("esc ", theme::faint()),
+        Span::styled("esc ", theme::dim()),
     ])
     .alignment(Alignment::Right);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style())
-        .style(Style::default().bg(theme::PANEL))
+        .style(Style::default().bg(theme::MODAL_BG))
         .title(Line::from(vec![Span::styled(
-            " select model ",
-            theme::green().add_modifier(Modifier::BOLD),
+            " Select model ",
+            theme::text().add_modifier(Modifier::BOLD),
         )]))
         .title(corner)
         .title_bottom(
             Line::from(Span::styled(
                 " ↑/↓ navigate · enter select · ctrl+f favorite · ctrl+a connect provider · esc dismiss ",
-                theme::faint(),
+                theme::dim(),
             ))
             .alignment(Alignment::Center),
         );
@@ -3061,7 +3125,7 @@ fn render_model_picker(
         .map(|entry| match entry {
             PickerEntry::Header(name) => ListItem::new(Line::from(Span::styled(
                 name.to_uppercase(),
-                theme::green().add_modifier(Modifier::BOLD),
+                theme::violet().add_modifier(Modifier::BOLD),
             ))),
             PickerEntry::SubHeader(family) => ListItem::new(Line::from(vec![
                 Span::styled("  ", theme::faint()),
@@ -3070,12 +3134,8 @@ fn render_model_picker(
             PickerEntry::Model { provider, model } => {
                 let is_current = model.id == current_model && provider == current_provider;
                 let is_fav = favorites.iter().any(|(p, m)| p == provider && m == &model.id);
-                let marker = if is_current { "● " } else { "○ " };
-                let marker_style = if is_current {
-                    theme::green().add_modifier(Modifier::BOLD)
-                } else {
-                    theme::faint()
-                };
+                let marker = if is_current { "● " } else { "  " };
+                let marker_style = theme::gold().add_modifier(Modifier::BOLD);
                 let star = if is_fav { "★ " } else { "" };
                 let provider_suffix = format!(" {provider}");
                 let free = is_free_model(&model.id);
@@ -3104,15 +3164,18 @@ fn render_model_picker(
                 ];
                 if !tag.is_empty() {
                     spans.push(Span::raw(" ".repeat(pad_w)));
-                    let tag_style = if free { theme::green().add_modifier(Modifier::BOLD) } else { theme::faint() };
+                    let tag_style = if free { theme::gold().add_modifier(Modifier::BOLD) } else { theme::faint() };
                     spans.push(Span::styled(tag, tag_style));
                 }
                 ListItem::new(Line::from(spans))
             }
         })
         .collect();
+    // A solid full-width warm highlight bar for the selected row, matching
+    // the reference product's own selection style, instead of a subtle
+    // panel-tint + colored-text highlight.
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::PANEL2).fg(theme::accent()).add_modifier(Modifier::BOLD),
+        Style::default().bg(theme::MODAL_SELECTED_BG).fg(theme::VOID).add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(selected.min(filtered.len().saturating_sub(1))));
@@ -3121,33 +3184,13 @@ fn render_model_picker(
     list_area
 }
 
-/// Walks backward from `idx` to see whether the entry at `idx` sits inside a
-/// vendor-family `SubHeader` group (an aggregator provider's catalog spanning
-/// more than one recognizable vendor) as opposed to a flat per-provider model
-/// list. Stops at the nearest `SubHeader` (grouped) or `Header`/`Provider`
-/// row (not grouped) — a `Model` row just keeps scanning past its siblings.
-fn family_context_for(entries: &[ProviderEntry], idx: usize) -> Option<&str> {
-    let mut i = idx;
-    while i > 0 {
-        i -= 1;
-        match &entries[i] {
-            ProviderEntry::SubHeader(family) => return Some(family.as_str()),
-            ProviderEntry::Header(_) | ProviderEntry::Provider { .. } => return None,
-            ProviderEntry::Model { .. } => {}
-        }
-    }
-    None
-}
-
 /// The `/provider` popup: providers grouped into Local / Free / Paid headers
 /// with a status dot (green = ready, amber = needs a key) and a hint that
 /// selecting a key-less provider opens the paste prompt.
 fn render_provider_picker(
     f: &mut Frame,
     area: Rect,
-    config: &Config,
     current_provider: &str,
-    current_model: &str,
     entries: &[ProviderEntry],
     selected: usize,
 ) -> Rect {
@@ -3157,49 +3200,29 @@ fn render_provider_picker(
         .clamp(8, area.height.saturating_sub(4).max(8));
     let popup = centered_rect(width, height, area);
 
-    // A model grouped under a vendor `SubHeader` (an aggregator's catalog,
-    // e.g. OpenCode Zen serving Anthropic/DeepSeek/Gemini models) is reached
-    // through the aggregator's own key, not a separate one — so if that
-    // aggregator is already configured, picking one of its models needs no
-    // extra key and the footer says so instead of implying one might be
-    // asked for.
-    let selectable_model_count = entries
-        .iter()
-        .filter(|e| matches!(e, ProviderEntry::Model { .. }))
-        .count();
-    let aggregator_note = match entries.get(selected) {
-        Some(ProviderEntry::Model { provider, .. })
-            if family_context_for(entries, selected).is_some()
-                && provider_status_ok(config, provider) =>
-        {
-            Some(provider.clone())
-        }
-        _ => None,
-    };
+    let provider_count = entries.iter().filter(|e| matches!(e, ProviderEntry::Provider { .. })).count();
 
     f.render_widget(Clear, popup);
     let corner = Line::from(vec![
-        Span::styled(format!("{selectable_model_count} "), theme::faint()),
-        Span::styled("esc ", theme::faint()),
+        Span::styled(format!("{provider_count} "), theme::faint()),
+        Span::styled("esc ", theme::dim()),
     ])
     .alignment(Alignment::Right);
-    let footer = match &aggregator_note {
-        Some(provider) => format!(
-            " ↑/↓ navigate · enter select · billed via your {provider} key, no separate key needed · esc dismiss "
-        ),
-        None => " ↑/↓ navigate · enter select (or paste key) · esc dismiss ".to_string(),
-    };
+    // Picking a provider that still needs a key doesn't dead-end here — it
+    // opens the key-paste prompt, then automatically opens the model picker
+    // for that provider once the key is saved (see `persist_key_and_switch`).
+    let footer = " ↑/↓ navigate · enter select (asks for a key if needed) · esc dismiss ";
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style())
-        .style(Style::default().bg(theme::PANEL))
+        .style(Style::default().bg(theme::MODAL_BG))
         .title(Line::from(vec![
-            Span::styled(" select provider ", theme::green().add_modifier(Modifier::BOLD)),
+            Span::styled(" Select provider ", theme::text().add_modifier(Modifier::BOLD)),
         ]))
         .title(corner)
         .title_bottom(
-            Line::from(Span::styled(footer, theme::faint())).alignment(Alignment::Center),
+            Line::from(Span::styled(footer, theme::dim())).alignment(Alignment::Center),
         );
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -3209,63 +3232,37 @@ fn render_provider_picker(
         .map(|entry| match entry {
             ProviderEntry::Header(name) => ListItem::new(Line::from(Span::styled(
                 format!(" {} ", name.to_uppercase()),
-                theme::green().add_modifier(Modifier::BOLD),
+                theme::violet().add_modifier(Modifier::BOLD),
             ))),
-            ProviderEntry::SubHeader(family) => ListItem::new(Line::from(vec![
-                Span::styled("   ", theme::faint()),
-                Span::styled(family.clone(), theme::dim().add_modifier(Modifier::ITALIC)),
-            ])),
-            ProviderEntry::Provider {
-                name,
-                kind,
-                model,
-                ready,
-            } => {
+            ProviderEntry::Provider { name, kind, ready } => {
                 let is_current = name == current_provider;
-                let dot = if *ready { theme::green() } else { theme::gold() };
-                let dot_label = if *ready { "●" } else { "◌" };
-                let status = if is_current { " (current)" } else { "" };
-                let key_note = if *ready {
-                    String::new()
+                // A connected provider gets a plain checkmark gutter,
+                // matching the reference product's own treatment — no
+                // separate "(current)"/"needs key" text; readiness alone
+                // tells the story, and `apply_provider_picker_choice`
+                // routes an unready pick straight to the key prompt anyway.
+                let gutter = if *ready {
+                    Span::styled("✓", theme::green().add_modifier(Modifier::BOLD))
                 } else {
-                    "  needs key".to_string()
+                    Span::styled(" ", theme::faint())
+                };
+                let name_style = if is_current {
+                    theme::text().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    theme::text().add_modifier(Modifier::BOLD)
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(dot_label, dot.add_modifier(Modifier::BOLD)),
+                    gutter,
                     Span::raw("  "),
-                    Span::styled(name.clone(), theme::text().add_modifier(Modifier::BOLD)),
-                    Span::styled(status, theme::green()),
+                    Span::styled(name.clone(), name_style),
                     Span::raw("  "),
                     Span::styled(kind.clone(), theme::dim()),
-                    Span::styled(format!(" / {model}"), theme::faint()),
-                    Span::styled(key_note, theme::gold()),
-                ]))
-            }
-            ProviderEntry::Model { model, free, .. } => {
-                let is_current = model.id == current_model;
-                let tag = if is_current {
-                    "✓ ".to_string()
-                } else {
-                    "   ".to_string()
-                };
-                let tier = if *free {
-                    Span::styled("free", theme::green().add_modifier(Modifier::BOLD))
-                } else {
-                    Span::styled("paid", theme::gold().add_modifier(Modifier::BOLD))
-                };
-                ListItem::new(Line::from(vec![
-                    Span::raw("   "),
-                    Span::styled(tag, theme::green().add_modifier(Modifier::BOLD)),
-                    Span::styled(model.name.clone(), theme::text()),
-                    Span::raw("  "),
-                    tier,
-                    Span::styled(format!("  ·  {}", model.id), theme::faint()),
                 ]))
             }
         })
         .collect();
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::PANEL2).fg(theme::accent()).add_modifier(Modifier::BOLD),
+        Style::default().bg(theme::MODAL_SELECTED_BG).fg(theme::VOID).add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(selected.min(entries.len().saturating_sub(1))));
@@ -3323,7 +3320,7 @@ fn gradient_wordmark(text: &str) -> Vec<Span<'static>> {
 /// segmented-pill control, a flexible spacer, and the provider button (with
 /// status dot) all inline, followed by the `border-bottom` hairline.
 /// Returns the provider button's rect for mouse hit testing.
-fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, config: &Config) -> Option<Rect> {
+fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, _config: &Config) {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
 
     // The wordmark carries the same rainbow/pulse sweep as the splash logo;
@@ -3338,27 +3335,23 @@ fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, config: &Config) -
         let t = state.started.elapsed().as_millis();
         logo_spans.extend(super::decor::animated_wordmark("ZEUS", t));
     }
-    logo_spans.push(Span::styled("  v1.0", theme::faint()));
+    logo_spans.push(Span::styled(
+        format!("  v{}", env!("CARGO_PKG_VERSION")),
+        theme::faint(),
+    ));
+    if let Some(latest) = &state.update_available {
+        // Passive only — never auto-installs. `zeus update` (or `zeus
+        // update --check`) is still the only thing that actually changes
+        // anything; see `update.rs`'s doc comment for why a silent
+        // background auto-update (like OpenCode's) isn't worth copying.
+        logo_spans.push(Span::styled(
+            format!(" → v{latest} (run `zeus update`)"),
+            theme::gold(),
+        ));
+    }
     let logo = Line::from(logo_spans);
 
     let pills = mode_pills_line(state.agent_mode);
-
-    // Bracketed like the mode pills to hint at the HTML's bordered pill
-    // button, since a single topbar row leaves no room for an actual border.
-    // Filled vs. hollow, not just green-vs-gold, matching the same ●/◌
-    // convention the provider picker/dropdown already use — a bare color
-    // dot is the one status signal in the topbar with no shape backup for
-    // colorblind users to fall back on.
-    let ready_dot = if provider_status_ok(config, &state.provider) { "● " } else { "◌ " };
-    let provider_line = Line::from(vec![
-        Span::styled("[ ", theme::faint()),
-        Span::styled(ready_dot, provider_status_style(config, &state.provider)),
-        Span::styled(state.provider.clone(), theme::dim()),
-        Span::styled("  ", theme::faint()),
-        Span::styled(state.model.clone(), theme::text().add_modifier(Modifier::BOLD)),
-        Span::styled("  ▾", theme::faint()),
-        Span::styled(" ]", theme::faint()),
-    ]);
 
     // Which specialist is driving the current Auto-mode plan step /
     // `/workflow` phase — previously only visible as a scrolling info line
@@ -3371,16 +3364,18 @@ fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, config: &Config) -
     });
     let persona_w = persona_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
 
-    // logo | gap | mode pills | persona chip | flexible spacer | provider
-    // button — the HTML's `display:flex; gap:18px` row with
-    // `.topbar-spacer{flex:1}`.
+    // logo | gap | mode pills | persona chip | flexible spacer. No
+    // provider/model chip up here anymore — the reference product doesn't
+    // put one in its top bar either, and the composer's own status line
+    // (`{Mode} · {model} {provider}`) already shows the same information,
+    // so the top-right button was a redundant second surface for the same
+    // action `/provider`/`ctrl+a`/`ctrl+p` already cover.
     let cols = Layout::horizontal([
         Constraint::Length(logo.width() as u16),
         Constraint::Length(3),
         Constraint::Length(pills.width() as u16),
         Constraint::Length(persona_w),
         Constraint::Min(0),
-        Constraint::Length(provider_line.width() as u16 + 2),
     ])
     .split(rows[0]);
     f.render_widget(Paragraph::new(logo), cols[0]);
@@ -3388,8 +3383,6 @@ fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, config: &Config) -
     if let Some(persona_line) = persona_line {
         f.render_widget(Paragraph::new(persona_line), cols[3]);
     }
-    f.render_widget(Paragraph::new(provider_line), cols[5]);
-    let provider_btn = cols[5];
 
     // Hairline separator — the HTML `border-bottom` of the topbar.
     f.render_widget(
@@ -3399,8 +3392,6 @@ fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, config: &Config) -
         ))),
         rows[1],
     );
-
-    Some(provider_btn)
 }
 
 /// The HTML `.modes` segmented control — PLAN/BUILD/AUTO with the active
@@ -3699,35 +3690,9 @@ fn render_side_foot(f: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
-/// Filter trimmed drop_searched dropdown entries into (original_index,
-/// row). Header/footer rows are excluded.
-/// Filter trimmed `drop_search` entries into a flat row list (header rows
-/// included so the group names render, but never selectable). Header rows
-/// are dropped entirely while a search query is active, since a flat match
-/// list needs no group labels.
-fn drop_filtered(state: &AppState) -> Vec<ProviderEntry> {
-    let Some(dd) = &state.dropdown else { return Vec::new() };
-    let q = state.drop_search.to_lowercase();
-    dd.entries
-        .iter().filter(|&e| match e {
-            ProviderEntry::Header(_) | ProviderEntry::SubHeader(_) => q.is_empty(),
-            ProviderEntry::Provider { name, model, .. } => {
-                q.is_empty() || name.to_lowercase().contains(&q) || model.to_lowercase().contains(&q)
-            }
-            ProviderEntry::Model { provider, model, .. } => {
-                q.is_empty()
-                    || model.name.to_lowercase().contains(&q)
-                    || model.id.to_lowercase().contains(&q)
-                    || provider.to_lowercase().contains(&q)
-            }
-        }).cloned()
-        .collect()
-}
-
 /// Filter the `/model` picker's entries by `state.model_picker_search`
-/// (matches on model name/id or provider name) — same convention as
-/// `drop_filtered`: headers only survive with an empty query, since a
-/// flat match list needs no group labels.
+/// (matches on model name/id or provider name) — headers only survive with
+/// an empty query, since a flat match list needs no group labels.
 fn model_picker_filtered(entries: &[PickerEntry], search: &str) -> Vec<PickerEntry> {
     let q = search.to_lowercase();
     entries
@@ -3745,159 +3710,6 @@ fn model_picker_filtered(entries: &[PickerEntry], search: &str) -> Vec<PickerEnt
         .collect()
 }
 
-/// The top-right provider dropdown — the HTML `.provider-panel`. Shows a
-/// search bar and the provider/model rows while browsing; swaps to an inline
-/// API-key entry when a key-less provider/model is chosen.
-fn render_dropdown(f: &mut Frame, area: Rect, state: &AppState) -> Option<Rect> {
-    let dd = state.dropdown.as_ref()?;
-    let keying = dd.keying.as_ref();
-    let w = area.width.min(56);
-    let list_h = if keying.is_some() {
-        3
-    } else {
-        let n = drop_filtered(state).len().min(16) as u16;
-        1 + n + 1
-    };
-    let h = (list_h + 2).min(area.height.saturating_sub(TOPBAR_H));
-    let x = area.x + area.width.saturating_sub(w);
-    let y = area.y + TOPBAR_H;
-    let rect = Rect { x, y, width: w, height: h };
-
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::accent_dim()))
-        .style(Style::default().bg(theme::ELEVATED));
-    f.render_widget(block.clone(), rect);
-    let inner = block.inner(rect);
-
-    if let Some(k) = keying {
-        let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
-            .split(inner);
-        let prompt = Line::from(vec![
-            Span::styled("key: API key for ", theme::gold().add_modifier(Modifier::BOLD)),
-            Span::styled(k.provider.clone(), theme::text().add_modifier(Modifier::BOLD)),
-        ]);
-        f.render_widget(Paragraph::new(prompt), rows[0]);
-        let key_line = if k.key.is_empty() {
-            Line::from(vec![Span::styled(
-                "  paste the key…",
-                placeholder_style(),
-            )])
-        } else {
-            Line::from(vec![
-                Span::styled("  ", theme::faint()),
-                Span::styled(mask_secret(&k.key), theme::green()),
-            ])
-        };
-        f.render_widget(Paragraph::new(key_line), rows[1]);
-        f.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(
-                " enter save · esc back · backspace edit ",
-                theme::faint(),
-            )])),
-            rows[2],
-        );
-    } else {
-        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-        let search_line = if state.drop_search.is_empty() {
-            Line::from(vec![
-                Span::styled("▸", theme::violet()),
-                Span::raw("  "),
-                Span::styled("Search providers or models…", placeholder_style()),
-            ])
-        } else {
-            Line::from(vec![
-                Span::styled("▸ ", theme::violet()),
-                Span::styled(state.drop_search.clone(), theme::text()),
-            ])
-        };
-        f.render_widget(Paragraph::new(search_line), rows[0]);
-
-        let filtered = drop_filtered(state);
-        if filtered.is_empty() && state.fetching_providers {
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        format!("  {} fetching providers…", spinner_glyph(state)),
-                        theme::dim(),
-                    ),
-                ])),
-                rows[1],
-            );
-            return Some(rect);
-        }
-        if !state.drop_search.is_empty() && filtered.is_empty() {
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("  no matches", theme::faint()),
-                ])),
-                rows[1],
-            );
-            return Some(rect);
-        }
-        let items: Vec<ListItem> = filtered
-            .iter()
-            .map(|e| match e {
-                ProviderEntry::Header(name) => ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", name.to_uppercase()),
-                        theme::green().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                ])),
-                ProviderEntry::SubHeader(family) => ListItem::new(Line::from(vec![
-                    Span::styled("   ", theme::faint()),
-                    Span::styled(family.clone(), theme::dim().add_modifier(Modifier::ITALIC)),
-                ])),
-                ProviderEntry::Provider { name, kind: _, model, ready } => {
-                    let dot = if *ready { "●" } else { "◌" };
-                    let dot_style = if *ready { theme::green() } else { theme::gold() };
-                    let need = if *ready { "" } else { " key" };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(dot, dot_style.add_modifier(Modifier::BOLD)),
-                        Span::raw(" "),
-                        Span::styled(name.clone(), theme::text().add_modifier(Modifier::BOLD)),
-                        Span::raw(" "),
-                        Span::styled(model.clone(), theme::faint()),
-                        Span::styled(need, theme::gold()),
-                    ]))
-                }
-                ProviderEntry::Model { provider, model, free, .. } => {
-                    let tier = if *free { "free" } else { "paid" };
-                    let tier_style = if *free { theme::green() } else { theme::gold() };
-                    ListItem::new(Line::from(vec![
-                        Span::raw("  · "),
-                        Span::styled(model.name.clone(), theme::text()),
-                        Span::raw(" "),
-                        Span::styled(tier, tier_style.add_modifier(Modifier::BOLD)),
-                        Span::raw(" "),
-                        Span::styled(provider.clone(), theme::faint()),
-                    ]))
-                }
-            })
-            .collect();
-        let list = List::new(items).highlight_style(
-            Style::default()
-                .bg(theme::PANEL2)
-                .fg(theme::accent())
-                .add_modifier(Modifier::BOLD),
-        );
-        let mut list_state = ListState::default();
-        let selectable = filtered.len().saturating_sub(1);
-        let sel = (0..=selectable)
-            .rev()
-            .find(|&i| {
-                !matches!(filtered.get(i), Some(ProviderEntry::Header(_) | ProviderEntry::SubHeader(_)))
-            })
-            .unwrap_or(0);
-        list_state.select(Some(sel.min(selectable)));
-        f.render_stateful_widget(list, rows[1], &mut list_state);
-    }
-
-    Some(rect)
-}
 
 /// The provider dot in the top-right button and pickers: green when the
 fn provider_status_ok(config: &Config, provider: &str) -> bool {
@@ -3912,14 +3724,6 @@ fn provider_status_ok(config: &Config, provider: &str) -> bool {
     match &cfg.api_key_env {
         Some(var) => std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false),
         None => true,
-    }
-}
-
-fn provider_status_style(config: &Config, provider: &str) -> Style {
-    if provider_status_ok(config, provider) {
-        theme::green()
-    } else {
-        theme::gold()
     }
 }
 
@@ -3968,15 +3772,45 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     // source of lag for little payoff on a screen that's mostly text).
     f.render_widget(Block::default().style(Style::default().bg(theme::INK)), area);
 
+    // Composer sizing computed up front, before `total_h` — the vertical
+    // centering below needs the composer's *real* height (it grows with
+    // wrapped line count for a long paste), not a fixed guess. Using a
+    // fixed constant here meant a multi-line paste before the first send
+    // silently pushed everything below the composer off the intended
+    // center, and on a short terminal `centered_row`'s own height clamp
+    // could squeeze the chips/hint down to zero height with no error.
+    let composer_w = (area.width.saturating_sub(8)).clamp(24, 64);
+    // Borders (2) + "› " prefix (2) + "➜" suffix (3).
+    let composer_text_w = (composer_w as usize).saturating_sub(7).max(10);
+    let wrapped_input = wrap_text(&state.input, composer_text_w);
+    let composer_text_h = wrapped_input.len().clamp(1, 10) as u16;
+    let composer_h = composer_text_h + 2;
+
+    // Slash-command palette sizing, same reasoning, plus it now reserves
+    // its own space below the composer instead of the chips/hint sharing
+    // the same `y` and getting painted over by it.
+    // Owned, not borrowed from `state` — `command_matches()` borrows
+    // `state.known_commands` through `&self`, which can't live across the
+    // `state.chip_areas`/`state.command_menu_area` writes further down.
+    let palette_matches: Vec<(String, String)> = state
+        .command_matches()
+        .into_iter()
+        .map(|(n, d)| (n.to_string(), d.to_string()))
+        .collect();
+    let palette_refs: Vec<(&str, &str)> =
+        palette_matches.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+    let menu_h = menu_height(&palette_refs);
+
     // ---- Centered content stack ----
     const STATUS_H: u16 = 1;
     const BANNER_H: u16 = 1;
     const QUESTION_H: u16 = 1;
-    const COMPOSER_H: u16 = 3;
     const CHIPS_H: u16 = 1;
     const HINT_H: u16 = 1;
     const GAP: u16 = 1;
-    let total_h = STATUS_H + GAP + BANNER_H + GAP + QUESTION_H + GAP + COMPOSER_H + GAP + CHIPS_H + GAP + HINT_H;
+    let menu_reserved_h = if menu_h > 0 { menu_h + GAP } else { 0 };
+    let total_h = STATUS_H + GAP + BANNER_H + GAP + QUESTION_H + GAP + composer_h + GAP
+        + menu_reserved_h + CHIPS_H + GAP + HINT_H;
     let mut y = area.y + (area.height.saturating_sub(total_h)) / 2;
 
     // Status eyebrow: pulsing dot (mirrors the CSS `ping` keyframe) +
@@ -3996,7 +3830,12 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     let label = if ready {
         "  Z E U S   R E A D Y"
     } else {
-        "  N O   P R O V I D E R  ·  / M O D E L   T O   C O N N E C T"
+        // `/provider` — not `/model` — is the command that actually works
+        // here: with no ready provider, `/model` just posts "no models
+        // found on any configured provider" and dead-ends, while
+        // `/provider` lists providers with a "needs a key" indicator and
+        // opens the key-paste prompt when you pick one.
+        "  N O   P R O V I D E R  ·  / P R O V I D E R   T O   C O N N E C T"
     };
     let status_text = format!("●{label}");
     let status_w = status_text.chars().count() as u16;
@@ -4034,9 +3873,14 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     y += QUESTION_H + GAP;
 
     // Composer: rounded box, teal `›` glyph, live input, a send glyph that
-    // lights up once there's something to send.
-    let composer_w = (area.width.saturating_sub(8)).clamp(24, 64);
-    let composer_area = centered_row(area, y, COMPOSER_H, composer_w);
+    // lights up once there's something to send. Height grows with wrapped
+    // line count (same fix as the main chat composer) — this screen's
+    // input previously rendered without any `.wrap(...)` at all, so long
+    // typed/pasted text ran straight off the right edge of the box instead
+    // of wrapping. Sizing (`composer_w`/`composer_text_w`/`wrapped_input`/
+    // `composer_text_h`/`composer_h`) was already computed above, for
+    // `total_h`.
+    let composer_area = centered_row(area, y, composer_h, composer_w);
     opaque(f, composer_area);
     let ready = !state.input.trim().is_empty();
     let composer_block = Block::default()
@@ -4049,11 +3893,14 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     let cols = Layout::horizontal([Constraint::Length(2), Constraint::Min(0), Constraint::Length(3)]).split(composer_inner);
     f.render_widget(Paragraph::new(Span::styled("›", theme::teal().add_modifier(Modifier::BOLD))), cols[0]);
     let input_line = if state.input.is_empty() {
-        Line::from(Span::styled("Describe a task, or paste a file path…", theme::empty_faint()))
+        Paragraph::new(Line::from(Span::styled(
+            "Describe a task, or paste a file path…",
+            theme::empty_faint(),
+        )))
     } else {
-        Line::from(Span::styled(state.input.clone(), theme::text()))
+        Paragraph::new(Text::from(state.input.clone()).style(theme::text())).wrap(Wrap { trim: false })
     };
-    f.render_widget(Paragraph::new(input_line), cols[1]);
+    f.render_widget(input_line, cols[1]);
     let send_style = if ready {
         // The lit-up half of the HTML's teal→cyan send-button gradient.
         Style::default().fg(theme::EMPTY_CYAN).add_modifier(Modifier::BOLD)
@@ -4062,20 +3909,27 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     };
     f.render_widget(Paragraph::new(Span::styled("➜", send_style)).alignment(Alignment::Right), cols[2]);
     if matches!(state.mode, Mode::Chat) && !state.busy {
-        let cursor_col = char_count(&state.input.chars().take(state.cursor).collect::<String>()) as u16;
-        f.set_cursor_position((cols[1].x + cursor_col, cols[1].y));
+        let typed_before: String = state.input.chars().take(state.cursor).collect();
+        let wrapped_before = wrap_text(&typed_before, composer_text_w);
+        let last_row = composer_text_h.saturating_sub(1);
+        let cursor_row = (wrapped_before.len() as u16).saturating_sub(1).min(last_row);
+        let cursor_col = wrapped_before.last().map(|l| char_count(l)).unwrap_or(0) as u16;
+        f.set_cursor_position((cols[1].x + cursor_col, cols[1].y + cursor_row));
     }
-    y += COMPOSER_H + GAP;
+    y += composer_h + GAP;
 
-    // Slash-command palette, when typing "/…", floats just below the composer.
-    let matches = state.command_matches();
-    let menu_h = menu_height(&matches);
-    state.command_menu_area = if menu_h > 0 {
-        let menu_area = centered_row(area, y, menu_h, composer_w);
-        Some(render_menu(f, menu_area, &matches, state.command_selected, theme::TEAL))
-    } else {
-        None
-    };
+    // Slash-command palette, when typing "/…", floats just below the
+    // composer, in its own reserved `menu_reserved_h` space (accounted for
+    // in `total_h` above) rather than sharing the chips' `y` and getting
+    // painted over by it. `palette_matches`/`palette_refs`/`menu_h` were
+    // already computed above, for `total_h`. The actual draw is still
+    // deferred past the chips/hint — `render_menu` dims the whole frame as
+    // a backdrop before drawing itself, and that only dims what's already
+    // been painted, so it has to run after everything else in this screen.
+    let menu_area = (menu_h > 0).then(|| centered_row(area, y, menu_h, composer_w));
+    if menu_h > 0 {
+        y += menu_h + GAP;
+    }
 
     // Example chips — clicking one fills the composer, like the HTML's chip handler.
     let gap = "   ";
@@ -4109,6 +3963,9 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
         Paragraph::new(Line::from(Span::styled(hint, theme::empty_faint()))).alignment(Alignment::Center),
         hint_area,
     );
+
+    state.command_menu_area = menu_area
+        .map(|area| render_menu(f, area, &palette_refs, state.command_selected, theme::TEAL));
 }
 
 fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
@@ -4123,16 +3980,9 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     // Fill the whole frame with the void background first.
     f.render_widget(Block::default().style(Style::default().bg(theme::VOID)), area);
 
-    let rows = Layout::vertical([
-        Constraint::Length(TOPBAR_H),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let rows = Layout::vertical([Constraint::Length(TOPBAR_H), Constraint::Min(0)]).split(area);
 
-    if let Some(btn) = render_topbar(f, rows[0], state, config) {
-        state.provider_btn_area = Some(btn);
-    }
+    render_topbar(f, rows[0], state, config);
 
     let has_side = area.width >= 100;
     // The HTML's `.chatcol { border-right: 1px solid var(--border) }` — a
@@ -4158,13 +4008,18 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
         state.todo_area = Some(list_area);
     }
 
-    // Top-right provider dropdown popover (drawn above the main content).
-    if let Some(rect) = render_dropdown(f, rows[1], state) {
-        if let Some(dd) = state.dropdown.as_mut() {
-            dd.area = Some(rect);
-        }
-    } else if let Some(dd) = state.dropdown.as_mut() {
-        dd.area = None;
+    // Dim everything drawn so far when a modal is about to go on top of it —
+    // matches the reference product's own semi-transparent black backdrop
+    // behind an open dialog. Ratatui has no real alpha blending, so this
+    // directly darkens each already-rendered cell's colors instead; the
+    // modal's own `Clear` + solid background then fully repaints its own
+    // footprint on top, so it doesn't matter that this dims that area too.
+    let any_modal_open = matches!(
+        state.mode,
+        Mode::ModelPicker { .. } | Mode::ProviderPicker { .. } | Mode::KeyEntry { .. } | Mode::Approval(_)
+    ) || state.session_picker.is_some();
+    if any_modal_open {
+        dim_backdrop(f, area);
     }
 
     let picker_area = if let Mode::ModelPicker { entries, selected } = &state.mode {
@@ -4188,9 +4043,7 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
             Some(render_provider_picker(
                 f,
                 area,
-                config,
                 &state.provider,
-                &state.model,
                 entries,
                 *selected,
             ))
@@ -4202,8 +4055,15 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     if let Mode::KeyEntry { provider } = &state.mode {
         let provider = provider.clone();
         let input_rect = render_key_entry_modal(f, area, &provider, &state.input);
-        let cursor_col = char_count(&state.input.chars().take(state.cursor).collect::<String>()) as u16;
-        f.set_cursor_position((input_rect.x + cursor_col.min(input_rect.width.saturating_sub(1)), input_rect.y));
+        // Cursor position only depends on how many characters precede it,
+        // not their actual (masked) content, so wrapping a same-length
+        // placeholder against the input box's real width gives the right
+        // row/col for a key long enough to have wrapped onto later rows.
+        let wrapped_before = wrap_text(&"x".repeat(state.cursor), input_rect.width.max(1) as usize);
+        let last_row = input_rect.height.saturating_sub(1);
+        let cursor_row = (wrapped_before.len() as u16).saturating_sub(1).min(last_row);
+        let cursor_col = wrapped_before.last().map(|l| char_count(l)).unwrap_or(0) as u16;
+        f.set_cursor_position((input_rect.x + cursor_col, input_rect.y + cursor_row));
     }
 
     if let Mode::Approval(pending) = &state.mode {
@@ -4525,7 +4385,8 @@ async fn handle_key(
     }
 
     // ---- Session-resume picker ----
-    if state.session_picker.is_some() {
+    if let Some(picker) = state.session_picker.as_ref() {
+        let filtered_len = session_picker_filtered(picker).len();
         match key.code {
             KeyCode::Esc => state.session_picker = None,
             KeyCode::Up => {
@@ -4535,16 +4396,28 @@ async fn handle_key(
             }
             KeyCode::Down => {
                 if let Some(picker) = state.session_picker.as_mut() {
-                    if picker.selected + 1 < picker.entries.len() {
+                    if picker.selected + 1 < filtered_len {
                         picker.selected += 1;
                     }
                 }
             }
             KeyCode::Enter => {
-                if let Some(picker) = state.session_picker.take() {
-                    if let Some(entry) = picker.entries.get(picker.selected) {
-                        resume_session(entry.id.clone(), config, agent_slot, state).await;
-                    }
+                let id = session_picker_filtered(picker).get(picker.selected).map(|s| s.id.clone());
+                state.session_picker = None;
+                if let Some(id) = id {
+                    resume_session(id, config, agent_slot, state).await;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = state.session_picker.as_mut() {
+                    picker.search.pop();
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(picker) = state.session_picker.as_mut() {
+                    picker.search.push(c);
+                    picker.selected = 0;
                 }
             }
             _ => {}
@@ -4585,95 +4458,13 @@ async fn handle_key(
         }
         return Ok(());
     }
-    // ctrl+f opens it — only in plain chat, so it doesn't steal the
-    // model picker's own ctrl+f (toggle favorite) or the dropdown's.
+    // ctrl+f opens it — only in plain chat, so it doesn't steal the model
+    // picker's own ctrl+f (toggle favorite).
     if matches!(state.mode, Mode::Chat)
-        && state.dropdown.is_none()
         && key.code == KeyCode::Char('f')
         && key.modifiers.contains(KeyModifiers::CONTROL)
     {
         state.search = Some(SearchState { query: String::new(), matches: Vec::new(), current: 0 });
-        return Ok(());
-    }
-
-    // ---- Top-right provider dropdown (search / key entry) ----
-    if state.dropdown.is_some() {
-        // Inline API-key entry mode.
-        if let Some(k) = state
-            .dropdown
-            .as_ref()
-            .and_then(|d| d.keying.as_ref())
-            .map(|k| (k.provider.clone(), k.key.clone()))
-        {
-            let (provider, keybuf) = k;
-            let mut keyval = keybuf;
-            match key.code {
-                KeyCode::Enter => {
-                    state.dropdown = None;
-                    persist_key_and_switch(&provider, &keyval, config, agent_slot, state);
-                }
-                KeyCode::Esc => {
-                    if let Some(d) = state.dropdown.as_mut() {
-                        d.keying = None;
-                    }
-                }
-                KeyCode::Backspace => {
-                    keyval.pop();
-                    if let Some(d) = state.dropdown.as_mut() {
-                        d.keying.as_mut().unwrap().key = keyval;
-                    }
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    keyval.push(c);
-                    if let Some(d) = state.dropdown.as_mut() {
-                        d.keying.as_mut().unwrap().key = keyval;
-                    }
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-
-        // List mode — search + navigate. Group headers are part of the
-        // filtered list for rendering, but navigation and selection skip them.
-        let filtered = drop_filtered(state);
-        match key.code {
-            KeyCode::Esc => state.dropdown = None,
-            KeyCode::Up => {
-                if let Some(d) = state.dropdown.as_mut() {
-                    d.selected = dropdown_prev_selectable(&filtered, d.selected);
-                }
-            }
-            KeyCode::Down => {
-                if let Some(d) = state.dropdown.as_mut() {
-                    d.selected = dropdown_next_selectable(&filtered, d.selected);
-                }
-            }
-            KeyCode::Tab | KeyCode::Enter => {
-                let sel = state
-                    .dropdown
-                    .as_ref()
-                    .map(|d| d.selected)
-                    .unwrap_or(0);
-                if let Some(entry) = filtered.get(sel) {
-                    let picked = entry.clone();
-                    dropdown_apply(state, agent_slot, config, &picked);
-                }
-            }
-            KeyCode::Backspace => {
-                state.drop_search.pop();
-                if let Some(d) = state.dropdown.as_mut() {
-                    d.selected = 0;
-                }
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.drop_search.push(c);
-                if let Some(d) = state.dropdown.as_mut() {
-                    d.selected = 0;
-                }
-            }
-            _ => {}
-        }
         return Ok(());
     }
 
@@ -4682,7 +4473,7 @@ async fn handle_key(
         // provider") — checked before the plain Char branch below since
         // both match on `KeyCode::Char`.
         if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            open_provider_picker(state, config, ui_tx);
+            open_provider_picker(state, config);
             return Ok(());
         }
         if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -4758,13 +4549,9 @@ async fn handle_key(
                         let (name, ready) = (name.clone(), *ready);
                         apply_provider_picker_choice(name, ready, config, agent_slot, state);
                     }
-                    Some(ProviderEntry::Model { provider, model, .. }) => {
-                        let (provider, model_id) = (provider.clone(), model.id.clone());
-                        apply_model_choice_or_key_entry(provider, model_id, config, agent_slot, state);
-                    }
                     // A header row isn't a choice — leave the picker open
                     // rather than silently closing it on a stray Enter.
-                    Some(ProviderEntry::Header(_)) | Some(ProviderEntry::SubHeader(_)) | None => {}
+                    Some(ProviderEntry::Header(_)) | None => {}
                 }
             }
             KeyCode::Esc => {
@@ -4787,7 +4574,7 @@ async fn handle_key(
                     state.push_error(format!("no key entered for '{provider}' — key not saved"));
                     return Ok(());
                 }
-                persist_key_and_switch(&provider, &key, config, agent_slot, state);
+                persist_key_and_switch(&provider, &key, config, state, ui_tx);
                 return Ok(());
             }
             KeyCode::Esc => {
@@ -4842,6 +4629,25 @@ async fn handle_key(
         return Ok(());
     }
 
+    // Command palette — matches the reference product's own `ctrl+p`
+    // (their `command_list` binding). Reuses the existing slash-command
+    // menu wholesale rather than a separate widget: typing "/" already
+    // opens it and filters as you type, so seeding the composer with just
+    // "/" surfaces every command immediately, exactly as if you'd typed
+    // the slash yourself.
+    if matches!(state.mode, Mode::Chat)
+        && key.code == KeyCode::Char('p')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && state.input.is_empty()
+    {
+        // Only when the composer is empty — otherwise this would silently
+        // stomp an unsent draft (or a queued follow-up being typed mid-turn)
+        // with no way to recover it.
+        state.input = "/".to_string();
+        state.cursor = 1;
+        return Ok(());
+    }
+
     // ESC acts as the universal pause/cancel: during an in-flight turn it
     // stops the agent loop and any running bash tool (same path as Ctrl-C);
     // at idle it clears the current input instead of accidental quit.
@@ -4859,6 +4665,44 @@ async fn handle_key(
     }
 
     if state.busy {
+        // Typing (and Enter to queue) still works while a turn is in
+        // flight instead of every keystroke being silently dropped —
+        // pickers/dropdowns/mode-switching stay blocked (everything below
+        // this point), but composing the *next* message doesn't have to
+        // wait for this one to finish first.
+        match key.code {
+            KeyCode::Enter => {
+                let trimmed = state.input.trim().to_string();
+                if !trimmed.is_empty() {
+                    state.input.clear();
+                    state.cursor = 0;
+                    state.push_user(trimmed.clone());
+                    state.push_info("queued — will send once the current turn finishes".to_string());
+                    state.queued_messages.push_back(trimmed);
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_char_at(&mut state.input, state.cursor, c);
+                state.cursor += 1;
+            }
+            KeyCode::Backspace => {
+                if state.cursor > 0 {
+                    remove_char_at(&mut state.input, state.cursor - 1);
+                    state.cursor -= 1;
+                }
+            }
+            KeyCode::Left => {
+                if state.cursor > 0 {
+                    state.cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if state.cursor < char_count(&state.input) {
+                    state.cursor += 1;
+                }
+            }
+            _ => {}
+        }
         return Ok(());
     }
 
@@ -5133,7 +4977,7 @@ async fn handle_key(
                         }
                     }
                     "provider" => {
-                        handle_provider_tui(arg, config, agent_slot, state, ui_tx).await;
+                        handle_provider_tui(arg, config, agent_slot, state).await;
                     }
                     "session" => state.push_info(format!("session={}", state.session_id)),
                     "sessions" => {
@@ -5143,7 +4987,8 @@ async fn handle_key(
                                 "no saved sessions yet — send a message to create one",
                             ),
                             Ok(entries) => {
-                                state.session_picker = Some(SessionPickerState { entries, selected: 0 });
+                                state.session_picker =
+                                    Some(SessionPickerState { entries, selected: 0, search: String::new() });
                             }
                             Err(e) => state.push_error(format!("couldn't list sessions: {e:#}")),
                         }
@@ -5295,9 +5140,9 @@ async fn handle_key(
                             state.push_error(
                                 "usage: /bg <goal> — run an orchestrated plan in the background".to_string(),
                             );
-                        } else if matches!(rest, "list" | "output" | "stop") {
+                        } else if matches!(rest, "list" | "output" | "stop" | "pause" | "resume") {
                             state.push_info(
-                                "manage background tasks with the `zeus bg` subcommand: zeus bg list · zeus bg output <id> · zeus bg stop <id>".to_string(),
+                                "manage background tasks with the `zeus bg` subcommand: zeus bg list · zeus bg output <id> · zeus bg pause <id> · zeus bg resume <id> · zeus bg stop <id>".to_string(),
                             );
                         } else {
                             let (goal, workflow) = match rest.rsplit_once("@@workflow:") {
@@ -5341,7 +5186,7 @@ async fn handle_key(
                     "'{}' isn't connected yet — opening the provider picker to set it up",
                     state.provider
                 ));
-                open_provider_picker(state, config, ui_tx);
+                open_provider_picker(state, config);
                 return Ok(());
             }
             state.push_user(trimmed.clone());
@@ -5416,7 +5261,6 @@ async fn handle_mouse(
     state: &mut AppState,
     agent_slot: &mut Option<Agent>,
     config: &Config,
-    ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
         let col = ev.column;
@@ -5457,8 +5301,7 @@ async fn handle_mouse(
                 let session_id = state
                     .session_picker
                     .as_ref()
-                    .and_then(|p| p.entries.get(idx))
-                    .map(|e| e.id.clone());
+                    .and_then(|p| session_picker_filtered(p).get(idx).map(|e| e.id.clone()));
                 if let Some(id) = session_id {
                     state.session_picker = None;
                     resume_session(id, config, agent_slot, state).await;
@@ -5505,73 +5348,6 @@ async fn handle_mouse(
             }
         }
 
-        let in_provider = state
-            .provider_btn_area
-            .map(|a| col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height)
-            .unwrap_or(false);
-        let in_drop = state
-            .dropdown
-            .as_ref()
-            .and_then(|d| d.area)
-            .map(|a| col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height)
-            .unwrap_or(false);
-
-        // Dropdown is open: pick a row inside it, close when clicking outside.
-        if state.dropdown.is_some() {
-            if in_provider {
-                state.dropdown = None;
-                state.drop_search.clear();
-                return;
-            }
-            if in_drop {
-                let area = state.dropdown.as_ref().unwrap().area.unwrap();
-                // List rows start just past the border + search row.
-                let list_top = area.y + 2;
-                let idx = row as isize - list_top as isize;
-                let filtered = drop_filtered(state);
-                if idx >= 0 && (idx as usize) < filtered.len() {
-                    let entry = filtered[idx as usize].clone();
-                    dropdown_apply(state, agent_slot, config, &entry);
-                }
-                return;
-            }
-            state.dropdown = None;
-            state.drop_search.clear();
-            return;
-        }
-
-        // Provider button: a cached model scan builds the dropdown
-        // instantly; otherwise it opens empty (showing a "fetching…" row)
-        // and probes providers in the background — probing every
-        // configured provider can take several seconds, and awaiting it
-        // inline here would freeze the whole render loop for that long.
-        if in_provider {
-            if let Some(groups) = state.model_cache.clone() {
-                let entries = build_dropdown_entries(config, &state.provider, &state.model, &groups);
-                let selected = dropdown_next_selectable(&entries, 0);
-                state.dropdown = Some(DropdownState { entries, selected, area: None, keying: None });
-                state.drop_search.clear();
-                return;
-            }
-            state.dropdown = Some(DropdownState {
-                entries: Vec::new(),
-                selected: 0,
-                area: None,
-                keying: None,
-            });
-            state.drop_search.clear();
-            state.fetching_providers = true;
-            let cfg = config.clone();
-            let provider = state.provider.clone();
-            let model = state.model.clone();
-            let tx = ui_tx.clone();
-            tokio::spawn(async move {
-                let groups = list_models_by_provider(&cfg).await;
-                let entries = build_dropdown_entries(&cfg, &provider, &model, &groups);
-                let _ = tx.send(UiEvent::DropdownReady(entries, groups));
-            });
-            return;
-        }
 
         // Click a TODO row to toggle it (progress bar fills in live).
         if let Some(ta) = state.todo_area {
@@ -5692,15 +5468,6 @@ async fn handle_mouse(
                                     state,
                                 );
                             }
-                            Some(ProviderEntry::Model { provider, model, .. }) => {
-                                apply_model_choice_or_key_entry(
-                                    provider.clone(),
-                                    model.id.clone(),
-                                    config,
-                                    agent_slot,
-                                    state,
-                                );
-                            }
                             _ => {}
                         }
                     }
@@ -5742,6 +5509,20 @@ async fn run_app<B: Backend>(
     let mut cancel_tx: Option<watch::Sender<bool>> = None;
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+
+    // One-shot background version check — never blocks startup, never
+    // auto-installs, just surfaces a small dim notice if a newer release
+    // exists (see `render_topbar`). A failed/offline check is silent by
+    // design: `update::latest_version()`'s `Err` is simply dropped.
+    let update_tx = ui_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(latest) = super::update::latest_version().await {
+            if super::update::is_newer(&latest, super::update::current_version()) {
+                let _ = update_tx.send(UiEvent::UpdateAvailable(latest));
+            }
+        }
+    });
+
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
     std::thread::spawn(move || {
         while let Ok(ev) = crossterm::event::read() {
@@ -5780,20 +5561,11 @@ async fn run_app<B: Backend>(
                                 insert_char_at(&mut state.input, state.cursor, c);
                                 state.cursor += 1;
                             }
-                        } else if let Some(k) = state.dropdown.as_mut().and_then(|d| d.keying.as_mut()) {
-                            // The inline dropdown key-entry field has its own
-                            // buffer (`KeyingState::key`), separate from
-                            // `state.input` — pasting an API key here is the
-                            // common case (keys are long random tokens), so
-                            // this needs the same handling as the full-screen
-                            // `Mode::KeyEntry` modal above, just targeting a
-                            // different buffer.
-                            k.key.push_str(&text);
-                        } else if state.dropdown.is_none() && matches!(state.mode, Mode::Chat) {
+                        } else if matches!(state.mode, Mode::Chat) {
                             // Plain composer paste (a message, or slash-command
-                            // text — both live in `state.input`). Pickers and
-                            // the dropdown search use their own buffers and
-                            // don't want raw text dumped into `state.input`.
+                            // text — both live in `state.input`). Pickers use
+                            // their own search buffers and don't want raw
+                            // text dumped into `state.input`.
                             let pasted_chars = text.chars().count();
                             let pasted_lines = text.lines().count();
                             for c in text.chars() {
@@ -5813,7 +5585,7 @@ async fn run_app<B: Backend>(
                         }
                     }
                     Event::Mouse(mouse) => {
-                        handle_mouse(mouse, &mut state, &mut agent_slot, config, &ui_tx).await;
+                        handle_mouse(mouse, &mut state, &mut agent_slot, config).await;
                     }
                     Event::Resize(..) => {
                         // Ratatui's own diffing skips cells that look
@@ -5835,16 +5607,6 @@ async fn run_app<B: Backend>(
                 match ui_event {
                     UiEvent::Agent(ev) => state.apply_agent_event(ev),
                     UiEvent::Approval(req) => state.mode = Mode::Approval(req),
-                    UiEvent::DropdownReady(entries, groups) => {
-                        state.fetching_providers = false;
-                        state.model_cache = Some(groups);
-                        // Discarded if the user already closed the dropdown
-                        // before the probe finished.
-                        if let Some(dd) = state.dropdown.as_mut() {
-                            dd.selected = dropdown_next_selectable(&entries, 0);
-                            dd.entries = entries;
-                        }
-                    }
                     UiEvent::ModelPickerReady(entries, selected, groups) => {
                         state.fetching_providers = false;
                         state.model_cache = Some(groups);
@@ -5858,16 +5620,8 @@ async fn run_app<B: Backend>(
                             }
                         }
                     }
-                    UiEvent::ProviderPickerReady(entries, selected, groups) => {
-                        state.fetching_providers = false;
-                        state.model_cache = Some(groups);
-                        if matches!(state.mode, Mode::Chat) {
-                            if entries.is_empty() {
-                                state.push_error("no providers configured — see config.toml / providers.toml");
-                            } else {
-                                state.mode = Mode::ProviderPicker { entries, selected };
-                            }
-                        }
+                    UiEvent::UpdateAvailable(latest) => {
+                        state.update_available = Some(latest);
                     }
                 }
             }
@@ -5928,6 +5682,13 @@ async fn run_app<B: Backend>(
                         agent_slot = Some(agent);
                     }
                 }
+                // Drain one queued message now that this turn is done — its
+                // bubble and "queued" note were already pushed when it was
+                // submitted (see `handle_key`'s busy-Enter branch), so this
+                // just starts the turn, same as a fresh Enter would.
+                if let Some(next) = state.queued_messages.pop_front() {
+                    start_turn(&mut state, &mut agent_slot, &mut turn_handle, &mut cancel_tx, &ui_tx, next, yes);
+                }
             }
         }
 
@@ -5979,7 +5740,11 @@ fn build_dir_info(config: &Config) -> DirInfo {
 /// cursor at its last position instead of hiding it. Harmless if ratatui
 /// already handled it.
 fn sync_cursor_visibility<B: Backend>(terminal: &mut Terminal<B>, state: &AppState) {
-    if state.busy || !matches!(state.mode, Mode::Chat | Mode::KeyEntry { .. }) {
+    // Busy no longer hides the cursor on its own — the composer stays
+    // typeable (to queue the next message) while a turn is in flight, so
+    // Chat mode keeps a live cursor regardless of `busy`; only an actual
+    // picker/modal mode (anything but Chat/KeyEntry) takes it away.
+    if !matches!(state.mode, Mode::Chat | Mode::KeyEntry { .. }) {
         terminal.hide_cursor().ok();
     }
 }
@@ -6015,4 +5780,153 @@ pub async fn run(config: &Config, agent: Agent, yes: bool) -> Result<()> {
     terminal.show_cursor().ok();
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_text_fits_on_one_line() {
+        assert_eq!(wrap_text("hello world", 20), vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn wrap_text_empty_input_yields_one_empty_line() {
+        assert_eq!(wrap_text("", 20), vec![String::new()]);
+    }
+
+    #[test]
+    fn wrap_text_breaks_on_whitespace_within_width() {
+        let lines = wrap_text("the quick brown fox jumps over the lazy dog", 12);
+        for line in &lines {
+            assert!(char_count(line) <= 12, "line {line:?} exceeds width 12");
+        }
+        // Rejoining with single spaces must reproduce the original words —
+        // wrapping shouldn't drop or duplicate any text.
+        assert_eq!(lines.join(" "), "the quick brown fox jumps over the lazy dog");
+    }
+
+    /// Regression test for a real bug: a single unbroken token longer than
+    /// `width` (a pasted API key, URL, long path) used to come back as one
+    /// oversized line, while ratatui's own `Paragraph` wrap hard-breaks it —
+    /// height/cursor-position math computed from this function's line count
+    /// then disagreed with what was actually drawn (tui.rs, `wrap_text`).
+    #[test]
+    fn wrap_text_hard_breaks_a_long_unbroken_token() {
+        let token = "a".repeat(26);
+        let lines = wrap_text(&token, 10);
+        assert_eq!(lines, vec!["a".repeat(10), "a".repeat(10), "a".repeat(6)]);
+        for line in &lines {
+            assert!(char_count(line) <= 10);
+        }
+    }
+
+    #[test]
+    fn wrap_text_hard_break_is_utf8_safe() {
+        // Multi-byte characters (each 3 bytes in UTF-8) — a byte-index split
+        // here would panic or corrupt the string; `wrap_text` must only
+        // ever split on char boundaries.
+        let token = "日".repeat(15);
+        let lines = wrap_text(&token, 10);
+        for line in &lines {
+            assert!(char_count(line) <= 10);
+        }
+        assert_eq!(lines.iter().map(|l| char_count(l)).sum::<usize>(), 15);
+    }
+
+    #[test]
+    fn wrap_text_mixes_short_words_and_a_long_token() {
+        let url = "x".repeat(60);
+        let text = format!("hi {url} bye");
+        let lines = wrap_text(&text, 20);
+        for line in &lines {
+            assert!(char_count(line) <= 20, "line {line:?} exceeds width 20");
+        }
+        // Every original character still shows up somewhere.
+        let rejoined: String = lines.concat();
+        assert!(rejoined.contains("hi"));
+        assert!(rejoined.contains("bye"));
+        assert_eq!(rejoined.chars().filter(|&c| c == 'x').count(), 60);
+    }
+
+    #[test]
+    fn wrap_text_clamps_width_to_a_minimum_of_ten() {
+        // A caller-requested width under 10 (e.g. a tiny terminal) doesn't
+        // shrink further — `width.max(10)` is a floor, not a suggestion.
+        let lines = wrap_text("abcdefghijklmnop", 2);
+        assert_eq!(lines, vec!["abcdefghij".to_string(), "klmnop".to_string()]);
+    }
+
+    #[test]
+    fn wrap_preserving_newlines_keeps_blank_lines() {
+        assert_eq!(
+            wrap_preserving_newlines("hello\n\nworld", 40),
+            vec!["hello".to_string(), String::new(), "world".to_string()]
+        );
+    }
+
+    #[test]
+    fn mask_secret_keeps_only_the_last_character() {
+        assert_eq!(mask_secret(""), "");
+        assert_eq!(mask_secret("a"), "a");
+        assert_eq!(mask_secret("abcd"), "•••d");
+    }
+
+    #[test]
+    fn centered_row_centers_horizontally_at_a_fixed_y() {
+        let area = Rect { x: 0, y: 0, width: 100, height: 50 };
+        let r = centered_row(area, 10, 5, 20);
+        assert_eq!(r, Rect { x: 40, y: 10, width: 20, height: 5 });
+    }
+
+    #[test]
+    fn centered_row_clamps_width_to_the_area() {
+        let area = Rect { x: 0, y: 0, width: 100, height: 50 };
+        let r = centered_row(area, 0, 5, 150);
+        assert_eq!(r.width, 100);
+        assert_eq!(r.x, 0);
+    }
+
+    #[test]
+    fn centered_row_collapses_height_when_y_is_past_the_area() {
+        // The exact mechanism that protects a short terminal from an
+        // overflowing empty-state screen: a row positioned past the visible
+        // area shrinks to zero height instead of panicking or drawing
+        // out-of-bounds.
+        let area = Rect { x: 0, y: 0, width: 100, height: 10 };
+        let r = centered_row(area, 20, 5, 20);
+        assert_eq!(r.height, 0);
+    }
+
+    #[test]
+    fn centered_rect_centers_both_axes() {
+        let area = Rect { x: 0, y: 0, width: 100, height: 50 };
+        let r = centered_rect(30, 10, area);
+        assert_eq!(r, Rect { x: 35, y: 20, width: 30, height: 10 });
+    }
+
+    #[test]
+    fn centered_rect_clamps_to_the_area_when_oversized() {
+        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let r = centered_rect(1000, 1000, area);
+        assert_eq!(r, Rect { x: 0, y: 0, width: 40, height: 20 });
+    }
+
+    #[test]
+    fn menu_height_is_zero_when_empty() {
+        assert_eq!(menu_height(&[]), 0);
+    }
+
+    #[test]
+    fn menu_height_grows_with_match_count_up_to_a_cap() {
+        let three = [("a", ""), ("b", ""), ("c", "")];
+        assert_eq!(menu_height(&three), 5);
+
+        let twenty: Vec<(&str, &str)> = (0..20).map(|_| ("cmd", "desc")).collect();
+        // Capped at 8 visible rows + 2 (border) regardless of match count —
+        // a large command list scrolls instead of the popup growing without
+        // bound.
+        assert_eq!(menu_height(&twenty), 10);
+    }
 }

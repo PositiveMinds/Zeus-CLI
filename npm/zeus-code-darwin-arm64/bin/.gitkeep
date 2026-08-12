@@ -1,0 +1,3 @@
+This directory is empty in source control. The release workflow copies the
+matching prebuilt `zeus` binary here right before `npm publish` — see
+`.github/workflows/release.yml`'s `publish-npm` job.
