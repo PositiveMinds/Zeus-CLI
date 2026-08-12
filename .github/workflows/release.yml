@@ -107,14 +107,24 @@ jobs:
           # string and every `gh release` call below operates on tag "".
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          set -eu
+          version="${TAG#v}"
+          # Templated from a checked-in file rather than an inline heredoc —
+          # a heredoc's closing delimiter has to sit at column 0 with zero
+          # indentation, which doesn't survive being nested inside a YAML
+          # block scalar indented to match the rest of this step.
+          sed "s/__TAG__/$TAG/g; s/__VERSION__/$version/g" \
+            .github/release-notes-template.md > release-notes.md
+
           if gh release view "$TAG" --repo PositiveMinds/Zeus-CLI-releases >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* \
               --repo PositiveMinds/Zeus-CLI-releases --clobber
+            gh release edit "$TAG" --repo PositiveMinds/Zeus-CLI-releases --notes-file release-notes.md
           else
             gh release create "$TAG" dist/* \
               --repo PositiveMinds/Zeus-CLI-releases \
               --title "$TAG" \
-              --notes "Prebuilt binaries for Zeus $TAG."
+              --notes-file release-notes.md
           fi
 
   publish-npm:

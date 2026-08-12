@@ -1,8 +1,34 @@
 # zeus
 
 Database-free AI coding agent. **The filesystem is the source of truth.**
+Published on npm as [`zeus-code`](https://www.npmjs.com/package/zeus-code).
 
 Built from [AI_Coding_Agent_Blueprint_Database_Free.md](./AI_Coding_Agent_Blueprint_Database_Free.md).
+
+## Features
+
+- **Terminal-native TUI** — a full ratatui chat interface: streaming replies,
+  syntax-highlighted diffs and code blocks, a command palette (`/` or
+  `ctrl+p`), message queuing while a turn is in flight, and session
+  search/resume.
+- **Three agent modes** — `Plan` (read-only research), `Build` (full tool
+  access), and `Auto` (a continuous tool-calling loop that keeps going until
+  the request is genuinely done), cycled with Tab.
+- **43 specialist personas across ~6 departments**, reachable in Auto mode
+  via a model-invoked `delegate` tool, or directly with `/agents`.
+- **Provider-agnostic** — Anthropic, OpenAI, Gemini, Grok, DeepSeek,
+  OpenRouter, OpenCodeZen, and local runners (Ollama, LM Studio, llama.cpp),
+  with in-app key entry and a live model picker.
+- **Filesystem-first safety core** — permission gates, path containment,
+  checkpoints + rewind, and a database-free `.agent/` project state instead
+  of a hidden daemon or cloud session store.
+- **Git, code intelligence, and background orchestration** — 24-operation
+  git integration with AI commit messages, a symbol index for
+  definitions/references, and `zeus bg` for long-running orchestrated tasks
+  you can check on, pause, resume, or stop independently of the TUI.
+- **Self-diagnosing** — `zeus doctor` checks every configured provider's
+  readiness (key presence, or live reachability for local runners), not
+  just the default one.
 
 ## Status
 
