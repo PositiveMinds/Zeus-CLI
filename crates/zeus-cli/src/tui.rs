@@ -1197,6 +1197,14 @@ struct AppState {
     /// waits its turn, draining one at a time as each turn finishes rather
     /// than making the user wait for the composer to unlock before typing.
     queued_messages: std::collections::VecDeque<String>,
+    /// Goal of a `/plan` run that just finished successfully, waiting on
+    /// confirmation to actually execute it via `Agent::orchestrate` —
+    /// `/plan` itself is read-only research plus a persisted
+    /// `.agent/tasks.json`, so without this the plan just sits there
+    /// unused unless the user separately knows to run `/bg orchestrate`.
+    /// Consumed by pressing Enter with an empty composer (see `handle_key`);
+    /// sending any other message instead clears it without running anything.
+    pending_plan_goal: Option<String>,
     quit: bool,
     mode: Mode,
     agent_mode: AgentMode,
@@ -1419,6 +1427,7 @@ impl AppState {
             cursor: 0,
             busy: false,
             queued_messages: std::collections::VecDeque::new(),
+            pending_plan_goal: None,
             quit: false,
             mode: Mode::Chat,
             agent_mode: if start_in_plan { AgentMode::Plan } else { AgentMode::Build },
@@ -4122,8 +4131,12 @@ fn start_turn(
 
 /// `/plan <goal>`: same plumbing as `start_turn`, but drives
 /// `Agent::plan_turn` — research read-only, persist `.agent/tasks.json`,
-/// and return without executing anything. Plan mode stays on afterwards so
-/// the next turns remain observational until the user switches to Auto.
+/// and return without executing anything. Plan mode stays on afterwards, so
+/// further chatting stays observational; to actually run the plan, confirm
+/// the prompt shown on completion (see `start_orchestrate_turn`) rather than
+/// switching modes yourself — plain Auto-mode chat no longer replays a
+/// pending plan on its own (Auto mode moved to a continuous tool loop that
+/// doesn't consult `tasks.json`).
 fn start_plan_turn(
     state: &mut AppState,
     agent_slot: &mut Option<Agent>,
@@ -4156,6 +4169,59 @@ fn start_plan_turn(
             reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
         };
         let result = agent.plan_turn(&message, on_event, approver).await;
+        (agent, result)
+    });
+    *turn_handle = Some(handle);
+}
+
+/// Confirmed run of a plan `/plan` just generated — drives
+/// `Agent::orchestrate`, which re-plans the same goal (cheap relative to the
+/// execution itself) and then executes step by step behind its own
+/// `plan_execute` approval prompt. `orchestrate` returns a plain summary
+/// `String` rather than a `TurnResult`; wrapped into one here so this flows
+/// through the exact same completion handling as every other turn kind,
+/// including the `PlanStepStarted`/`PlanStepDone`/`OrchestrationDone`
+/// events that already drive the sidebar and persona chip.
+fn start_orchestrate_turn(
+    state: &mut AppState,
+    agent_slot: &mut Option<Agent>,
+    turn_handle: &mut Option<TurnJoin>,
+    cancel_tx: &mut Option<watch::Sender<bool>>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    goal: String,
+    yes: bool,
+) {
+    let Some(mut agent) = agent_slot.take() else {
+        return;
+    };
+    *cancel_tx = Some(agent.cancel_handle());
+    state.busy = true;
+    let tx_events = ui_tx.clone();
+    let tx_approval = ui_tx.clone();
+    let handle = tokio::spawn(async move {
+        let on_event = move |ev: AgentEvent| {
+            let _ = tx_events.send(UiEvent::Agent(ev));
+        };
+        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
+            if yes {
+                return ApprovalDecision::Approved;
+            }
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
+                request: req.clone(),
+                reply: reply_tx,
+            }));
+            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
+        };
+        let result = agent
+            .orchestrate(&goal, on_event, approver)
+            .await
+            .map(|summary| TurnResult {
+                final_text: summary,
+                tool_calls: 0,
+                cancelled: false,
+                usage: TokenUsage::default(),
+            });
         (agent, result)
     });
     *turn_handle = Some(handle);
@@ -4660,6 +4726,7 @@ async fn handle_key(
         } else {
             state.input.clear();
             state.cursor = 0;
+            state.pending_plan_goal = None;
         }
         return Ok(());
     }
@@ -4750,8 +4817,19 @@ async fn handle_key(
         }
         KeyCode::Enter => {
             if state.input.trim().is_empty() {
+                // A bare Enter right after `/plan` finished confirms running
+                // it now — otherwise this has always just been a no-op, so
+                // there's nothing existing to conflict with.
+                if let Some(goal) = state.pending_plan_goal.take() {
+                    state.push_info(format!("running plan: {goal}"));
+                    start_orchestrate_turn(state, agent_slot, turn_handle, cancel_tx, ui_tx, goal, yes);
+                }
                 return Ok(());
             }
+            // Sending a real message instead declines a pending plan
+            // confirmation rather than leaving it to fire on some later,
+            // unrelated bare Enter.
+            state.pending_plan_goal = None;
             let raw = std::mem::take(&mut state.input);
             state.cursor = 0;
             let trimmed = raw.trim().to_string();
@@ -5067,6 +5145,7 @@ async fn handle_key(
                                 apply_agent_mode(agent, AgentMode::Plan);
                             }
                             state.push_user(trimmed.clone());
+                            state.pending_plan_goal = Some(arg.to_string());
                             start_plan_turn(
                                 state,
                                 agent_slot,
@@ -5669,8 +5748,23 @@ async fn run_app<B: Backend>(
                                         }
                                     }
                                 }
+                                // `/plan` alone never executes anything — offer
+                                // to actually run it now via `orchestrate`
+                                // rather than leaving the persisted
+                                // `.agent/tasks.json` unused. Left set (not
+                                // consumed here) so the next bare-Enter press
+                                // can pick it up; declining by sending a real
+                                // message instead clears it in `handle_key`.
+                                if let Some(goal) = &state.pending_plan_goal {
+                                    state.push_info(format!(
+                                        "plan ready for \"{goal}\" — press Enter now to run it, Esc to dismiss, or type a message to keep going instead"
+                                    ));
+                                }
                             }
-                            Err(e) => state.push_error(format!("turn failed: {e:#}")),
+                            Err(e) => {
+                                state.pending_plan_goal = None;
+                                state.push_error(format!("turn failed: {e:#}"));
+                            }
                         }
                     }
                     Err(join_err) => {
