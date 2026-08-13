@@ -860,7 +860,21 @@ impl Agent {
         // with no checkpoint, so a misframed goal would sail straight into
         // file edits.
         let mut plan = TaskPlan::from_steps(goal, &steps, "", false);
+        // Snapshot any previously persisted plan BEFORE overwriting it, so a
+        // re-planned run can diff the new step list against the old one rather
+        // than making the user re-read everything.
+        let prior_plan = match &self.options.tasks_file {
+            Some(path) => TaskPlan::read(path)?,
+            None => None,
+        };
         self.write_task_plan(&plan)?;
+
+        let mut preview = self.render_plan_preview(&steps);
+        if let (Some(path), Some(prior)) = (&self.options.tasks_file, prior_plan) {
+            if let Some(diff) = plan.diff_vs(&prior) {
+                preview.push_str(&format!("\n--- plan changed vs {}\n{diff}", path.display()));
+            }
+        }
 
         let approved = matches!(
             approver(&PermissionRequest {
@@ -871,7 +885,7 @@ impl Agent {
                     "execute the reviewed plan ({} step(s)) for: {goal}",
                     steps.len()
                 ),
-                preview: Some(self.render_plan_preview(&steps)),
+                preview: Some(preview),
                 overwrites: false,
             }),
             ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession
@@ -2633,6 +2647,59 @@ mod tests {
         assert!(plan.approved);
         assert_eq!(plan.completed(), 3, "all steps done at finish");
         assert!(plan.steps.iter().all(|s| s.done));
+    }
+
+    #[tokio::test]
+    async fn orchestrate_diffs_against_a_prior_plan_in_the_approval_preview() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let tasks_file = root.join(".agent/tasks.json");
+        let script = orchestration_script(
+            r#"[{"description":"new approach","rationale":"revised"},{"description":"second","rationale":"two"}]"#,
+            "done",
+            "verdict: LGTM",
+        );
+
+        // A plan from a prior run already exists on disk.
+        let prior = crate::plans::TaskPlan::from_steps(
+            "do the thing",
+            &[crate::agent::PlanStep {
+                id: 1,
+                description: "old approach".into(),
+                rationale: "first".into(),
+                persona: None,
+            }],
+            "",
+            false,
+        );
+        prior.write(&tasks_file).unwrap();
+
+        let mut agent = test_agent(root, MockProvider::new(script));
+        agent.options.tasks_file = Some(tasks_file.clone());
+        let previews: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let previews2 = previews.clone();
+        let (summary, _usage) = agent
+            .orchestrate(
+                "do the thing",
+                |_ev| {},
+                move |req: &PermissionRequest| {
+                    if let Some(p) = &req.preview {
+                        previews2.lock().unwrap().push(p.clone());
+                    }
+                    ApprovalDecision::Approved
+                },
+            )
+            .await
+            .unwrap();
+        assert!(summary.contains("2 steps"), "{summary}");
+
+        // The plan_execute gate's preview mentions the change from the old
+        // step list and carries the new step text.
+        let joined = previews.lock().unwrap().join("\n");
+        assert!(joined.contains("plan changed vs"), "{joined}");
+        assert!(joined.contains("new approach"), "{joined}");
+        assert!(joined.contains("old approach"), "{joined}");
     }
 
     #[tokio::test]

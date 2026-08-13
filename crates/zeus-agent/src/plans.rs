@@ -107,6 +107,41 @@ impl TaskPlan {
     pub fn completed(&self) -> usize {
         self.steps.iter().filter(|s| s.done).count()
     }
+
+    /// A stable, line-oriented rendering of the plan for diffing: one line per
+    /// step, prefixed by its state (`[x]` done / `[ ]` pending), so a plan
+    /// diff reads as "what the steps now say".
+    pub fn render_lines(&self) -> String {
+        let mut out = format!("goal: {}\n", self.goal);
+        out.push_str(&format!(
+            "approved: {}\n",
+            if self.approved { "yes" } else { "no" }
+        ));
+        for step in &self.steps {
+            let state = if step.done { "[x]" } else { "[ ]" };
+            out.push_str(&format!(
+                "{state} {}. {}{}\n",
+                step.id,
+                step.description,
+                step.persona
+                    .as_ref()
+                    .map(|p| format!("  [{p}]"))
+                    .unwrap_or_default()
+            ));
+        }
+        out
+    }
+
+    /// Human-readable diff between this plan and a previously persisted one
+    /// (e.g. the plan on disk from a prior `/plan` run). Shows only what
+    /// changed in the step list; `None` when `other` is absent.
+    pub fn diff_vs(&self, other: &TaskPlan) -> Option<String> {
+        let diff = zeus_fs::preview_diff(&other.render_lines(), &self.render_lines());
+        if diff == "(no line-level changes)" {
+            return None;
+        }
+        Some(diff)
+    }
 }
 
 fn io_err(e: impl std::fmt::Display) -> std::io::Error {
@@ -210,5 +245,59 @@ mod tests {
         // unknown id is a no-op
         plan.mark_done(99);
         assert_eq!(plan.completed(), 1);
+    }
+
+    #[test]
+    fn render_lines_is_stable_and_state_aware() {
+        let steps = vec![
+            PlanStep {
+                id: 1,
+                description: "read the manifest".into(),
+                rationale: "need to see what's declared".into(),
+                persona: Some("qa".into()),
+            },
+            PlanStep {
+                id: 2,
+                description: "add the missing dep".into(),
+                rationale: "build fails without it".into(),
+                persona: None,
+            },
+        ];
+        let mut plan = TaskPlan::from_steps("ship it", &steps, "", false);
+        let before = plan.render_lines();
+        assert!(before.contains("goal: ship it"));
+        assert!(before.contains("[ ] 1. read the manifest  [qa]"));
+        assert!(before.contains("approved: no"));
+
+        plan.mark_done(1);
+        let after = plan.render_lines();
+        assert!(after.contains("[x] 1. read the manifest  [qa]"));
+        assert!(before != after);
+    }
+
+    #[test]
+    fn diff_vs_reports_only_changed_steps() {
+        let mk = |goal: &str, descs: &[&str]| {
+            let steps: Vec<PlanStep> = descs
+                .iter()
+                .enumerate()
+                .map(|(i, d)| PlanStep {
+                    id: i + 1,
+                    description: d.to_string(),
+                    rationale: "r".into(),
+                    persona: None,
+                })
+                .collect();
+            TaskPlan::from_steps(goal, &steps, "", false)
+        };
+        // Same plan → no diff.
+        let old = mk("g", &["a", "b"]);
+        let new = mk("g", &["a", "b"]);
+        assert!(new.diff_vs(&old).is_none());
+
+        // One step changed → diff mentions it.
+        let new2 = mk("g", &["a", "B CHANGED"]);
+        let diff = new2.diff_vs(&old).expect("diff present");
+        assert!(diff.contains("B CHANGED"), "{diff}");
     }
 }
