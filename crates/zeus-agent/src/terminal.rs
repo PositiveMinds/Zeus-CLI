@@ -644,12 +644,9 @@ pub(crate) fn kill_tree(pid: u32) {
     // Background tasks are session leaders in their own process group
     // (see background.rs), so a negative pid kills the whole group,
     // e.g. `sh -c "docker compose up"` and its children. Falls back to
-    // a single-process kill when the pid doesn't lead a group. `--` ends
-    // option parsing so the negative pid is a target, not a flag.
-    let _ = Command::new("kill")
-        .args(["-9", "--", &format!("-{pid}")])
-        .output();
-    let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    // a single-process kill when the pid doesn't lead a group.
+    let _ = raw_kill(-(pid as i32), signals::SIGKILL);
+    let _ = raw_kill(pid as i32, signals::SIGKILL);
 }
 
 /// Windows `PROCESSENTRY32W` snapshot entry, `#[repr(C)]` so the FFI layout
@@ -754,26 +751,67 @@ pub(crate) fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
-    let sig = if suspend { "STOP" } else { "CONT" };
+    let sig = if suspend {
+        signals::SIGSTOP
+    } else {
+        signals::SIGCONT
+    };
     // Prefer the process group so any children freeze/thaw together.
-    let pgid = Command::new("ps")
-        .args(["-o", "pgid=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .ok()
-        });
+    let pgid = process_group_of(pid);
     let target = match pgid {
         // Only signal the group when it is not the caller's own group —
         // otherwise `kill -STOP -<own pgid>` freezes this very process.
-        Some(gid) if gid != own_process_group() => format!("-{gid}"),
-        _ => pid.to_string(),
+        Some(gid) if gid != own_process_group() => -(gid as i32),
+        _ => pid as i32,
     };
-    run_signal(&format!("-{sig}"), &target)
+    raw_kill(target, sig)
+}
+
+/// Signal numbers, `cfg`'d per platform (they differ between Linux and the
+/// BSD-derived macOS/FreeBSD ABI). Only the ones this code uses.
+#[cfg(unix)]
+mod signals {
+    pub const SIGKILL: i32 = 9;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
+    pub const SIGSTOP: i32 = 19;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))]
+    pub const SIGSTOP: i32 = 17;
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
+    pub const SIGCONT: i32 = 18;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))]
+    pub const SIGCONT: i32 = 19;
+}
+
+/// Raw `kill(2)` — replaces shelling out to the `kill` command so the
+/// suspend/resume/kill-tree path spawns zero subprocesses. A negative `pid`
+/// targets the whole process group, matching what `kill -STOP -- -<pgid>`
+/// used to do (with none of the procps-ng `--` arg-parsing fragility).
+#[cfg(unix)]
+fn raw_kill(pid: i32, sig: i32) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let rc = unsafe { kill(pid, sig) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The process group of `pid`, via `getpgid(2)` — replaces the old
+/// `ps -o pgid=` subprocess.
+#[cfg(unix)]
+fn process_group_of(pid: u32) -> Option<u32> {
+    unsafe extern "C" {
+        fn getpgid(pid: i32) -> i32;
+    }
+    let gid = unsafe { getpgid(pid as i32) };
+    if gid <= 0 {
+        None
+    } else {
+        Some(gid as u32)
+    }
 }
 
 #[cfg(unix)]
@@ -837,21 +875,6 @@ fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
                 "NtSuspend/ResumeProcess returned status {status:#x}"
             )))
         }
-    }
-}
-
-#[cfg(unix)]
-fn run_signal(signal: &str, target: &str) -> std::io::Result<()> {
-    // `--` ends option parsing so a negative target (a process group like
-    // `-7`) is treated as a pid, not a flag — required by procps-ng's kill.
-    let status = Command::new("kill")
-        .args([signal, "--", target])
-        .status()
-        .map_err(std::io::Error::other)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other("kill failed"))
     }
 }
 

@@ -352,14 +352,12 @@ fn is_alive(pid: u32) -> bool {
     // waitpid returns ECHILD and we fall back to the kill -0 answer.
     unsafe extern "C" {
         fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        fn kill(pid: i32, sig: i32) -> i32;
     }
     const WNOHANG: i32 = 1;
 
-    let knock = Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // Raw `kill(pid, 0)` probes liveness without spawning a `kill` subprocess.
+    let knock = unsafe { kill(pid as i32, 0) == 0 };
     if !knock {
         return false;
     }
