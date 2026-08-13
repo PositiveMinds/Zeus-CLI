@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -208,8 +209,16 @@ fn run_capturing(mut cmd: Command, timeout: Duration) -> std::io::Result<Capture
 
     let stdout_buf = Arc::new(Mutex::new(String::new()));
     let stderr_buf = Arc::new(Mutex::new(String::new()));
-    let out_thread = child.stdout.take().map(|h| spawn_reader(h, stdout_buf.clone()));
-    let err_thread = child.stderr.take().map(|h| spawn_reader(h, stderr_buf.clone()));
+    let stdout_done = Arc::new(AtomicBool::new(false));
+    let stderr_done = Arc::new(AtomicBool::new(false));
+    let _ = child
+        .stdout
+        .take()
+        .map(|h| spawn_reader(h, stdout_buf.clone(), stdout_done.clone()));
+    let _ = child
+        .stderr
+        .take()
+        .map(|h| spawn_reader(h, stderr_buf.clone(), stderr_done.clone()));
 
     let start = Instant::now();
     let status = loop {
@@ -224,11 +233,15 @@ fn run_capturing(mut cmd: Command, timeout: Duration) -> std::io::Result<Capture
         std::thread::sleep(Duration::from_millis(25));
     };
 
-    if let Some(h) = out_thread {
-        let _ = h.join();
-    }
-    if let Some(h) = err_thread {
-        let _ = h.join();
+    // Bounded wait for the readers instead of an unconditional join: a
+    // lingering pipe from a grandchild hook process can keep the reader side
+    // open past the child's exit, and an unbounded join would hang the turn
+    // (same class of hang guarded in the terminal runner).
+    let reader_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < reader_deadline
+        && !(stdout_done.load(Ordering::SeqCst) && stderr_done.load(Ordering::SeqCst))
+    {
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     let stdout = stdout_buf.lock().unwrap().clone();
@@ -244,13 +257,15 @@ fn run_capturing(mut cmd: Command, timeout: Duration) -> std::io::Result<Capture
 fn spawn_reader<R: Read + Send + 'static>(
     mut reader: R,
     buf: Arc<Mutex<String>>,
-) -> std::thread::JoinHandle<()> {
+    done: Arc<AtomicBool>,
+) {
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if reader.read_to_end(&mut bytes).is_ok() {
             buf.lock().unwrap().push_str(&String::from_utf8_lossy(&bytes));
         }
-    })
+        done.store(true, Ordering::SeqCst);
+    });
 }
 
 #[cfg(test)]

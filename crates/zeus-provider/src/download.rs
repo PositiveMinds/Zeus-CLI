@@ -11,7 +11,15 @@
 use crate::error::{ProviderError, Result};
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+
+/// Cap on establishing the connection (DNS / TCP / TLS). A directory with no
+/// reachable server must surface as an error instead of blocking the turn on
+/// an OS-level connect retry loop. Deliberately scoped to connect, not the
+/// whole transfer: model files can be multi-GB and a total request timeout
+/// would cut off legitimately slow downloads mid-stream.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn map_reqwest_err(e: reqwest::Error) -> ProviderError {
     ProviderError::Transport(e.to_string())
@@ -33,7 +41,10 @@ pub async fn download_hf_file(
         .to_os_string();
 
     let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| ProviderError::Transport(format!("build http client: {e}")))?;
     let resp = client.get(&url).send().await.map_err(map_reqwest_err)?;
     if !resp.status().is_success() {
         return Err(ProviderError::Api(format!(
@@ -82,8 +93,15 @@ mod tests {
     /// the actual HTTP + redirect + streaming-write path works, not just
     /// that the code compiles. Uses a tiny test-fixture repo's config.json
     /// (a few hundred bytes), not a real multi-GB model file.
+    ///
+    /// Skips unless `ZEUS_LIVE_TESTS=1` is set: a default `cargo test` must
+    /// never require (or hang on) internet access, in CI or offline dev.
     #[tokio::test]
     async fn downloads_a_real_small_file_from_hugging_face() {
+        if std::env::var("ZEUS_LIVE_TESTS").is_err() {
+            eprintln!("skipped: set ZEUS_LIVE_TESTS=1 to run live network tests");
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let mut last_progress = (0u64, None);
         let path = download_hf_file(
@@ -104,8 +122,13 @@ mod tests {
         assert!(!tmp.path().join("config.json.part").exists());
     }
 
+    /// Same live-network gating as `downloads_a_real_small_file_from_hugging_face`.
     #[tokio::test]
     async fn missing_file_returns_a_clear_error_not_a_panic() {
+        if std::env::var("ZEUS_LIVE_TESTS").is_err() {
+            eprintln!("skipped: set ZEUS_LIVE_TESTS=1 to run live network tests");
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let err = download_hf_file(
             "hf-internal-testing/tiny-random-gpt2",

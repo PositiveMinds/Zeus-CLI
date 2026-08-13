@@ -254,14 +254,16 @@ impl TerminalRunner {
 
         let stdout_buf = Arc::new(Mutex::new(String::new()));
         let stderr_buf = Arc::new(Mutex::new(String::new()));
-        let out_thread = child
+        let stdout_done = Arc::new(AtomicBool::new(false));
+        let stderr_done = Arc::new(AtomicBool::new(false));
+        let _ = child
             .stdout
             .take()
-            .map(|h| spawn_reader(h, stdout_buf.clone()));
-        let err_thread = child
+            .map(|h| spawn_reader(h, stdout_buf.clone(), stdout_done.clone()));
+        let _ = child
             .stderr
             .take()
-            .map(|h| spawn_reader(h, stderr_buf.clone()));
+            .map(|h| spawn_reader(h, stderr_buf.clone(), stderr_done.clone()));
 
         let mut timed_out = false;
         let mut cancelled = false;
@@ -289,11 +291,17 @@ impl TerminalRunner {
             std::thread::sleep(Duration::from_millis(25));
         };
 
-        if let Some(h) = out_thread {
-            let _ = h.join();
-        }
-        if let Some(h) = err_thread {
-            let _ = h.join();
+        // Bounded wait for the reader threads rather than an unconditional
+        // join: if some lingering handle keeps a pipe's write side open past
+        // the child's exit, the readers never see EOF — an unbounded join
+        // here hangs the whole command (the same class of hang the pty path
+        // below already guards against). Handles are dropped after the
+        // deadline; a still-blocked thread is leaked rather than waited on.
+        let reader_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < reader_deadline
+            && !(stdout_done.load(Ordering::SeqCst) && stderr_done.load(Ordering::SeqCst))
+        {
+            std::thread::sleep(Duration::from_millis(25));
         }
 
         let mut stdout = stdout_buf.lock().unwrap().clone();
@@ -488,6 +496,7 @@ fn build_command(command: &str, opts: &TerminalOptions) -> Command {
 fn spawn_reader<R: std::io::Read + Send + 'static>(
     reader: R,
     buf: Arc<Mutex<String>>,
+    done: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
@@ -505,6 +514,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
                 Err(_) => break,
             }
         }
+        done.store(true, Ordering::SeqCst);
     })
 }
 

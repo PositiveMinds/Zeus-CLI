@@ -17,12 +17,19 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Latest spec version this client speaks. The server may negotiate an
 /// older one back in its `initialize` response; per spec that's fine as
 /// long as it's a version we understand (we don't currently reject any).
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Cap on a single request/response round trip. A server that goes silent
+/// (but stays alive, so `read_line` never sees EOF) must surface as an error
+/// rather than hang the agent turn on a blocking stdio read.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpTool {
@@ -228,12 +235,54 @@ impl McpClient {
         });
         let mut conv = self.conversation.lock().unwrap();
         Self::write_line(&mut conv.stdin, &req)?;
+
+        // Read the response on a scoped thread and wait bounded on the main
+        // one: a server that goes silent while staying alive (read_line can
+        // never EOF) must time out instead of blocking forever. On expiry we
+        // kill the child — closing its stdout is what lets the reader thread
+        // reach EOF, so `scope` joins cleanly. `thread::scope` returns this
+        // closure's result, so `return` here flows straight out of
+        // `send_request`.
+        let reader = &mut conv.reader;
+        let name = &self.name;
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            let _ = s.spawn(move || {
+                let _ = result_tx.send(Self::read_response(reader, id, method, name));
+            });
+            let deadline = Instant::now() + RESPONSE_TIMEOUT;
+            loop {
+                if let Ok(r) = result_rx.try_recv() {
+                    return r;
+                }
+                if Instant::now() >= deadline {
+                    if let Ok(mut child) = self.child.lock() {
+                        let _ = child.kill();
+                    }
+                    return Err(AgentError::Terminal(format!(
+                        "mcp '{}': no response to '{method}' within {}s (server killed)",
+                        self.name,
+                        RESPONSE_TIMEOUT.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        })
+    }
+
+    /// Consume server lines until the response matching `id` arrives (skipping
+    /// notifications and stray responses), then return its result/error.
+    fn read_response(
+        reader: &mut BufReader<ChildStdout>,
+        id: i64,
+        method: &str,
+        name: &str,
+    ) -> Result<Value> {
         loop {
-            let line = Self::read_line(&mut conv.reader)?;
+            let line = Self::read_line(reader)?;
             let value: Value = serde_json::from_str(&line).map_err(|e| {
                 AgentError::Terminal(format!(
-                    "mcp '{}': non-JSON line from server: {e} (line: {line:?})",
-                    self.name
+                    "mcp '{name}': non-JSON line from server: {e} (line: {line:?})"
                 ))
             })?;
             // A request/id-bearing response we're waiting on; anything else
@@ -245,8 +294,7 @@ impl McpClient {
             }
             if let Some(err) = value.get("error") {
                 return Err(AgentError::Terminal(format!(
-                    "mcp '{}' error calling {method}: {err}",
-                    self.name
+                    "mcp '{name}' error calling {method}: {err}"
                 )));
             }
             return Ok(value.get("result").cloned().unwrap_or(Value::Null));
