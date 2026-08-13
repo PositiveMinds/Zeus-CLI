@@ -3,9 +3,11 @@
 //!
 //! The blueprint calls for a structured, reviewable artifact that survives
 //! the session: `TaskPlan` is written at plan time (`approved: false`),
-//! flipped to `true` when the user approves execution, and updated again when
-//! every step completes. Nothing in zeus reads it back yet — it exists as the
-//! durable record a human reviews before hitting "execute".
+//! flipped to `true` when the user approves execution, and each step's `done`
+//! flag is flipped as the orchestrator completes it — so a human watching
+//! `.agent/tasks.json` mid-run sees live per-step progress. Nothing in zeus
+//! reads the file back for its own decisions yet; it exists as the durable
+//! record a human reviews before and during execution.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -91,6 +93,16 @@ impl TaskPlan {
         }
     }
 
+    /// Mark the step with the given id complete. Unknown ids are ignored —
+    /// declined steps never run, so they stay pending.
+    pub fn mark_done(&mut self, id: usize) {
+        for step in &mut self.steps {
+            if step.id == id {
+                step.done = true;
+            }
+        }
+    }
+
     /// How many steps have been completed.
     pub fn completed(&self) -> usize {
         self.steps.iter().filter(|s| s.done).count()
@@ -165,5 +177,38 @@ mod tests {
         plan.mark_all_done();
         assert_eq!(plan.completed(), 2);
         assert!(plan.steps.iter().all(|s| s.done));
+    }
+
+    #[test]
+    fn mark_done_flips_only_the_named_step() {
+        let steps = vec![
+            PlanStep {
+                id: 1,
+                description: "a".into(),
+                rationale: "one".into(),
+                persona: None,
+            },
+            PlanStep {
+                id: 2,
+                description: "b".into(),
+                rationale: "two".into(),
+                persona: None,
+            },
+            PlanStep {
+                id: 3,
+                description: "c".into(),
+                rationale: "three".into(),
+                persona: None,
+            },
+        ];
+        let mut plan = TaskPlan::from_steps("g", &steps, "", false);
+        plan.mark_done(2);
+        assert_eq!(plan.completed(), 1);
+        assert!(!plan.steps[0].done);
+        assert!(plan.steps[1].done);
+        assert!(!plan.steps[2].done);
+        // unknown id is a no-op
+        plan.mark_done(99);
+        assert_eq!(plan.completed(), 1);
     }
 }

@@ -166,9 +166,9 @@ gate = true
         );
         assert_eq!(w.phases.len(), 2);
         assert_eq!(w.phases[0].persona, "architect");
-        assert_eq!(w.phases[0].read_only, true);
-        assert_eq!(w.phases[0].gate, false);
-        assert_eq!(w.phases[1].gate, true);
+        assert!(w.phases[0].read_only);
+        assert!(!w.phases[0].gate);
+        assert!(w.phases[1].gate);
     }
 
     #[test]

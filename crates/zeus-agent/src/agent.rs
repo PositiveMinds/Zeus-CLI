@@ -982,10 +982,13 @@ impl Agent {
                 }
                 prior_content = result.final_text.clone();
                 summaries.push(step_summary(&step, &result.final_text));
+                let done_id = step.id;
                 on_event(AgentEvent::PlanStepDone {
                     step,
                     summary: result.final_text,
                 });
+                plan.mark_done(done_id);
+                self.write_task_plan(&plan)?;
                 idx += 1;
             } else {
                 // Run the read-only batch concurrently (bounded). All steps in
@@ -1046,6 +1049,7 @@ impl Agent {
                             }
                             prior_content = final_text.clone();
                             summaries.push(step_summary(step, &final_text));
+                            plan.mark_done(step.id);
                             on_event(AgentEvent::PlanStepDone {
                                 step: step.clone(),
                                 summary: final_text,
@@ -1053,6 +1057,7 @@ impl Agent {
                         }
                         Err(e) => {
                             summaries.push(step_summary(step, &format!("(step failed: {e})")));
+                            plan.mark_done(step.id);
                             on_event(AgentEvent::PlanStepDone {
                                 step: step.clone(),
                                 summary: format!("(step failed: {e})"),
@@ -1064,6 +1069,7 @@ impl Agent {
                     let summary = self.cancel_orchestration(goal, &summaries, &mut on_event)?;
                     return Ok((summary, total_usage));
                 }
+                self.write_task_plan(&plan)?;
                 idx = end;
             }
         }
@@ -2487,7 +2493,7 @@ mod tests {
         assert!(!result.cancelled);
         assert_eq!(result.final_text, "verdict: APPROVE");
         // Plan mode was forced on for the read-only review pass, then restored.
-        assert_eq!(before, false);
+        assert!(!before);
         assert_eq!(agent.plan_mode(), before);
         let review = events.iter().find_map(|e| match e {
             AgentEvent::ReviewUncommitted { persona, report } => {
@@ -2594,6 +2600,39 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, AgentEvent::OrchestrationRevision { .. })));
+    }
+
+    #[tokio::test]
+    async fn orchestrate_persists_per_step_progress_to_tasks_json() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut agent = test_agent(
+            root,
+            MockProvider::new(orchestration_script(
+                r#"[{"description":"first","rationale":"one"},{"description":"second","rationale":"two"},{"description":"third","rationale":"three"}]"#,
+                "did the first thing",
+                "verdict: LGTM",
+            )),
+        );
+        // With `max_parallel_read_steps = 1` every step runs sequentially, so
+        // the persisted file is written once per completed step and the final
+        // state reflects the exact run order.
+        agent.options.max_parallel_read_steps = 1;
+        let tasks_file = root.join(".agent/tasks.json");
+        agent.options.tasks_file = Some(tasks_file.clone());
+
+        let (summary, _usage) = agent
+            .orchestrate("do the thing", |_ev| {}, approve)
+            .await
+            .unwrap();
+        assert!(summary.contains("3 steps"), "{summary}");
+
+        let plan = crate::plans::TaskPlan::read(&tasks_file)
+            .unwrap()
+            .expect("tasks.json written");
+        assert!(plan.approved);
+        assert_eq!(plan.completed(), 3, "all steps done at finish");
+        assert!(plan.steps.iter().all(|s| s.done));
     }
 
     #[tokio::test]
