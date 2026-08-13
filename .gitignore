@@ -1,7 +1,6 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Agent local overrides (personal / machine-specific)
 **/.agent/settings.local.toml
@@ -34,6 +33,11 @@ Thumbs.db
 # Standalone UI/design prototypes (not part of the zeus project)
 /supercode ui/
 *.webp
+
+# Scratch/research notes and media (Word docs, videos, one-off scripts)
+*.docx
+*.mp4
+tmp-ranked.ps1
 
 # npm platform packages — the release workflow drops the actual prebuilt
 # binary into each of these right before `npm publish`; never checked in.
