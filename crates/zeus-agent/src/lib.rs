@@ -31,7 +31,7 @@ pub use agent::{Agent, AgentEvent, AgentOptions, ContextUsage, PlanStep, TurnRes
 pub use analyze::{analyze_repo, GitReport, ProbeHit, ProbeReport, RepoFile, RepoFingerprint};
 pub use background::{BackgroundTask, BackgroundTaskRegistry, TaskStatus};
 pub use commands::{ExpandResult, SlashCommands};
-pub use context::{ContextManager, CompactResult};
+pub use context::{CompactResult, ContextManager};
 pub use docread::{extract as extract_document, Document};
 pub use error::{AgentError, Result};
 pub use hooks::{HookRunner, PreToolUseOutcome};
@@ -43,11 +43,15 @@ pub use personas::{
 pub use plans::{TaskPlan, TaskStep};
 pub use plugin::{load_all as load_all_plugins, LoadedPlugin, PluginCallResult};
 pub use project::load_or_analyze;
-pub use session::{new_session_id, ConversationState, SessionStore, SessionSummary, TranscriptEntry};
+pub use session::{
+    new_session_id, ConversationState, SessionStore, SessionSummary, TranscriptEntry,
+};
 pub use skills::{discover_in_dir, parse_skill, skill_resources, Skill, SkillArg, SkillTier};
 pub use terminal::{
-    CommandHistory, CommandProfile, CommandRecord, Sandbox, TerminalOptions, TerminalRunner,
-    TerminalOutput,
+    CommandHistory, CommandProfile, CommandRecord, Sandbox, TerminalOptions, TerminalOutput,
+    TerminalRunner,
 };
-pub use workflows::{discover_all as discover_workflows, parse_workflow, Workflow, WorkflowPhaseDef};
 pub use tools::{builtin_tool_specs, platform_tool_specs, ToolManager, ToolResult};
+pub use workflows::{
+    discover_all as discover_workflows, parse_workflow, Workflow, WorkflowPhaseDef,
+};

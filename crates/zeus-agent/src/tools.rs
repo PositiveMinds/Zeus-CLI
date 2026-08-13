@@ -15,9 +15,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use zeus_fs::{
-    ApprovalDecision, CopyOptions, DeviceEngine, EditOptions, GitEngine, GitOutput, IndexEngine,
-    PermissionGate, PermissionRequest, PlatformEngine, PlatformOutput, ReadOptions, ResetMode,
-    SearchOptions, SymbolIndex, Workspace, WriteOptions, filter_out_own_index, word_boundary,
+    filter_out_own_index, word_boundary, ApprovalDecision, CopyOptions, DeviceEngine, EditOptions,
+    GitEngine, GitOutput, IndexEngine, PermissionGate, PermissionRequest, PlatformEngine,
+    PlatformOutput, ReadOptions, ResetMode, SearchOptions, SymbolIndex, Workspace, WriteOptions,
 };
 use zeus_provider::ToolSpec;
 
@@ -717,7 +717,9 @@ pub fn platform_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "gh_pr_merge".into(),
-            description: "Merge a GitHub pull request (requires approval). method=merge/squash/rebase.".into(),
+            description:
+                "Merge a GitHub pull request (requires approval). method=merge/squash/rebase."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -803,7 +805,8 @@ pub fn platform_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "supabase_db_push".into(),
-            description: "Push local migrations to the linked remote database (requires approval).".into(),
+            description: "Push local migrations to the linked remote database (requires approval)."
+                .into(),
             parameters: json!({ "type": "object", "properties": {} }),
         },
         ToolSpec {
@@ -859,7 +862,8 @@ pub fn platform_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "vercel_deploy".into(),
-            description: "Deploy to Vercel (requires approval). prod=true deploys to production.".into(),
+            description: "Deploy to Vercel (requires approval). prod=true deploys to production."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1104,7 +1108,8 @@ pub fn platform_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "sam_deploy".into(),
-            description: "sam deploy (requires approval). guided=true for interactive prompts.".into(),
+            description: "sam deploy (requires approval). guided=true for interactive prompts."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1124,7 +1129,8 @@ pub fn platform_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "cloudformation_deploy".into(),
-            description: "aws cloudformation deploy a template to a stack (requires approval).".into(),
+            description: "aws cloudformation deploy a template to a stack (requires approval)."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1342,7 +1348,8 @@ pub fn platform_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "netlify_deploy".into(),
-            description: "Deploy to Netlify (requires approval). prod=true deploys to production.".into(),
+            description: "Deploy to Netlify (requires approval). prod=true deploys to production."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1407,7 +1414,7 @@ pub struct ToolManager {
 fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
-            "read"
+        "read"
             | "grep"
             | "glob"
             | "web_fetch"
@@ -1512,7 +1519,8 @@ impl ToolManager {
     }
 
     pub fn set_plan_mode(&self, enabled: bool) {
-        self.plan_mode.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.plan_mode
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn plan_mode(&self) -> bool {
@@ -1625,19 +1633,19 @@ impl ToolManager {
             Err(e) => return Err(e),
         };
 
-        Ok(match self.hooks.run_post_tool_use(
-            name,
-            arguments,
-            &result.content,
-            result.is_error,
-        ) {
-            Some(extra) => ToolResult {
-                content: format!("{}\n\n[post-tool-use hook output]\n{extra}", result.content),
-                is_error: result.is_error,
-                images: result.images,
+        Ok(
+            match self
+                .hooks
+                .run_post_tool_use(name, arguments, &result.content, result.is_error)
+            {
+                Some(extra) => ToolResult {
+                    content: format!("{}\n\n[post-tool-use hook output]\n{extra}", result.content),
+                    is_error: result.is_error,
+                    images: result.images,
+                },
+                None => result,
             },
-            None => result,
-        })
+        )
     }
 
     fn dispatch_inner<F>(&self, name: &str, arguments: &str, approver: &mut F) -> Result<ToolResult>
@@ -1722,8 +1730,12 @@ impl ToolManager {
             "supabase_status" => self.do_platform("supabase_status", &args, approver),
             "supabase_db_push" => self.do_platform("supabase_db_push", &args, approver),
             "supabase_db_diff" => self.do_platform("supabase_db_diff", &args, approver),
-            "supabase_functions_list" => self.do_platform("supabase_functions_list", &args, approver),
-            "supabase_functions_deploy" => self.do_platform("supabase_functions_deploy", &args, approver),
+            "supabase_functions_list" => {
+                self.do_platform("supabase_functions_list", &args, approver)
+            }
+            "supabase_functions_deploy" => {
+                self.do_platform("supabase_functions_deploy", &args, approver)
+            }
             "vercel_whoami" => self.do_platform("vercel_whoami", &args, approver),
             "vercel_projects_list" => self.do_platform("vercel_projects_list", &args, approver),
             "vercel_env_list" => self.do_platform("vercel_env_list", &args, approver),
@@ -1754,7 +1766,9 @@ impl ToolManager {
             "aws_ecs_force_deploy" => self.do_platform("aws_ecs_force_deploy", &args, approver),
             "sam_build" => self.do_platform("sam_build", &args, approver),
             "sam_deploy" => self.do_platform("sam_deploy", &args, approver),
-            "cloudformation_describe" => self.do_platform("cloudformation_describe", &args, approver),
+            "cloudformation_describe" => {
+                self.do_platform("cloudformation_describe", &args, approver)
+            }
             "cloudformation_deploy" => self.do_platform("cloudformation_deploy", &args, approver),
             "az_whoami" => self.do_platform("az_whoami", &args, approver),
             "az_webapp_list" => self.do_platform("az_webapp_list", &args, approver),
@@ -1802,12 +1816,19 @@ impl ToolManager {
     /// native plugin call is at least as consequential as an external
     /// server call (more so: it runs in-process, see the trust-boundary
     /// warning in `plugin.rs`), so it gets no less scrutiny.
-    fn do_plugin_call<F>(&self, plugin_and_tool: &str, args: Value, approver: &mut F) -> Result<ToolResult>
+    fn do_plugin_call<F>(
+        &self,
+        plugin_and_tool: &str,
+        args: Value,
+        approver: &mut F,
+    ) -> Result<ToolResult>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         let Some((plugin_name, tool)) = plugin_and_tool.split_once("__") else {
-            return Err(AgentError::UnknownTool(format!("plugin__{plugin_and_tool}")));
+            return Err(AgentError::UnknownTool(format!(
+                "plugin__{plugin_and_tool}"
+            )));
         };
         let Some(plugin) = self.plugins.iter().find(|p| p.name() == plugin_name) else {
             return Ok(ToolResult::err(format!(
@@ -1846,7 +1867,12 @@ impl ToolManager {
     /// they default to "ask" via the generic no-rule fallback (same as any
     /// tool with no tailored default) rather than silently inheriting
     /// whatever the built-in `bash`/`write`/etc. defaults happen to be.
-    fn do_mcp_call<F>(&self, server_and_tool: &str, args: Value, approver: &mut F) -> Result<ToolResult>
+    fn do_mcp_call<F>(
+        &self,
+        server_and_tool: &str,
+        args: Value,
+        approver: &mut F,
+    ) -> Result<ToolResult>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
@@ -1898,9 +1924,7 @@ impl ToolManager {
     }
 
     fn usize_arg(args: &Value, key: &str) -> Option<usize> {
-        args.get(key)
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
+        args.get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
     }
 
     fn opt_bool_arg(args: &Value, key: &str) -> Option<bool> {
@@ -1910,7 +1934,11 @@ impl ToolManager {
     fn str_array_arg(args: &Value, key: &str) -> Vec<String> {
         args.get(key)
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1924,14 +1952,21 @@ impl ToolManager {
             return Ok(ToolResult::err("missing required \"todos\" array"));
         };
         for t in todos {
-            if t.get("content").and_then(|v| v.as_str()).is_none_or(str::is_empty) {
-                return Ok(ToolResult::err("each todo needs a non-empty \"content\" string"));
+            if t.get("content")
+                .and_then(|v| v.as_str())
+                .is_none_or(str::is_empty)
+            {
+                return Ok(ToolResult::err(
+                    "each todo needs a non-empty \"content\" string",
+                ));
             }
             match t.get("status").and_then(|v| v.as_str()) {
                 Some("pending" | "in_progress" | "completed") => {}
-                _ => return Ok(ToolResult::err(
-                    "each todo needs \"status\" to be one of pending/in_progress/completed",
-                )),
+                _ => {
+                    return Ok(ToolResult::err(
+                        "each todo needs \"status\" to be one of pending/in_progress/completed",
+                    ))
+                }
             }
         }
         let done = todos
@@ -1943,8 +1978,14 @@ impl ToolManager {
 
     fn do_read(&self, args: &Value) -> Result<ToolResult> {
         let path = Self::str_arg(args, "path")?;
-        let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
-        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
         // Default-bounded read so an unguarded look at a huge generated file
         // can't fill the context — and the header below always states the
         // visible window, so a partial read is never mistaken for the file.
@@ -2013,7 +2054,9 @@ impl ToolManager {
             },
             &mut *approver,
         ) {
-            Ok(n) => Ok(ToolResult::ok(format!("edited {path} ({n} replacement(s))"))),
+            Ok(n) => Ok(ToolResult::ok(format!(
+                "edited {path} ({n} replacement(s))"
+            ))),
             Err(e) => Ok(ToolResult::err(e.to_string())),
         }
     }
@@ -2158,7 +2201,10 @@ impl ToolManager {
                 tool: "code_index".into(),
                 path: Some(SymbolIndex::file_path(&root)),
                 command: None,
-                description: format!("build/refresh the code index at {}", SymbolIndex::file_path(&root).display()),
+                description: format!(
+                    "build/refresh the code index at {}",
+                    SymbolIndex::file_path(&root).display()
+                ),
                 ..Default::default()
             },
             &mut *approver,
@@ -2529,7 +2575,10 @@ impl ToolManager {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_lowercase();
-        if content_type.contains("json") || content_type.contains("text") || content_type.contains("xml") {
+        if content_type.contains("json")
+            || content_type.contains("text")
+            || content_type.contains("xml")
+        {
             // fine
         } else {
             return Ok(ToolResult::err(format!(
@@ -2549,9 +2598,7 @@ impl ToolManager {
             content = content.chars().take(max_chars).collect::<String>();
             content.push_str("\n… (truncated, max_chars reached)");
         }
-        Ok(ToolResult::ok(format!(
-            "# web_fetch {url}\n{content}"
-        )))
+        Ok(ToolResult::ok(format!("# web_fetch {url}\n{content}")))
     }
 
     /// `web_search` — query a public web search endpoint and return the top
@@ -2578,10 +2625,7 @@ impl ToolManager {
             Ok(c) => c,
             Err(e) => return Ok(ToolResult::err(format!("http client init failed: {e}"))),
         };
-        let endpoint = format!(
-            "https://html.duckduckgo.com/html/?q={}",
-            urlencode(&query)
-        );
+        let endpoint = format!("https://html.duckduckgo.com/html/?q={}", urlencode(&query));
         let resp = match client.get(&endpoint).send() {
             Ok(r) => r,
             Err(e) => return Ok(ToolResult::err(format!("search request failed: {e}"))),
@@ -2600,13 +2644,21 @@ impl ToolManager {
         // DuckDuckGo HTML results: <a class="result__a" href="URL">title</a>
         // and <a class="result__snippet" ...>snippet</a>.
         let mut results: Vec<(String, String, String)> = Vec::new();
-        for (_i, chunk) in html.split("result__a").skip(1).enumerate() {
+        for chunk in html.split("result__a").skip(1) {
             if results.len() >= max_results {
                 break;
             }
-            let Some(href_start) = chunk.find("href=\"") else { continue };
-            let url = &chunk[href_start + 6..chunk[href_start + 6..].find('"').map(|i| i + href_start + 6).unwrap_or(href_start + 6)];
-            let Some(title_end) = chunk.find("</a>") else { continue };
+            let Some(href_start) = chunk.find("href=\"") else {
+                continue;
+            };
+            let url = &chunk[href_start + 6
+                ..chunk[href_start + 6..]
+                    .find('"')
+                    .map(|i| i + href_start + 6)
+                    .unwrap_or(href_start + 6)];
+            let Some(title_end) = chunk.find("</a>") else {
+                continue;
+            };
             let title = strip_html(&chunk[..title_end]);
             let snippet = chunk
                 .find("result__snippet")
@@ -2618,7 +2670,11 @@ impl ToolManager {
                 .map(|s| strip_html(&s))
                 .unwrap_or_default();
             let url_clean = url.trim_start_matches("//").to_string();
-            results.push((title.trim().to_string(), url_clean, snippet.trim().to_string()));
+            results.push((
+                title.trim().to_string(),
+                url_clean,
+                snippet.trim().to_string(),
+            ));
         }
 
         if results.is_empty() {
@@ -2631,7 +2687,11 @@ impl ToolManager {
             out.push_str(&format!(
                 "\n{}. {title}\n   {url}\n   {}\n",
                 i + 1,
-                if snippet.is_empty() { "(no snippet)".to_string() } else { snippet.clone() }
+                if snippet.is_empty() {
+                    "(no snippet)".to_string()
+                } else {
+                    snippet.clone()
+                }
             ));
         }
         out.push_str("\nUse web_fetch on the most relevant URL above for full content.");
@@ -2682,11 +2742,8 @@ impl ToolManager {
         }
         let mut lines = Vec::new();
         for skill in skills {
-            let hay = format!(
-                "{} {} {:?}",
-                skill.name, skill.description, skill.tags
-            )
-            .to_lowercase();
+            let hay =
+                format!("{} {} {:?}", skill.name, skill.description, skill.tags).to_lowercase();
             if !search.is_empty() && !hay.contains(&search) {
                 continue;
             }
@@ -2818,7 +2875,9 @@ impl ToolManager {
     /// read specs, reports, spreadsheets and slide decks.
     fn do_read_document(&self, args: &Value) -> Result<ToolResult> {
         let path = Self::str_arg(args, "path")?;
-        let max_chars = Self::usize_arg(args, "max_chars").unwrap_or(100_000).max(1000);
+        let max_chars = Self::usize_arg(args, "max_chars")
+            .unwrap_or(100_000)
+            .max(1000);
         let root = self.workspace.project_root.clone();
         let resolved = match zeus_fs::resolve_in_project(&root, Path::new(path)) {
             Ok(p) => p,
@@ -2856,7 +2915,12 @@ impl ToolManager {
         };
         let bytes = match std::fs::read(&resolved) {
             Ok(b) => b,
-            Err(e) => return Ok(ToolResult::err(format!("could not read {}: {e}", resolved.display()))),
+            Err(e) => {
+                return Ok(ToolResult::err(format!(
+                    "could not read {}: {e}",
+                    resolved.display()
+                )))
+            }
         };
         // Only raster formats are safe to hand to a vision model.
         let mime = image_mime(&resolved);
@@ -2892,9 +2956,12 @@ impl ToolManager {
             None => crate::project::load_or_analyze(&root),
         };
         let text = if topic.trim().is_empty() {
-            format!("Repository understanding:\n{}", fp.banner_lines().join("\n"))
+            format!(
+                "Repository understanding:\n{}",
+                fp.banner_lines().join("\n")
+            )
         } else {
-            fp.render(&topic)
+            fp.render(topic)
         };
         Ok(ToolResult::ok(text))
     }
@@ -2925,9 +2992,7 @@ impl ToolManager {
                 let name = Self::str_arg(args, "name")?;
                 match crate::project::memory_read(&root, name) {
                     Some(body) => Ok(ToolResult::ok(format!(".agent/memory/{name}.md:\n{body}"))),
-                    None => Ok(ToolResult::err(format!(
-                        "no memory note named `{name}`"
-                    ))),
+                    None => Ok(ToolResult::err(format!("no memory note named `{name}`"))),
                 }
             }
             other => Ok(ToolResult::err(format!(
@@ -2958,7 +3023,9 @@ impl ToolManager {
             WriteOptions::default(),
             &mut *approver,
         ) {
-            Ok(()) => Ok(ToolResult::ok(format!("wrote .agent/memory/{path_name}.md"))),
+            Ok(()) => Ok(ToolResult::ok(format!(
+                "wrote .agent/memory/{path_name}.md"
+            ))),
             Err(e) => Ok(ToolResult::err(e.to_string())),
         }
     }
@@ -2971,16 +3038,30 @@ impl ToolManager {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        let action = Self::str_arg(args, "action")?
-            .to_ascii_lowercase();
+        let action = Self::str_arg(args, "action")?.to_ascii_lowercase();
         let device = &self.device;
         // A no-op enum check so unknown actions are rejected before any adb
         // call (and before the permission prompt).
         if !matches!(
             action.as_str(),
-            "devices" | "connect" | "disconnect" | "install" | "uninstall" | "launch" | "screenshot"
-                | "screenrecord" | "logcat" | "logcat_clear" | "shell" | "pair" | "info" | "reverse"
-                | "forward" | "input" | "pull" | "push"
+            "devices"
+                | "connect"
+                | "disconnect"
+                | "install"
+                | "uninstall"
+                | "launch"
+                | "screenshot"
+                | "screenrecord"
+                | "logcat"
+                | "logcat_clear"
+                | "shell"
+                | "pair"
+                | "info"
+                | "reverse"
+                | "forward"
+                | "input"
+                | "pull"
+                | "push"
         ) {
             return Ok(ToolResult::err(format!(
                 "unknown device action '{action}' — use one of: devices, connect, disconnect, install, uninstall, launch, screenshot, screenrecord, logcat, logcat_clear, shell, pair, info, reverse, forward, input, pull, push"
@@ -2989,12 +3070,12 @@ impl ToolManager {
 
         let opt_str = |key: &str| Self::opt_str_arg(args, key).map(|s| s.to_string());
         let req_str = |key: &str| {
-            Self::str_arg(args, key).map(|s| s.to_string()).map_err(|_| {
-                AgentError::InvalidArguments {
+            Self::str_arg(args, key)
+                .map(|s| s.to_string())
+                .map_err(|_| AgentError::InvalidArguments {
                     tool: "device".into(),
                     reason: format!("action '{action}' requires '{key}'"),
-                }
-            })
+                })
         };
 
         let result = match action.as_str() {
@@ -3003,14 +3084,21 @@ impl ToolManager {
             "disconnect" => device.disconnect(&req_str("target")?, &mut *approver),
             "install" => device.install(&req_str("path")?, &mut *approver),
             "uninstall" => device.uninstall(&req_str("package")?, &mut *approver),
-            "launch" => device.launch(&req_str("package")?, opt_str("activity").as_deref(), &mut *approver),
+            "launch" => device.launch(
+                &req_str("package")?,
+                opt_str("activity").as_deref(),
+                &mut *approver,
+            ),
             "screenshot" => device.screenshot(opt_str("out").as_deref(), &mut *approver),
             "screenrecord" => {
                 let seconds = args.get("seconds").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
                 device.screenrecord(opt_str("out").as_deref(), seconds, &mut *approver)
             }
             "logcat" => {
-                let max = args.get("max_lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+                let max = args
+                    .get("max_lines")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200) as usize;
                 device.logcat(opt_str("filter").as_deref(), max, &mut *approver)
             }
             "logcat_clear" => device.logcat_clear(&mut *approver),
@@ -3018,24 +3106,42 @@ impl ToolManager {
             "pair" => device.pair(&req_str("host_port")?, &req_str("code")?, &mut *approver),
             "info" => device.info(&mut *approver),
             "reverse" => {
-                let local = args.get("local_port").and_then(|v| v.as_u64()).map(|v| v as u32);
-                let dev = args.get("device_port").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let local = args
+                    .get("local_port")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                let dev = args
+                    .get("device_port")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
                 device.reverse(local, dev, &mut *approver)
             }
             "forward" => {
-                let local = args.get("local_port").and_then(|v| v.as_u64()).map(|v| v as u32);
-                let dev = args.get("device_port").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let local = args
+                    .get("local_port")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                let dev = args
+                    .get("device_port")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
                 device.forward(local, dev, &mut *approver)
             }
             "input" => device.input(&req_str("event")?, &mut *approver),
-            "pull" => device.pull(&req_str("remote")?, opt_str("out").as_deref(), &mut *approver),
+            "pull" => device.pull(
+                &req_str("remote")?,
+                opt_str("out").as_deref(),
+                &mut *approver,
+            ),
             "push" => device.push(&req_str("out")?, &req_str("remote")?, &mut *approver),
             _ => unreachable!("validated above"),
         };
 
         match result {
             Ok(out) => Ok(device_result(out)),
-            Err(e) => Ok(ToolResult::err(format!("device action '{action}' failed: {e}"))),
+            Err(e) => Ok(ToolResult::err(format!(
+                "device action '{action}' failed: {e}"
+            ))),
         }
     }
 
@@ -3092,9 +3198,7 @@ impl ToolManager {
     fn do_bg_resume(&self, args: &Value) -> Result<ToolResult> {
         let id = Self::u64_arg(args, "id")?;
         match self.background.resume(id) {
-            Ok(()) => Ok(ToolResult::ok(format!(
-                "resumed background task {id}"
-            ))),
+            Ok(()) => Ok(ToolResult::ok(format!("resumed background task {id}"))),
             Err(e) => Ok(ToolResult::err(e.to_string())),
         }
     }
@@ -3102,11 +3206,18 @@ impl ToolManager {
     // --- Git ---
 
     fn do_git_diff(&self, args: &Value) -> Result<ToolResult> {
-        let staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+        let staged = args
+            .get("staged")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let refs: Vec<String> = args
             .get("refs")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let refs_ref: Vec<&str> = refs.iter().map(|s| s.as_str()).collect();
         git_result(self.git.diff(staged, &refs_ref))
@@ -3135,7 +3246,11 @@ impl ToolManager {
         let paths: Vec<String> = args
             .get("paths")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         if paths.is_empty() {
             return Err(AgentError::InvalidArguments {
@@ -3327,7 +3442,10 @@ impl ToolManager {
                 let tag = Self::str_arg(args, "tag")?;
                 let title = Self::opt_str_arg(args, "title");
                 let notes = Self::opt_str_arg(args, "notes");
-                platform_result(self.platform.gh_release_create(tag, title, notes, &mut *approver))
+                platform_result(
+                    self.platform
+                        .gh_release_create(tag, title, notes, &mut *approver),
+                )
             }
             "gh_workflow_list" => platform_result(self.platform.gh_workflow_list()),
             "gh_workflow_run" => {
@@ -3373,7 +3491,10 @@ impl ToolManager {
                 let prod = Self::opt_bool_arg(args, "prod").unwrap_or(false);
                 let target = Self::opt_str_arg(args, "target");
                 let project = Self::opt_str_arg(args, "project");
-                platform_result(self.platform.vercel_deploy(prod, target, project, &mut *approver))
+                platform_result(
+                    self.platform
+                        .vercel_deploy(prod, target, project, &mut *approver),
+                )
             }
             "vercel_logs" => {
                 let dep = Self::opt_str_arg(args, "deployment");
@@ -3390,10 +3511,12 @@ impl ToolManager {
                 let services = Self::str_array_arg(args, "services");
                 let detached = Self::opt_bool_arg(args, "detached").unwrap_or(false);
                 let build = Self::opt_bool_arg(args, "build").unwrap_or(false);
-                platform_result(
-                    self.platform
-                        .docker_compose_up(services, detached, build, &mut *approver),
-                )
+                platform_result(self.platform.docker_compose_up(
+                    services,
+                    detached,
+                    build,
+                    &mut *approver,
+                ))
             }
             "docker_compose_down" => {
                 let volumes = Self::opt_bool_arg(args, "volumes").unwrap_or(false);
@@ -3446,7 +3569,10 @@ impl ToolManager {
             "circleci_builds" => {
                 let project = Self::str_arg(args, "project")?;
                 let branch = Self::opt_str_arg(args, "branch");
-                platform_result(self.platform.circleci_builds(project, branch, count("limit")))
+                platform_result(
+                    self.platform
+                        .circleci_builds(project, branch, count("limit")),
+                )
             }
             "aws_whoami" => platform_result(self.platform.aws_whoami()),
             "aws_s3_ls" => {
@@ -3463,13 +3589,20 @@ impl ToolManager {
             "aws_lambda_invoke" => {
                 let function = Self::str_arg(args, "function")?;
                 let payload = Self::opt_str_arg(args, "payload");
-                platform_result(self.platform.aws_lambda_invoke(function, payload, &mut *approver))
+                platform_result(
+                    self.platform
+                        .aws_lambda_invoke(function, payload, &mut *approver),
+                )
             }
             "aws_ecs_list_clusters" => platform_result(self.platform.aws_ecs_list_clusters()),
             "aws_ecs_force_deploy" => {
                 let cluster = Self::str_arg(args, "cluster")?;
                 let service = Self::str_arg(args, "service")?;
-                platform_result(self.platform.aws_ecs_force_deploy(cluster, service, &mut *approver))
+                platform_result(self.platform.aws_ecs_force_deploy(
+                    cluster,
+                    service,
+                    &mut *approver,
+                ))
             }
             "sam_build" => platform_result(self.platform.sam_build(&mut *approver)),
             "sam_deploy" => {
@@ -3484,7 +3617,11 @@ impl ToolManager {
             "cloudformation_deploy" => {
                 let template = Self::str_arg(args, "template")?;
                 let stack = Self::str_arg(args, "stack")?;
-                platform_result(self.platform.cloudformation_deploy(template, stack, &mut *approver))
+                platform_result(self.platform.cloudformation_deploy(
+                    template,
+                    stack,
+                    &mut *approver,
+                ))
             }
             "az_whoami" => platform_result(self.platform.az_whoami()),
             "az_webapp_list" => platform_result(self.platform.az_webapp_list()),
@@ -3492,13 +3629,21 @@ impl ToolManager {
                 let name = Self::str_arg(args, "name")?;
                 let rg = Self::str_arg(args, "resource_group")?;
                 let source = Self::str_arg(args, "source")?;
-                platform_result(self.platform.az_webapp_deploy(name, rg, source, &mut *approver))
+                platform_result(
+                    self.platform
+                        .az_webapp_deploy(name, rg, source, &mut *approver),
+                )
             }
             "az_functionapp_deploy" => {
                 let name = Self::str_arg(args, "name")?;
                 let rg = Self::str_arg(args, "resource_group")?;
                 let source = Self::str_arg(args, "source")?;
-                platform_result(self.platform.az_functionapp_deploy(name, rg, source, &mut *approver))
+                platform_result(self.platform.az_functionapp_deploy(
+                    name,
+                    rg,
+                    source,
+                    &mut *approver,
+                ))
             }
             "gcloud_whoami" => platform_result(self.platform.gcloud_whoami()),
             "gcloud_app_deploy" => platform_result(self.platform.gcloud_app_deploy(&mut *approver)),
@@ -3506,7 +3651,12 @@ impl ToolManager {
                 let service = Self::str_arg(args, "service")?;
                 let image = Self::str_arg(args, "image")?;
                 let region = Self::opt_str_arg(args, "region");
-                platform_result(self.platform.gcloud_run_deploy(service, image, region, &mut *approver))
+                platform_result(self.platform.gcloud_run_deploy(
+                    service,
+                    image,
+                    region,
+                    &mut *approver,
+                ))
             }
             "gcloud_run_services" => platform_result(self.platform.gcloud_run_services()),
             "helm_list" => {
@@ -3522,13 +3672,19 @@ impl ToolManager {
                 let release = Self::str_arg(args, "release")?;
                 let chart = Self::str_arg(args, "chart")?;
                 let ns = Self::opt_str_arg(args, "namespace");
-                platform_result(self.platform.helm_install(release, chart, ns, &mut *approver))
+                platform_result(
+                    self.platform
+                        .helm_install(release, chart, ns, &mut *approver),
+                )
             }
             "helm_upgrade" => {
                 let release = Self::str_arg(args, "release")?;
                 let chart = Self::str_arg(args, "chart")?;
                 let ns = Self::opt_str_arg(args, "namespace");
-                platform_result(self.platform.helm_upgrade(release, chart, ns, &mut *approver))
+                platform_result(
+                    self.platform
+                        .helm_upgrade(release, chart, ns, &mut *approver),
+                )
             }
             "helm_uninstall" => {
                 let release = Self::str_arg(args, "release")?;
@@ -3564,7 +3720,10 @@ impl ToolManager {
                 let dir = Self::str_arg(args, "dir")?;
                 let prod = Self::opt_bool_arg(args, "prod").unwrap_or(false);
                 let site = Self::opt_str_arg(args, "site");
-                platform_result(self.platform.netlify_deploy(dir, prod, site, &mut *approver))
+                platform_result(
+                    self.platform
+                        .netlify_deploy(dir, prod, site, &mut *approver),
+                )
             }
             "firebase_projects" => platform_result(self.platform.firebase_projects()),
             "firebase_deploy" => {
@@ -3748,7 +3907,10 @@ fn open_browser_url(url: &str) -> std::io::Result<()> {
 /// Map an image file extension to its MIME type; `None` for non-raster
 /// formats that a vision model cannot ingest.
 fn image_mime(path: &Path) -> Option<&'static str> {
-    let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
     match ext.as_str() {
         "png" => Some("image/png"),
         "jpg" | "jpeg" | "jpe" => Some("image/jpeg"),
@@ -3776,10 +3938,18 @@ fn reject_web_target(url: &str) -> Option<String> {
         return Some("no host in url".into());
     }
     for bad in [
-        "localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", "169.254.169.254", "metadata.google.internal",
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "[::1]",
+        "0.0.0.0",
+        "169.254.169.254",
+        "metadata.google.internal",
     ] {
         if host == bad {
-            return Some(format!("'{host}' resolves to the loopback/metadata services"));
+            return Some(format!(
+                "'{host}' resolves to the loopback/metadata services"
+            ));
         }
     }
     None
@@ -3941,28 +4111,25 @@ mod tests {
         assert!(tm.plan_mode());
 
         let blocked = tm
-            .dispatch_with_approver(
-                "write",
-                r#"{"path":"a.txt","content":"changed"}"#,
-                approve,
-            )
+            .dispatch_with_approver("write", r#"{"path":"a.txt","content":"changed"}"#, approve)
             .unwrap();
         assert!(blocked.is_error);
         assert!(blocked.content.contains("Plan mode"));
         // The blocked call must not have actually touched the file.
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "hello"
+        );
 
-        let read = tm.dispatch_with_approver("read", r#"{"path":"a.txt"}"#, approve).unwrap();
+        let read = tm
+            .dispatch_with_approver("read", r#"{"path":"a.txt"}"#, approve)
+            .unwrap();
         assert!(!read.is_error);
         assert!(read.content.contains("hello"));
 
         tm.set_plan_mode(false);
         let write_again = tm
-            .dispatch_with_approver(
-                "write",
-                r#"{"path":"a.txt","content":"changed"}"#,
-                approve,
-            )
+            .dispatch_with_approver("write", r#"{"path":"a.txt","content":"changed"}"#, approve)
             .unwrap();
         assert!(!write_again.is_error);
     }
@@ -3976,7 +4143,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("proj");
         let tm = tool_manager(&root);
-        let result = tm.dispatch_with_approver("frobnicate", "{}", approve).unwrap();
+        let result = tm
+            .dispatch_with_approver("frobnicate", "{}", approve)
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("frobnicate"));
     }
@@ -4023,7 +4192,11 @@ mod tests {
         // security, qa-testing, documentation — a single read_skill call
         // loads the whole chain.
         let r = tm
-            .dispatch_with_approver("read_skill", r#"{"name":"build-app","recursive":true}"#, approve)
+            .dispatch_with_approver(
+                "read_skill",
+                r#"{"name":"build-app","recursive":true}"#,
+                approve,
+            )
             .unwrap();
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("skill: build-app"));
@@ -4158,13 +4331,21 @@ mod tests {
         // it comes back as a failed `ToolResult` (so the model sees the
         // mistake and can retry) rather than a hard dispatch error that
         // would kill the whole turn with no chance to self-correct.
-        let missing = tm.dispatch_with_approver("web_search", "{}", approve).unwrap();
-        assert!(missing.is_error, "missing `query` should surface as a failed tool result");
+        let missing = tm
+            .dispatch_with_approver("web_search", "{}", approve)
+            .unwrap();
+        assert!(
+            missing.is_error,
+            "missing `query` should surface as a failed tool result"
+        );
     }
 
-#[test]
+    #[test]
     fn web_search_is_read_only_tool() {
-        assert!(is_read_only_tool("web_search"), "web_search must run in plan mode");
+        assert!(
+            is_read_only_tool("web_search"),
+            "web_search must run in plan mode"
+        );
         assert!(is_read_only_tool("web_fetch"));
         assert!(!is_read_only_tool("bash"));
     }
@@ -4184,7 +4365,11 @@ mod tests {
         assert!(empty.content.contains("No long-term memory"));
 
         let w = tm
-            .dispatch_with_approver("memory_write", r#"{"name":"auth","content":"token-based auth"}"#, approve)
+            .dispatch_with_approver(
+                "memory_write",
+                r#"{"name":"auth","content":"token-based auth"}"#,
+                approve,
+            )
             .unwrap();
         assert!(!w.is_error, "{}", w.content);
         let path = root.join(".agent/memory/auth.md");
@@ -4201,7 +4386,11 @@ mod tests {
         assert!(read.content.contains("token-based"));
 
         let bad_name = tm
-            .dispatch_with_approver("memory_write", r#"{"name":"BAD NAME","content":"x"}"#, approve)
+            .dispatch_with_approver(
+                "memory_write",
+                r#"{"name":"BAD NAME","content":"x"}"#,
+                approve,
+            )
             .unwrap();
         assert!(bad_name.is_error);
     }
@@ -4271,17 +4460,15 @@ mod tests {
 
         let tm = tool_manager(&root);
         let r = tm
-            .dispatch_with_approver(
-                "code_rename",
-                r#"{"old":"alpha","new":"omega"}"#,
-                approve,
-            )
+            .dispatch_with_approver("code_rename", r#"{"old":"alpha","new":"omega"}"#, approve)
             .unwrap();
         assert!(!r.is_error);
         assert!(r.content.contains("rename 'alpha' -> 'omega'"));
         assert!(r.content.contains("Plan only"));
         // Rename must never write.
-        assert!(std::fs::read_to_string(root.join("lib.rs")).unwrap().contains("fn alpha()"));
+        assert!(std::fs::read_to_string(root.join("lib.rs"))
+            .unwrap()
+            .contains("fn alpha()"));
     }
 
     #[test]
@@ -4397,7 +4584,9 @@ mod tests {
         let root = tmp.path().join("proj");
         let tm = tool_manager(&root);
         for spec in builtin_tool_specs() {
-            let result = tm.dispatch_with_approver(&spec.name, "{}", approve).unwrap();
+            let result = tm
+                .dispatch_with_approver(&spec.name, "{}", approve)
+                .unwrap();
             // `dispatch_with_approver` now soft-fails both InvalidArguments
             // and UnknownTool into `Ok(ToolResult::err(...))` instead of
             // returning `Err`, so `Err(AgentError::UnknownTool(_))` can no
@@ -4421,7 +4610,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        std::process::Command::new("git").arg("init").current_dir(&root).output().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&root)
+            .output()
+            .unwrap();
         std::process::Command::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(&root)
@@ -4454,7 +4647,9 @@ mod tests {
         assert!(!log.is_error);
         assert!(log.content.contains("initial commit"));
 
-        let status = tm.dispatch_with_approver("git_status", "{}", approve).unwrap();
+        let status = tm
+            .dispatch_with_approver("git_status", "{}", approve)
+            .unwrap();
         assert!(!status.is_error);
 
         // Force-push must be denied even though the approver would allow —

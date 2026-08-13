@@ -21,30 +21,102 @@ use std::path::{Path, PathBuf};
 
 /// Directory names that never add project signal (never scanned).
 const IGNORED_DIRS: &[&str] = &[
-    ".git", ".hg", ".svn", ".bzr", "node_modules", "target", "build", "dist",
-    ".next", ".nuxt", ".output", ".svelte-kit", ".cache", ".venv", "venv",
-    "env", "envs", "__pycache__", ".mypy_cache", ".pytest_cache",
-    ".ruff_cache", ".gradle", ".idea", ".vscode", ".agent", "coverage",
-    ".parcel-cache", ".dart_tool", ".yarn", ".pnpm-store", "vendor",
-    "third_party", "__snapshots__",
+    ".git",
+    ".hg",
+    ".svn",
+    ".bzr",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".svelte-kit",
+    ".cache",
+    ".venv",
+    "venv",
+    "env",
+    "envs",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".gradle",
+    ".idea",
+    ".vscode",
+    ".agent",
+    "coverage",
+    ".parcel-cache",
+    ".dart_tool",
+    ".yarn",
+    ".pnpm-store",
+    "vendor",
+    "third_party",
+    "__snapshots__",
 ];
 
 /// Files that describe the build (never counted as source or tests).
 const CONFIG_NAMES: &[&str] = &[
-    "cargo.toml", "cargo.lock", "package.json", "package-lock.json",
-    "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "tsconfig.json", "svelte.config.js",
-    "vite.config.ts", "vite.config.js", "vitest.config.ts", "next.config.js",
-    "tailwind.config.js", "tailwind.config.ts", "postcss.config.js",
-    "Dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yaml",
-    "compose.yml", "Makefile", "README", "README.md", "Gemfile", "Gemfile.lock",
-    "go.mod", "go.sum", "pyproject.toml", "setup.py", "requirements.txt",
-    "requirements-dev.txt", "Pipfile", "Pipfile.lock", "poetry.lock",
-    "biome.json", "eslint.config.js", "eslint.config.mjs", ".prettierrc",
-    "webpack.config.js", "rollup.config.js", "vite.config.mjs",
-    "cmakelists.txt", "build.gradle", "build.gradle.kts", "pom.xml",
-    "settings.gradle", "build.rs", "diesel.toml", "alembic.ini", "manage.py",
-    "lerna.json", "turbo.json", ".env.example", ".env.sample",
-    "vercel.json", "netlify.toml", ".node-version", ".nvmrc",
+    "cargo.toml",
+    "cargo.lock",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+    "tsconfig.json",
+    "svelte.config.js",
+    "vite.config.ts",
+    "vite.config.js",
+    "vitest.config.ts",
+    "next.config.js",
+    "tailwind.config.js",
+    "tailwind.config.ts",
+    "postcss.config.js",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yaml",
+    "compose.yml",
+    "Makefile",
+    "README",
+    "README.md",
+    "Gemfile",
+    "Gemfile.lock",
+    "go.mod",
+    "go.sum",
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "Pipfile",
+    "Pipfile.lock",
+    "poetry.lock",
+    "biome.json",
+    "eslint.config.js",
+    "eslint.config.mjs",
+    ".prettierrc",
+    "webpack.config.js",
+    "rollup.config.js",
+    "vite.config.mjs",
+    "cmakelists.txt",
+    "build.gradle",
+    "build.gradle.kts",
+    "pom.xml",
+    "settings.gradle",
+    "build.rs",
+    "diesel.toml",
+    "alembic.ini",
+    "manage.py",
+    "lerna.json",
+    "turbo.json",
+    ".env.example",
+    ".env.sample",
+    "vercel.json",
+    "netlify.toml",
+    ".node-version",
+    ".nvmrc",
 ];
 
 fn language_for(ext: &str) -> Option<&'static str> {
@@ -114,7 +186,11 @@ impl GitReport {
             return "not a git repo".to_string();
         }
         let n = self.unstaged + self.staged + self.untracked + self.conflicts;
-        let state = if n == 0 { "clean".to_string() } else { format!("{n} uncommitted change(s)") };
+        let state = if n == 0 {
+            "clean".to_string()
+        } else {
+            format!("{n} uncommitted change(s)")
+        };
         if self.branch.is_empty() {
             state
         } else {
@@ -160,10 +236,36 @@ pub struct RepoFingerprint {
 
 /// Directory basenames that indicate a project area (used for important dirs).
 const IMPORTANT_DIR_NAMES: &[&str] = &[
-    "src", "lib", "app", "core", "server", "backend", "frontend", "client",
-    "api", "apis", "services", "shared", "components", "pages", "views",
-    "config", "configs", "tests", "test", "e2e", "migrations", "db", "infra",
-    "deploy", "public", "assets", "crates", "modules", "packages", "apps",
+    "src",
+    "lib",
+    "app",
+    "core",
+    "server",
+    "backend",
+    "frontend",
+    "client",
+    "api",
+    "apis",
+    "services",
+    "shared",
+    "components",
+    "pages",
+    "views",
+    "config",
+    "configs",
+    "tests",
+    "test",
+    "e2e",
+    "migrations",
+    "db",
+    "infra",
+    "deploy",
+    "public",
+    "assets",
+    "crates",
+    "modules",
+    "packages",
+    "apps",
 ];
 
 impl RepoFingerprint {
@@ -201,7 +303,12 @@ impl RepoFingerprint {
         if !self.entry_points.is_empty() {
             lines.push(format!(
                 "✓ entry: {}",
-                self.entry_points.iter().take(4).cloned().collect::<Vec<_>>().join(", ")
+                self.entry_points
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         if self.git.present {
@@ -289,65 +396,189 @@ impl ProbeReport {
 /// Subject rules: a request keyword maps to related aliases used to search
 /// filenames, then the whole group is presented under one label.
 const TOPIC_RULES: &[(&str, &[&str])] = &[
-    ("authentication", &[
-        "auth", "login", "signin", "signup", "register", "logout", "jwt", "oauth",
-        "session", "password", "credential", "user", "account", "permission",
-        "role", "token", "mfa",
-    ]),
-    ("database", &[
-        "db", "datastore", "sql", "schema", "table", "migration", "model",
-        "entity", "query", "orm", "postgres", "postgresql", "mysql", "sqlite",
-        "mongodb", "mongo", "redis", "prisma", "sequelize", "typeorm", "diesel",
-        "sqlx", "sea-orm",
-    ]),
-    ("api", &[
-        "api", "rest", "endpoint", "route", "graphql", "controller", "handler",
-        "middleware", "webhook", "service",
-    ]),
-    ("ui/frontend", &[
-        "frontend", "ui", "component", "page", "view", "react", "vue", "svelte",
-        "angular", "css", "tailwind", "style", "jsx", "tsx", "design", "dashboard",
-    ]),
-    ("backend/web", &[
-        "backend", "server", "app", "express", "fastify", "nginx", "deploy",
-    ]),
-    ("tests", &["test", "spec", "fixture", "mock", "jest", "pytest", "expect"]),
-    ("configuration", &[
-        "config", "env", "environment", "setting", "dotenv", "setup", "yml",
-        "toml",
-    ]),
-    ("git", &["git", "commit", "branch", "merge", "rebase", "stash", "checkout"]),
-    ("ci/infra", &[
-        "ci", "pipeline", "workflow", "terraform", "ansible", "kubernetes", "k8s",
-        "docker", "container", "actions",
-    ]),
-    ("security", &[
-        "security", "vulner", "sanitize", "encrypt", "hash", "captcha", "csrf",
-        "cors", "ssl", "tls", "throttle",
-    ]),
-    ("realtime", &["websocket", "socket", "pubsub", "stomp", "socket.io"]),
-    ("search", &[
-        "search", "index", "elastic", "meilisearch", "solr", "lunr",
-    ]),
-    ("payments", &[
-        "payment", "stripe", "checkout", "invoice", "billing", "subscription",
-        "charge",
-    ]),
-    ("data/file", &[
-        "etl", "analytics", "streaming", "kafka", "spark", "report", "export",
-        "import", "csv",
-    ]),
+    (
+        "authentication",
+        &[
+            "auth",
+            "login",
+            "signin",
+            "signup",
+            "register",
+            "logout",
+            "jwt",
+            "oauth",
+            "session",
+            "password",
+            "credential",
+            "user",
+            "account",
+            "permission",
+            "role",
+            "token",
+            "mfa",
+        ],
+    ),
+    (
+        "database",
+        &[
+            "db",
+            "datastore",
+            "sql",
+            "schema",
+            "table",
+            "migration",
+            "model",
+            "entity",
+            "query",
+            "orm",
+            "postgres",
+            "postgresql",
+            "mysql",
+            "sqlite",
+            "mongodb",
+            "mongo",
+            "redis",
+            "prisma",
+            "sequelize",
+            "typeorm",
+            "diesel",
+            "sqlx",
+            "sea-orm",
+        ],
+    ),
+    (
+        "api",
+        &[
+            "api",
+            "rest",
+            "endpoint",
+            "route",
+            "graphql",
+            "controller",
+            "handler",
+            "middleware",
+            "webhook",
+            "service",
+        ],
+    ),
+    (
+        "ui/frontend",
+        &[
+            "frontend",
+            "ui",
+            "component",
+            "page",
+            "view",
+            "react",
+            "vue",
+            "svelte",
+            "angular",
+            "css",
+            "tailwind",
+            "style",
+            "jsx",
+            "tsx",
+            "design",
+            "dashboard",
+        ],
+    ),
+    (
+        "backend/web",
+        &[
+            "backend", "server", "app", "express", "fastify", "nginx", "deploy",
+        ],
+    ),
+    (
+        "tests",
+        &[
+            "test", "spec", "fixture", "mock", "jest", "pytest", "expect",
+        ],
+    ),
+    (
+        "configuration",
+        &[
+            "config",
+            "env",
+            "environment",
+            "setting",
+            "dotenv",
+            "setup",
+            "yml",
+            "toml",
+        ],
+    ),
+    (
+        "git",
+        &[
+            "git", "commit", "branch", "merge", "rebase", "stash", "checkout",
+        ],
+    ),
+    (
+        "ci/infra",
+        &[
+            "ci",
+            "pipeline",
+            "workflow",
+            "terraform",
+            "ansible",
+            "kubernetes",
+            "k8s",
+            "docker",
+            "container",
+            "actions",
+        ],
+    ),
+    (
+        "security",
+        &[
+            "security", "vulner", "sanitize", "encrypt", "hash", "captcha", "csrf", "cors", "ssl",
+            "tls", "throttle",
+        ],
+    ),
+    (
+        "realtime",
+        &["websocket", "socket", "pubsub", "stomp", "socket.io"],
+    ),
+    (
+        "search",
+        &["search", "index", "elastic", "meilisearch", "solr", "lunr"],
+    ),
+    (
+        "payments",
+        &[
+            "payment",
+            "stripe",
+            "checkout",
+            "invoice",
+            "billing",
+            "subscription",
+            "charge",
+        ],
+    ),
+    (
+        "data/file",
+        &[
+            "etl",
+            "analytics",
+            "streaming",
+            "kafka",
+            "spark",
+            "report",
+            "export",
+            "import",
+            "csv",
+        ],
+    ),
 ];
 
 const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "or", "the", "to", "in", "on", "of", "for", "with",
-    "at", "from", "by", "is", "it", "its", "be", "do", "does", "did", "was",
-    "are", "this", "that", "these", "those", "we", "you", "they", "i", "my",
-    "your", "our", "have", "has", "had", "will", "would", "should", "could",
-    "please", "make", "creating", "add", "create", "remove", "update", "fix",
-    "write", "code", "want", "need", "help", "how", "why", "what", "where",
-    "when", "which", "using", "used", "use", "like", "just", "about", "into",
-    "not", "no", "yes", "also", "then", "there", "here", "all", "some", "any",
+    "a", "an", "and", "or", "the", "to", "in", "on", "of", "for", "with", "at", "from", "by", "is",
+    "it", "its", "be", "do", "does", "did", "was", "are", "this", "that", "these", "those", "we",
+    "you", "they", "i", "my", "your", "our", "have", "has", "had", "will", "would", "should",
+    "could", "please", "make", "creating", "add", "create", "remove", "update", "fix", "write",
+    "code", "want", "need", "help", "how", "why", "what", "where", "when", "which", "using",
+    "used", "use", "like", "just", "about", "into", "not", "no", "yes", "also", "then", "there",
+    "here", "all", "some", "any",
 ];
 
 pub(crate) struct ProbeSubject {
@@ -387,9 +618,9 @@ pub(crate) fn subjects_for(request: &str) -> Vec<ProbeSubject> {
 /// Filename-level match: term hits any path segment by exact/prefix equality
 /// (so `auth` hits `authentication/`, `user` hits `users.rs`, not `browser`).
 fn segment_hit(rel_lower: &str, term: &str) -> bool {
-    rel_lower.split(['/', '\\', '.', '_', '-']).any(|seg| {
-        !seg.is_empty() && (seg == term || seg.starts_with(term))
-    })
+    rel_lower
+        .split(['/', '\\', '.', '_', '-'])
+        .any(|seg| !seg.is_empty() && (seg == term || seg.starts_with(term)))
 }
 
 fn probe_files(files: &[RepoFile], request: &str) -> ProbeReport {
@@ -496,29 +727,50 @@ fn is_config_path(rel: &Path) -> bool {
     if rel.file_name().is_none() {
         return false;
     }
-    let base = rel.file_name().unwrap().to_string_lossy().to_ascii_lowercase();
+    let base = rel
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_ascii_lowercase();
     CONFIG_NAMES.contains(&base.as_str())
         || s.starts_with(".github/")
         || s.starts_with(".env")
-        || (rel.components().count() <= 3 && rel.extension().map(|e| e.to_ascii_lowercase()) == Some("toml".into()) && (s.starts_with("config/") || s.starts_with(".config/")))
+        || (rel.components().count() <= 3
+            && rel.extension().map(|e| e.to_ascii_lowercase()) == Some("toml".into())
+            && (s.starts_with("config/") || s.starts_with(".config/")))
         || s.ends_with(".config.json")
 }
 
 fn is_test_path(rel: &Path) -> bool {
     let s = rel.to_string_lossy().to_ascii_lowercase();
-    let base = rel.file_name().map(|b| b.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    let dir_part = rel.parent().map(|p| p.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    s.contains("/test/") || dir_part.starts_with("tests")
-        || dir_part.ends_with("/tests") || dir_part.ends_with("/test")
+    let base = rel
+        .file_name()
+        .map(|b| b.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let dir_part = rel
+        .parent()
+        .map(|p| p.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    s.contains("/test/")
+        || dir_part.starts_with("tests")
+        || dir_part.ends_with("/tests")
+        || dir_part.ends_with("/test")
         || dir_part.contains("__tests__")
-        || s.contains(".test.") || s.contains(".spec.") || s.contains("_test.rs")
-        || base.ends_with("_test.go") || base.ends_with("_spec.rb")
-        || base == "test" || base == "tests" || base == "spec"
+        || s.contains(".test.")
+        || s.contains(".spec.")
+        || s.contains("_test.rs")
+        || base.ends_with("_test.go")
+        || base.ends_with("_spec.rb")
+        || base == "test"
+        || base == "tests"
+        || base == "spec"
 }
 
 /// Determine the test command for this repo via the `test` tool's detector.
 fn infer_test_commands(root: &Path) -> Vec<String> {
-    crate::tools::detect_test_command(root).into_iter().collect()
+    crate::tools::detect_test_command(root)
+        .into_iter()
+        .collect()
 }
 
 /// Build the deterministic fingerprint for a project root.
@@ -534,7 +786,12 @@ pub fn analyze_repo(root: &Path) -> RepoFingerprint {
             f.config_count += 1;
             continue;
         }
-        let ext = file.rel.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let ext = file
+            .rel
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         if ext.is_empty() {
             continue;
         }
@@ -551,15 +808,19 @@ pub fn analyze_repo(root: &Path) -> RepoFingerprint {
             *lang_counts.entry(name).or_default() += n;
         }
     }
-    let mut langs: Vec<(String, usize)> =
-        lang_counts.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let mut langs: Vec<(String, usize)> = lang_counts
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
     langs.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
     f.languages = langs;
 
     // Manifest content (root + common app dirs) for framework/db/manager hunts.
     let manifest_sites: Vec<PathBuf> = {
         let mut sites = vec![root.to_path_buf()];
-        for dir in ["frontend", "backend", "client", "server", "web", "api", "apps", "packages"] {
+        for dir in [
+            "frontend", "backend", "client", "server", "web", "api", "apps", "packages",
+        ] {
             let p = root.join(dir);
             if p.is_dir() {
                 sites.push(p);
@@ -569,7 +830,15 @@ pub fn analyze_repo(root: &Path) -> RepoFingerprint {
     };
     let mut texts: Vec<String> = Vec::new();
     for site in &manifest_sites {
-        for name in ["Cargo.toml", "package.json", "pyproject.toml", "requirements.txt", "go.mod", "Gemfile", "composer.json"] {
+        for name in [
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "requirements.txt",
+            "go.mod",
+            "Gemfile",
+            "composer.json",
+        ] {
             let p = site.join(name);
             if p.is_file() {
                 if let Some(t) = read_small(&p) {
@@ -704,9 +973,12 @@ fn detect_databases(joined_manifests: &str, files: &[RepoFile], f: &mut RepoFing
     }
     let migration_present = files.iter().any(|s2| {
         let s = s2.rel.to_string_lossy();
-        s.contains("/migrations/") || s.starts_with("migrations/")
-            || s.contains("/prisma/") || s.starts_with("prisma/")
-            || s.contains("/alembic/") || s.starts_with("alembic/")
+        s.contains("/migrations/")
+            || s.starts_with("migrations/")
+            || s.contains("/prisma/")
+            || s.starts_with("prisma/")
+            || s.contains("/alembic/")
+            || s.starts_with("alembic/")
     });
     if migration_present && f.databases.is_empty() {
         f.databases.push("migrations present".to_string());
@@ -716,8 +988,7 @@ fn detect_databases(joined_manifests: &str, files: &[RepoFile], f: &mut RepoFing
 fn detect_managers(_joined_manifests: &str, files: &[RepoFile], f: &mut RepoFingerprint) {
     let has = |name: &str| {
         files.iter().any(|s2| {
-            s2.rel.file_name().is_some()
-                && s2.rel.file_name().unwrap().to_string_lossy() == name
+            s2.rel.file_name().is_some() && s2.rel.file_name().unwrap().to_string_lossy() == name
         })
     };
     let mut found: Vec<&str> = Vec::new();
@@ -757,10 +1028,26 @@ fn detect_managers(_joined_manifests: &str, files: &[RepoFile], f: &mut RepoFing
 
 fn detect_entry_points(root: &Path) -> Vec<String> {
     let candidates = [
-        "src/main.rs", "src/lib.rs", "src/main.ts", "src/main.tsx", "src/main.js",
-        "src/index.ts", "src/index.tsx", "src/index.js", "main.py", "app.py",
-        "manage.py", "run.py", "wsgi.py", "asgi.py", "src/main.py", "src/app.py",
-        "server.js", "server.ts", "index.js", "index.py",
+        "src/main.rs",
+        "src/lib.rs",
+        "src/main.ts",
+        "src/main.tsx",
+        "src/main.js",
+        "src/index.ts",
+        "src/index.tsx",
+        "src/index.js",
+        "main.py",
+        "app.py",
+        "manage.py",
+        "run.py",
+        "wsgi.py",
+        "asgi.py",
+        "src/main.py",
+        "src/app.py",
+        "server.js",
+        "server.ts",
+        "index.js",
+        "index.py",
     ];
     candidates
         .iter()
@@ -873,11 +1160,7 @@ fn parse_go_manifest(text: &str, out: &mut Vec<Dependency>) {
         if first.is_empty() {
             continue;
         }
-        let name = first
-            .rsplit('/')
-            .next()
-            .unwrap_or(first)
-            .to_string();
+        let name = first.rsplit('/').next().unwrap_or(first).to_string();
         let version = parts.next().unwrap_or("").to_string();
         out.push(Dependency {
             name,
@@ -978,7 +1261,11 @@ fn detect_build_commands(texts: &[String], root: &Path) -> Vec<String> {
 fn detect_important_dirs(files: &[RepoFile]) -> Vec<String> {
     let mut dirs: BTreeMap<String, usize> = BTreeMap::new();
     for f in files {
-        let first = f.rel.components().next().and_then(|c| c.as_os_str().to_str());
+        let first = f
+            .rel
+            .components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str());
         if let Some(first) = first {
             if IMPORTANT_DIR_NAMES.contains(&first) || first.starts_with('.') {
                 *dirs.entry(first.to_string()).or_default() += 1;
@@ -1108,10 +1395,18 @@ mod tests {
         assert!(
             report.hits.iter().any(|h| h.label == "authentication"),
             "hits: {:?}",
-            report.hits.iter().map(|h| h.label.as_str()).collect::<Vec<_>>()
+            report
+                .hits
+                .iter()
+                .map(|h| h.label.as_str())
+                .collect::<Vec<_>>()
         );
         // The unrelated "browser" file must not be swept in by "user".
-        let auth = report.hits.iter().find(|h| h.label == "authentication").unwrap();
+        let auth = report
+            .hits
+            .iter()
+            .find(|h| h.label == "authentication")
+            .unwrap();
         assert!(auth.files.iter().any(|f| f.contains("users.rs")));
         assert!(!auth.files.iter().any(|f| f.contains("browser_util")));
     }
@@ -1137,13 +1432,11 @@ mod tests {
         let cargo = "[package]\nname=\"x\"\n[dependencies]\nserde = \"1\"\naxum = { version = \"0.7\", features=[\"macros\"] }\n[dev-dependencies]\ntokio = \"1\"\n";
         let npm = r#"{"name":"x","dependencies":{"react":"18"},"devDependencies":{"vite":"^5","rollup":"4"}}"#;
         let req = "fastapi==0.99\nuvicorn[standard]>=0.23\n";
-        let deps = detect_dependencies(&[
-            cargo.to_string(),
-            npm.to_string(),
-            req.to_string(),
-        ]);
+        let deps = detect_dependencies(&[cargo.to_string(), npm.to_string(), req.to_string()]);
         let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
-        for want in ["serde", "axum", "tokio", "react", "vite", "rollup", "fastapi", "uvicorn"] {
+        for want in [
+            "serde", "axum", "tokio", "react", "vite", "rollup", "fastapi", "uvicorn",
+        ] {
             assert!(names.contains(&want), "missing {want} in {names:?}");
         }
         let axum = deps.iter().find(|d| d.name == "axum").unwrap();

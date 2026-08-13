@@ -56,8 +56,7 @@ impl ContextManager {
             return 0;
         }
         let mut first_non_system = 0;
-        while first_non_system < messages.len() && messages[first_non_system].role == Role::System
-        {
+        while first_non_system < messages.len() && messages[first_non_system].role == Role::System {
             first_non_system += 1;
         }
 

@@ -32,9 +32,7 @@ pub use llamacpp::{
     ensure_model_file, ensure_server_binary, find_on_path, locate_server_binary,
     resolve_local_model, serve, spawn_server_and_wait, ServerInfo, DEFAULT_MODEL_CATALOG,
 };
-pub use local_models::{
-    import_model_file, scan_local_models, scan_system_models, LocalModelFile,
-};
+pub use local_models::{import_model_file, scan_local_models, scan_system_models, LocalModelFile};
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use registry::{create_default, create_provider, ProviderHandle};

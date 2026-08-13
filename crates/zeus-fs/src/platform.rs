@@ -102,7 +102,13 @@ impl PlatformEngine {
     }
 
     /// Run a read-only command with no user approval prompt.
-    fn read(&self, tool: &str, description: &str, bin: &str, args: &[String]) -> Result<PlatformOutput> {
+    fn read(
+        &self,
+        tool: &str,
+        description: &str,
+        bin: &str,
+        args: &[String],
+    ) -> Result<PlatformOutput> {
         self.enforce_strict(tool, description.to_string())?;
         self.run_bin(bin, args)
     }
@@ -150,7 +156,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("gh", "gh_issue_create", "Install it and run `gh auth login`.")?;
+        self.require_bin(
+            "gh",
+            "gh_issue_create",
+            "Install it and run `gh auth login`.",
+        )?;
         let command = "gh issue create";
         self.enforce(
             "gh_issue_create",
@@ -158,7 +168,12 @@ impl PlatformEngine {
             command.into(),
             approver,
         )?;
-        let mut args = vec!["issue".into(), "create".into(), "--title".into(), title.to_string()];
+        let mut args = vec![
+            "issue".into(),
+            "create".into(),
+            "--title".into(),
+            title.to_string(),
+        ];
         if let Some(body) = body {
             args.push("--body".into());
             args.push(body.to_string());
@@ -174,7 +189,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("gh", "gh_issue_close", "Install it and run `gh auth login`.")?;
+        self.require_bin(
+            "gh",
+            "gh_issue_close",
+            "Install it and run `gh auth login`.",
+        )?;
         self.enforce(
             "gh_issue_close",
             "close a GitHub issue".into(),
@@ -187,7 +206,12 @@ impl PlatformEngine {
 
     pub fn gh_pr_list(&self, state: &str, limit: usize) -> Result<PlatformOutput> {
         self.require_bin("gh", "gh_pr_list", "Install it and run `gh auth login`.")?;
-        let mut args = vec!["pr".into(), "list".into(), "--state".into(), state.to_string()];
+        let mut args = vec![
+            "pr".into(),
+            "list".into(),
+            "--state".into(),
+            state.to_string(),
+        ];
         args.push("--limit".into());
         args.push(limit.to_string());
         self.read("gh_pr_list", "gh pr list", "gh", &args)
@@ -216,7 +240,12 @@ impl PlatformEngine {
             "gh pr create".into(),
             approver,
         )?;
-        let mut args = vec!["pr".into(), "create".into(), "--title".into(), title.to_string()];
+        let mut args = vec![
+            "pr".into(),
+            "create".into(),
+            "--title".into(),
+            title.to_string(),
+        ];
         if let Some(body) = body {
             args.push("--body".into());
             args.push(body.to_string());
@@ -256,7 +285,11 @@ impl PlatformEngine {
     }
 
     pub fn gh_release_list(&self, limit: usize) -> Result<PlatformOutput> {
-        self.require_bin("gh", "gh_release_list", "Install it and run `gh auth login`.")?;
+        self.require_bin(
+            "gh",
+            "gh_release_list",
+            "Install it and run `gh auth login`.",
+        )?;
         let mut args = vec!["release".into(), "list".into()];
         args.push("--limit".into());
         args.push(limit.to_string());
@@ -273,7 +306,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("gh", "gh_release_create", "Install it and run `gh auth login`.")?;
+        self.require_bin(
+            "gh",
+            "gh_release_create",
+            "Install it and run `gh auth login`.",
+        )?;
         self.enforce(
             "gh_release_create",
             "create a GitHub release".into(),
@@ -293,7 +330,11 @@ impl PlatformEngine {
     }
 
     pub fn gh_workflow_list(&self) -> Result<PlatformOutput> {
-        self.require_bin("gh", "gh_workflow_list", "Install it and run `gh auth login`.")?;
+        self.require_bin(
+            "gh",
+            "gh_workflow_list",
+            "Install it and run `gh auth login`.",
+        )?;
         let args = vec!["workflow".into(), "list".into()];
         self.read("gh_workflow_list", "gh workflow list", "gh", &args)
     }
@@ -307,7 +348,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("gh", "gh_workflow_run", "Install it and run `gh auth login`.")?;
+        self.require_bin(
+            "gh",
+            "gh_workflow_run",
+            "Install it and run `gh auth login`.",
+        )?;
         self.enforce(
             "gh_workflow_run",
             "trigger a GitHub Actions workflow".into(),
@@ -346,7 +391,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("supabase", "supabase_login", "Install it (`brew install supabase/tap/supabase`).")?;
+        self.require_bin(
+            "supabase",
+            "supabase_login",
+            "Install it (`brew install supabase/tap/supabase`).",
+        )?;
         self.enforce(
             "supabase_login",
             "log in to Supabase (opens browser)".into(),
@@ -357,11 +406,19 @@ impl PlatformEngine {
         self.run_bin("supabase", &args)
     }
 
-    pub fn supabase_link<F>(&self, project_ref: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
+    pub fn supabase_link<F>(
+        &self,
+        project_ref: Option<&str>,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("supabase", "supabase_link", "Install it (`brew install supabase/tap/supabase`).")?;
+        self.require_bin(
+            "supabase",
+            "supabase_link",
+            "Install it (`brew install supabase/tap/supabase`).",
+        )?;
         self.enforce(
             "supabase_link",
             "link the project to a Supabase remote".into(),
@@ -377,22 +434,44 @@ impl PlatformEngine {
     }
 
     pub fn supabase_projects_list(&self) -> Result<PlatformOutput> {
-        self.require_bin("supabase", "supabase_projects_list", "Install it (`brew install supabase/tap/supabase`).")?;
+        self.require_bin(
+            "supabase",
+            "supabase_projects_list",
+            "Install it (`brew install supabase/tap/supabase`).",
+        )?;
         let args = vec!["projects".into(), "list".into()];
-        self.read("supabase_projects_list", "supabase projects list", "supabase", &args)
+        self.read(
+            "supabase_projects_list",
+            "supabase projects list",
+            "supabase",
+            &args,
+        )
     }
 
     pub fn supabase_status(&self) -> Result<PlatformOutput> {
-        self.require_bin("supabase", "supabase_status", "Install it (`brew install supabase/tap/supabase`).")?;
+        self.require_bin(
+            "supabase",
+            "supabase_status",
+            "Install it (`brew install supabase/tap/supabase`).",
+        )?;
         let args = vec!["status".into()];
-        self.read("supabase_status", "supabase status (local dev services)", "supabase", &args)
+        self.read(
+            "supabase_status",
+            "supabase status (local dev services)",
+            "supabase",
+            &args,
+        )
     }
 
     pub fn supabase_db_push<F>(&self, approver: &mut F) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("supabase", "supabase_db_push", "Install it (`brew install supabase/tap/supabase`).")?;
+        self.require_bin(
+            "supabase",
+            "supabase_db_push",
+            "Install it (`brew install supabase/tap/supabase`).",
+        )?;
         self.enforce(
             "supabase_db_push",
             "push local migrations to the linked remote database".into(),
@@ -404,7 +483,11 @@ impl PlatformEngine {
     }
 
     pub fn supabase_db_diff(&self, schema: Option<&str>, linked: bool) -> Result<PlatformOutput> {
-        self.require_bin("supabase", "supabase_db_diff", "Install it (`brew install supabase/tap/supabase`).")?;
+        self.require_bin(
+            "supabase",
+            "supabase_db_diff",
+            "Install it (`brew install supabase/tap/supabase`).",
+        )?;
         let mut args = vec!["db".into(), "diff".into()];
         if linked {
             args.push("--linked".into());
@@ -417,9 +500,18 @@ impl PlatformEngine {
     }
 
     pub fn supabase_functions_list(&self) -> Result<PlatformOutput> {
-        self.require_bin("supabase", "supabase_functions_list", "Install it (`brew install supabase/tap/supabase`).")?;
+        self.require_bin(
+            "supabase",
+            "supabase_functions_list",
+            "Install it (`brew install supabase/tap/supabase`).",
+        )?;
         let args = vec!["functions".into(), "list".into()];
-        self.read("supabase_functions_list", "supabase functions list", "supabase", &args)
+        self.read(
+            "supabase_functions_list",
+            "supabase functions list",
+            "supabase",
+            &args,
+        )
     }
 
     pub fn supabase_functions_deploy<F>(
@@ -432,7 +524,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("supabase", "supabase_functions_deploy", "Install it (`brew install supabase/tap/supabase`).")?;
+        self.require_bin(
+            "supabase",
+            "supabase_functions_deploy",
+            "Install it (`brew install supabase/tap/supabase`).",
+        )?;
         self.enforce(
             "supabase_functions_deploy",
             "deploy a Supabase Edge Function".into(),
@@ -459,15 +555,28 @@ impl PlatformEngine {
     }
 
     pub fn vercel_whoami(&self) -> Result<PlatformOutput> {
-        self.require_bin("vercel", "vercel_whoami", "Install it (`npm i -g vercel`) and run `vercel login`.")?;
+        self.require_bin(
+            "vercel",
+            "vercel_whoami",
+            "Install it (`npm i -g vercel`) and run `vercel login`.",
+        )?;
         let args = vec!["whoami".into()];
         self.read("vercel_whoami", "vercel whoami", "vercel", &args)
     }
 
     pub fn vercel_projects_list(&self) -> Result<PlatformOutput> {
-        self.require_bin("vercel", "vercel_projects_list", "Install it (`npm i -g vercel`) and run `vercel login`.")?;
+        self.require_bin(
+            "vercel",
+            "vercel_projects_list",
+            "Install it (`npm i -g vercel`) and run `vercel login`.",
+        )?;
         let args = vec!["projects".into(), "ls".into()];
-        self.read("vercel_projects_list", "vercel projects ls", "vercel", &args)
+        self.read(
+            "vercel_projects_list",
+            "vercel projects ls",
+            "vercel",
+            &args,
+        )
     }
 
     pub fn vercel_env_list(
@@ -475,7 +584,11 @@ impl PlatformEngine {
         env: Option<&str>,
         project: Option<&str>,
     ) -> Result<PlatformOutput> {
-        self.require_bin("vercel", "vercel_env_list", "Install it (`npm i -g vercel`) and run `vercel login`.")?;
+        self.require_bin(
+            "vercel",
+            "vercel_env_list",
+            "Install it (`npm i -g vercel`) and run `vercel login`.",
+        )?;
         let mut args = vec!["env".into(), "ls".into()];
         if let Some(env) = env {
             args.push(env.to_string());
@@ -497,7 +610,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("vercel", "vercel_deploy", "Install it (`npm i -g vercel`) and run `vercel login`.")?;
+        self.require_bin(
+            "vercel",
+            "vercel_deploy",
+            "Install it (`npm i -g vercel`) and run `vercel login`.",
+        )?;
         self.enforce(
             "vercel_deploy",
             "deploy to Vercel".into(),
@@ -524,7 +641,11 @@ impl PlatformEngine {
         project: Option<&str>,
         follow: bool,
     ) -> Result<PlatformOutput> {
-        self.require_bin("vercel", "vercel_logs", "Install it (`npm i -g vercel`) and run `vercel login`.")?;
+        self.require_bin(
+            "vercel",
+            "vercel_logs",
+            "Install it (`npm i -g vercel`) and run `vercel login`.",
+        )?;
         let mut args = vec!["logs".into()];
         if let Some(deployment) = deployment {
             args.push(deployment.to_string());
@@ -548,7 +669,11 @@ impl PlatformEngine {
     }
 
     pub fn docker_ps(&self, all: bool) -> Result<PlatformOutput> {
-        self.require_bin("docker", "docker_ps", "Install Docker Desktop / the docker CLI.")?;
+        self.require_bin(
+            "docker",
+            "docker_ps",
+            "Install Docker Desktop / the docker CLI.",
+        )?;
         let mut args = vec!["ps".into()];
         if all {
             args.push("--all".into());
@@ -557,7 +682,11 @@ impl PlatformEngine {
     }
 
     pub fn docker_images(&self) -> Result<PlatformOutput> {
-        self.require_bin("docker", "docker_images", "Install Docker Desktop / the docker CLI.")?;
+        self.require_bin(
+            "docker",
+            "docker_images",
+            "Install Docker Desktop / the docker CLI.",
+        )?;
         let args = vec!["images".into()];
         self.read("docker_images", "docker images", "docker", &args)
     }
@@ -572,7 +701,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("docker", "docker_compose_up", "Install Docker Desktop / the docker CLI.")?;
+        self.require_bin(
+            "docker",
+            "docker_compose_up",
+            "Install Docker Desktop / the docker CLI.",
+        )?;
         self.enforce(
             "docker_compose_up",
             "docker compose up".into(),
@@ -594,7 +727,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("docker", "docker_compose_down", "Install Docker Desktop / the docker CLI.")?;
+        self.require_bin(
+            "docker",
+            "docker_compose_down",
+            "Install Docker Desktop / the docker CLI.",
+        )?;
         self.enforce(
             "docker_compose_down",
             "docker compose down".into(),
@@ -613,7 +750,11 @@ impl PlatformEngine {
         service: Option<&str>,
         follow: bool,
     ) -> Result<PlatformOutput> {
-        self.require_bin("docker", "docker_compose_logs", "Install Docker Desktop / the docker CLI.")?;
+        self.require_bin(
+            "docker",
+            "docker_compose_logs",
+            "Install Docker Desktop / the docker CLI.",
+        )?;
         let mut args = vec!["compose".into(), "logs".into()];
         if follow {
             args.push("--follow".into());
@@ -621,7 +762,12 @@ impl PlatformEngine {
         if let Some(service) = service {
             args.push(service.to_string());
         }
-        self.read("docker_compose_logs", "docker compose logs", "docker", &args)
+        self.read(
+            "docker_compose_logs",
+            "docker compose logs",
+            "docker",
+            &args,
+        )
     }
 
     // ---------------------------------------------------------------
@@ -639,7 +785,11 @@ impl PlatformEngine {
         namespace: Option<&str>,
         all_namespaces: bool,
     ) -> Result<PlatformOutput> {
-        self.require_bin("kubectl", "k8s_get", "Install kubectl and configure a kubeconfig.")?;
+        self.require_bin(
+            "kubectl",
+            "k8s_get",
+            "Install kubectl and configure a kubeconfig.",
+        )?;
         let mut args = vec!["get".into(), resource.to_string()];
         if let Some(name) = name {
             args.push(name.to_string());
@@ -661,7 +811,11 @@ impl PlatformEngine {
         namespace: Option<&str>,
         follow: bool,
     ) -> Result<PlatformOutput> {
-        self.require_bin("kubectl", "k8s_logs", "Install kubectl and configure a kubeconfig.")?;
+        self.require_bin(
+            "kubectl",
+            "k8s_logs",
+            "Install kubectl and configure a kubeconfig.",
+        )?;
         let mut args = vec!["logs".into(), pod.to_string()];
         if let Some(container) = container {
             args.push("-c".into());
@@ -686,7 +840,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("kubectl", "k8s_apply", "Install kubectl and configure a kubeconfig.")?;
+        self.require_bin(
+            "kubectl",
+            "k8s_apply",
+            "Install kubectl and configure a kubeconfig.",
+        )?;
         self.enforce(
             "k8s_apply",
             "kubectl apply".into(),
@@ -706,13 +864,22 @@ impl PlatformEngine {
         resource: &str,
         namespace: Option<&str>,
     ) -> Result<PlatformOutput> {
-        self.require_bin("kubectl", "k8s_rollout_status", "Install kubectl and configure a kubeconfig.")?;
+        self.require_bin(
+            "kubectl",
+            "k8s_rollout_status",
+            "Install kubectl and configure a kubeconfig.",
+        )?;
         let mut args = vec!["rollout".into(), "status".into(), resource.to_string()];
         if let Some(namespace) = namespace {
             args.push("-n".into());
             args.push(namespace.to_string());
         }
-        self.read("k8s_rollout_status", "kubectl rollout status", "kubectl", &args)
+        self.read(
+            "k8s_rollout_status",
+            "kubectl rollout status",
+            "kubectl",
+            &args,
+        )
     }
 
     // ---------------------------------------------------------------
@@ -728,7 +895,12 @@ impl PlatformEngine {
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         self.require_bin("terraform", "tf_init", "Install terraform / OpenTofu.")?;
-        self.enforce("tf_init", "terraform init".into(), "terraform init".into(), approver)?;
+        self.enforce(
+            "tf_init",
+            "terraform init".into(),
+            "terraform init".into(),
+            approver,
+        )?;
         let args = vec!["init".into()];
         self.run_bin("terraform", &args)
     }
@@ -748,12 +920,22 @@ impl PlatformEngine {
         self.read("tf_plan", "terraform plan", "terraform", &args)
     }
 
-    pub fn tf_apply<F>(&self, plan_file: Option<&str>, auto_approve: bool, approver: &mut F) -> Result<PlatformOutput>
+    pub fn tf_apply<F>(
+        &self,
+        plan_file: Option<&str>,
+        auto_approve: bool,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         self.require_bin("terraform", "tf_apply", "Install terraform / OpenTofu.")?;
-        self.enforce("tf_apply", "terraform apply".into(), "terraform apply".into(), approver)?;
+        self.enforce(
+            "tf_apply",
+            "terraform apply".into(),
+            "terraform apply".into(),
+            approver,
+        )?;
         let mut args = vec!["apply".into()];
         if auto_approve {
             args.push("-auto-approve".into());
@@ -773,12 +955,21 @@ impl PlatformEngine {
     }
 
     pub fn circleci_validate(&self, config: Option<&str>) -> Result<PlatformOutput> {
-        self.require_bin("circleci", "circleci_validate", "Install it (`brew install circleci`) and run `circleci setup`.")?;
+        self.require_bin(
+            "circleci",
+            "circleci_validate",
+            "Install it (`brew install circleci`) and run `circleci setup`.",
+        )?;
         let mut args = vec!["config".into(), "validate".into()];
         if let Some(config) = config {
             args.push(config.to_string());
         }
-        self.read("circleci_validate", "circleci config validate", "circleci", &args)
+        self.read(
+            "circleci_validate",
+            "circleci config validate",
+            "circleci",
+            &args,
+        )
     }
 
     pub fn circleci_builds(
@@ -787,7 +978,11 @@ impl PlatformEngine {
         branch: Option<&str>,
         limit: usize,
     ) -> Result<PlatformOutput> {
-        self.require_bin("circleci", "circleci_builds", "Install it (`brew install circleci`) and run `circleci setup`.")?;
+        self.require_bin(
+            "circleci",
+            "circleci_builds",
+            "Install it (`brew install circleci`) and run `circleci setup`.",
+        )?;
         let mut args = vec!["builds".into(), project.to_string()];
         if let Some(branch) = branch {
             args.push(format!("--branch={branch}"));
@@ -805,13 +1000,21 @@ impl PlatformEngine {
     }
 
     pub fn aws_whoami(&self) -> Result<PlatformOutput> {
-        self.require_bin("aws", "aws_whoami", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`) and configure credentials.")?;
+        self.require_bin(
+            "aws",
+            "aws_whoami",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`) and configure credentials.",
+        )?;
         let args = vec!["sts".into(), "get-caller-identity".into()];
         self.read("aws_whoami", "aws sts get-caller-identity", "aws", &args)
     }
 
     pub fn aws_s3_ls(&self, path: Option<&str>) -> Result<PlatformOutput> {
-        self.require_bin("aws", "aws_s3_ls", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).")?;
+        self.require_bin(
+            "aws",
+            "aws_s3_ls",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).",
+        )?;
         let mut args = vec!["s3".into(), "ls".into()];
         if let Some(path) = path {
             args.push(path.to_string());
@@ -819,18 +1022,32 @@ impl PlatformEngine {
         self.read("aws_s3_ls", "aws s3 ls", "aws", &args)
     }
 
-    pub fn aws_s3_sync<F>(&self, source: &str, dest: &str, approver: &mut F) -> Result<PlatformOutput>
+    pub fn aws_s3_sync<F>(
+        &self,
+        source: &str,
+        dest: &str,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("aws", "aws_s3_sync", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).")?;
+        self.require_bin(
+            "aws",
+            "aws_s3_sync",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).",
+        )?;
         self.enforce(
             "aws_s3_sync",
             "sync files to/from an S3 bucket".into(),
             "aws s3 sync".into(),
             approver,
         )?;
-        let args = vec!["s3".into(), "sync".into(), source.to_string(), dest.to_string()];
+        let args = vec![
+            "s3".into(),
+            "sync".into(),
+            source.to_string(),
+            dest.to_string(),
+        ];
         self.run_bin("aws", &args)
     }
 
@@ -838,7 +1055,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("aws", "aws_ecr_login", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).")?;
+        self.require_bin(
+            "aws",
+            "aws_ecr_login",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).",
+        )?;
         self.enforce(
             "aws_ecr_login",
             "log in to Amazon ECR (docker login)".into(),
@@ -850,23 +1071,41 @@ impl PlatformEngine {
     }
 
     pub fn aws_lambda_list(&self) -> Result<PlatformOutput> {
-        self.require_bin("aws", "aws_lambda_list", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).")?;
+        self.require_bin(
+            "aws",
+            "aws_lambda_list",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).",
+        )?;
         let args = vec!["lambda".into(), "list-functions".into()];
         self.read("aws_lambda_list", "aws lambda list-functions", "aws", &args)
     }
 
-    pub fn aws_lambda_invoke<F>(&self, function: &str, payload: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
+    pub fn aws_lambda_invoke<F>(
+        &self,
+        function: &str,
+        payload: Option<&str>,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("aws", "aws_lambda_invoke", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).")?;
+        self.require_bin(
+            "aws",
+            "aws_lambda_invoke",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).",
+        )?;
         self.enforce(
             "aws_lambda_invoke",
             "invoke an AWS Lambda function".into(),
             "aws lambda invoke".into(),
             approver,
         )?;
-        let mut args = vec!["lambda".into(), "invoke".into(), "--function-name".into(), function.to_string()];
+        let mut args = vec![
+            "lambda".into(),
+            "invoke".into(),
+            "--function-name".into(),
+            function.to_string(),
+        ];
         if let Some(payload) = payload {
             args.push("--payload".into());
             args.push(payload.to_string());
@@ -876,16 +1115,34 @@ impl PlatformEngine {
     }
 
     pub fn aws_ecs_list_clusters(&self) -> Result<PlatformOutput> {
-        self.require_bin("aws", "aws_ecs_list_clusters", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).")?;
+        self.require_bin(
+            "aws",
+            "aws_ecs_list_clusters",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).",
+        )?;
         let args = vec!["ecs".into(), "list-clusters".into()];
-        self.read("aws_ecs_list_clusters", "aws ecs list-clusters", "aws", &args)
+        self.read(
+            "aws_ecs_list_clusters",
+            "aws ecs list-clusters",
+            "aws",
+            &args,
+        )
     }
 
-    pub fn aws_ecs_force_deploy<F>(&self, cluster: &str, service: &str, approver: &mut F) -> Result<PlatformOutput>
+    pub fn aws_ecs_force_deploy<F>(
+        &self,
+        cluster: &str,
+        service: &str,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("aws", "aws_ecs_force_deploy", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).")?;
+        self.require_bin(
+            "aws",
+            "aws_ecs_force_deploy",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).",
+        )?;
         self.enforce(
             "aws_ecs_force_deploy",
             "force a new deployment of an ECS service".into(),
@@ -916,17 +1173,35 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("sam", "sam_build", "Install AWS SAM CLI (`winget install AWS.SAMCLI`).")?;
-        self.enforce("sam_build", "sam build".into(), "sam build".into(), approver)?;
+        self.require_bin(
+            "sam",
+            "sam_build",
+            "Install AWS SAM CLI (`winget install AWS.SAMCLI`).",
+        )?;
+        self.enforce(
+            "sam_build",
+            "sam build".into(),
+            "sam build".into(),
+            approver,
+        )?;
         let args = vec!["build".into()];
         self.run_bin("sam", &args)
     }
 
-    pub fn sam_deploy<F>(&self, guided: bool, stack_name: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
+    pub fn sam_deploy<F>(
+        &self,
+        guided: bool,
+        stack_name: Option<&str>,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("sam", "sam_deploy", "Install AWS SAM CLI (`winget install AWS.SAMCLI`).")?;
+        self.require_bin(
+            "sam",
+            "sam_deploy",
+            "Install AWS SAM CLI (`winget install AWS.SAMCLI`).",
+        )?;
         self.enforce(
             "sam_deploy",
             "deploy an AWS SAM stack".into(),
@@ -945,16 +1220,39 @@ impl PlatformEngine {
     }
 
     pub fn cloudformation_describe(&self, stack: &str) -> Result<PlatformOutput> {
-        self.require_bin("aws", "cloudformation_describe", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).")?;
-        let args = vec!["cloudformation".into(), "describe-stacks".into(), "--stack-name".into(), stack.to_string()];
-        self.read("cloudformation_describe", "aws cloudformation describe-stacks", "aws", &args)
+        self.require_bin(
+            "aws",
+            "cloudformation_describe",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).",
+        )?;
+        let args = vec![
+            "cloudformation".into(),
+            "describe-stacks".into(),
+            "--stack-name".into(),
+            stack.to_string(),
+        ];
+        self.read(
+            "cloudformation_describe",
+            "aws cloudformation describe-stacks",
+            "aws",
+            &args,
+        )
     }
 
-    pub fn cloudformation_deploy<F>(&self, template: &str, stack: &str, approver: &mut F) -> Result<PlatformOutput>
+    pub fn cloudformation_deploy<F>(
+        &self,
+        template: &str,
+        stack: &str,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("aws", "cloudformation_deploy", "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).")?;
+        self.require_bin(
+            "aws",
+            "cloudformation_deploy",
+            "Install AWS CLI v2 (`winget install Amazon.AWSCLI`).",
+        )?;
         self.enforce(
             "cloudformation_deploy",
             "create/update a CloudFormation stack".into(),
@@ -981,22 +1279,40 @@ impl PlatformEngine {
     }
 
     pub fn az_whoami(&self) -> Result<PlatformOutput> {
-        self.require_bin("az", "az_whoami", "Install Azure CLI (`winget install Microsoft.AzureCLI`).")?;
+        self.require_bin(
+            "az",
+            "az_whoami",
+            "Install Azure CLI (`winget install Microsoft.AzureCLI`).",
+        )?;
         let args = vec!["account".into(), "show".into()];
         self.read("az_whoami", "az account show", "az", &args)
     }
 
     pub fn az_webapp_list(&self) -> Result<PlatformOutput> {
-        self.require_bin("az", "az_webapp_list", "Install Azure CLI (`winget install Microsoft.AzureCLI`).")?;
+        self.require_bin(
+            "az",
+            "az_webapp_list",
+            "Install Azure CLI (`winget install Microsoft.AzureCLI`).",
+        )?;
         let args = vec!["webapp".into(), "list".into()];
         self.read("az_webapp_list", "az webapp list", "az", &args)
     }
 
-    pub fn az_webapp_deploy<F>(&self, name: &str, resource_group: &str, source: &str, approver: &mut F) -> Result<PlatformOutput>
+    pub fn az_webapp_deploy<F>(
+        &self,
+        name: &str,
+        resource_group: &str,
+        source: &str,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("az", "az_webapp_deploy", "Install Azure CLI (`winget install Microsoft.AzureCLI`).")?;
+        self.require_bin(
+            "az",
+            "az_webapp_deploy",
+            "Install Azure CLI (`winget install Microsoft.AzureCLI`).",
+        )?;
         self.enforce(
             "az_webapp_deploy",
             "deploy to an Azure App Service web app".into(),
@@ -1016,11 +1332,21 @@ impl PlatformEngine {
         self.run_bin("az", &args)
     }
 
-    pub fn az_functionapp_deploy<F>(&self, name: &str, resource_group: &str, source: &str, approver: &mut F) -> Result<PlatformOutput>
+    pub fn az_functionapp_deploy<F>(
+        &self,
+        name: &str,
+        resource_group: &str,
+        source: &str,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("az", "az_functionapp_deploy", "Install Azure CLI (`winget install Microsoft.AzureCLI`).")?;
+        self.require_bin(
+            "az",
+            "az_functionapp_deploy",
+            "Install Azure CLI (`winget install Microsoft.AzureCLI`).",
+        )?;
         self.enforce(
             "az_functionapp_deploy",
             "deploy an Azure Functions app".into(),
@@ -1051,7 +1377,11 @@ impl PlatformEngine {
     }
 
     pub fn gcloud_whoami(&self) -> Result<PlatformOutput> {
-        self.require_bin("gcloud", "gcloud_whoami", "Install Google Cloud SDK (https://cloud.google.com/sdk).")?;
+        self.require_bin(
+            "gcloud",
+            "gcloud_whoami",
+            "Install Google Cloud SDK (https://cloud.google.com/sdk).",
+        )?;
         let args = vec!["config".into(), "list".into()];
         self.read("gcloud_whoami", "gcloud config list", "gcloud", &args)
     }
@@ -1060,7 +1390,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("gcloud", "gcloud_app_deploy", "Install Google Cloud SDK (https://cloud.google.com/sdk).")?;
+        self.require_bin(
+            "gcloud",
+            "gcloud_app_deploy",
+            "Install Google Cloud SDK (https://cloud.google.com/sdk).",
+        )?;
         self.enforce(
             "gcloud_app_deploy",
             "deploy to Google App Engine".into(),
@@ -1071,11 +1405,21 @@ impl PlatformEngine {
         self.run_bin("gcloud", &args)
     }
 
-    pub fn gcloud_run_deploy<F>(&self, service: &str, image: &str, region: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
+    pub fn gcloud_run_deploy<F>(
+        &self,
+        service: &str,
+        image: &str,
+        region: Option<&str>,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("gcloud", "gcloud_run_deploy", "Install Google Cloud SDK (https://cloud.google.com/sdk).")?;
+        self.require_bin(
+            "gcloud",
+            "gcloud_run_deploy",
+            "Install Google Cloud SDK (https://cloud.google.com/sdk).",
+        )?;
         self.enforce(
             "gcloud_run_deploy",
             "deploy a container to Cloud Run".into(),
@@ -1099,9 +1443,18 @@ impl PlatformEngine {
     }
 
     pub fn gcloud_run_services(&self) -> Result<PlatformOutput> {
-        self.require_bin("gcloud", "gcloud_run_services", "Install Google Cloud SDK (https://cloud.google.com/sdk).")?;
+        self.require_bin(
+            "gcloud",
+            "gcloud_run_services",
+            "Install Google Cloud SDK (https://cloud.google.com/sdk).",
+        )?;
         let args = vec!["run".into(), "services".into(), "list".into()];
-        self.read("gcloud_run_services", "gcloud run services list", "gcloud", &args)
+        self.read(
+            "gcloud_run_services",
+            "gcloud run services list",
+            "gcloud",
+            &args,
+        )
     }
 
     // ---------------------------------------------------------------
@@ -1132,7 +1485,13 @@ impl PlatformEngine {
         self.read("helm_status", "helm status", "helm", &args)
     }
 
-    pub fn helm_install<F>(&self, release: &str, chart: &str, namespace: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
+    pub fn helm_install<F>(
+        &self,
+        release: &str,
+        chart: &str,
+        namespace: Option<&str>,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
@@ -1151,7 +1510,13 @@ impl PlatformEngine {
         self.run_bin("helm", &args)
     }
 
-    pub fn helm_upgrade<F>(&self, release: &str, chart: &str, namespace: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
+    pub fn helm_upgrade<F>(
+        &self,
+        release: &str,
+        chart: &str,
+        namespace: Option<&str>,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
@@ -1170,7 +1535,12 @@ impl PlatformEngine {
         self.run_bin("helm", &args)
     }
 
-    pub fn helm_uninstall<F>(&self, release: &str, namespace: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
+    pub fn helm_uninstall<F>(
+        &self,
+        release: &str,
+        namespace: Option<&str>,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
@@ -1198,22 +1568,39 @@ impl PlatformEngine {
     }
 
     pub fn fly_whoami(&self) -> Result<PlatformOutput> {
-        self.require_bin("flyctl", "fly_whoami", "Install flyctl (`winget install fly-io.flyctl`).")?;
+        self.require_bin(
+            "flyctl",
+            "fly_whoami",
+            "Install flyctl (`winget install fly-io.flyctl`).",
+        )?;
         let args = vec!["auth".into(), "whoami".into()];
         self.read("fly_whoami", "flyctl auth whoami", "flyctl", &args)
     }
 
     pub fn fly_apps_list(&self) -> Result<PlatformOutput> {
-        self.require_bin("flyctl", "fly_apps_list", "Install flyctl (`winget install fly-io.flyctl`).")?;
+        self.require_bin(
+            "flyctl",
+            "fly_apps_list",
+            "Install flyctl (`winget install fly-io.flyctl`).",
+        )?;
         let args = vec!["apps".into(), "list".into()];
         self.read("fly_apps_list", "flyctl apps list", "flyctl", &args)
     }
 
-    pub fn fly_deploy<F>(&self, image: Option<&str>, app: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
+    pub fn fly_deploy<F>(
+        &self,
+        image: Option<&str>,
+        app: Option<&str>,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("flyctl", "fly_deploy", "Install flyctl (`winget install fly-io.flyctl`).")?;
+        self.require_bin(
+            "flyctl",
+            "fly_deploy",
+            "Install flyctl (`winget install fly-io.flyctl`).",
+        )?;
         self.enforce(
             "fly_deploy",
             "deploy to Fly.io".into(),
@@ -1233,7 +1620,11 @@ impl PlatformEngine {
     }
 
     pub fn fly_status(&self, app: &str) -> Result<PlatformOutput> {
-        self.require_bin("flyctl", "fly_status", "Install flyctl (`winget install fly-io.flyctl`).")?;
+        self.require_bin(
+            "flyctl",
+            "fly_status",
+            "Install flyctl (`winget install fly-io.flyctl`).",
+        )?;
         let args = vec!["status".into(), "-a".into(), app.to_string()];
         self.read("fly_status", "flyctl status", "flyctl", &args)
     }
@@ -1247,13 +1638,21 @@ impl PlatformEngine {
     }
 
     pub fn railway_whoami(&self) -> Result<PlatformOutput> {
-        self.require_bin("railway", "railway_whoami", "Install Railway CLI (`npm i -g @railway/cli`).")?;
+        self.require_bin(
+            "railway",
+            "railway_whoami",
+            "Install Railway CLI (`npm i -g @railway/cli`).",
+        )?;
         let args = vec!["whoami".into()];
         self.read("railway_whoami", "railway whoami", "railway", &args)
     }
 
     pub fn railway_status(&self) -> Result<PlatformOutput> {
-        self.require_bin("railway", "railway_status", "Install Railway CLI (`npm i -g @railway/cli`).")?;
+        self.require_bin(
+            "railway",
+            "railway_status",
+            "Install Railway CLI (`npm i -g @railway/cli`).",
+        )?;
         let args = vec!["status".into()];
         self.read("railway_status", "railway status", "railway", &args)
     }
@@ -1262,7 +1661,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("railway", "railway_up", "Install Railway CLI (`npm i -g @railway/cli`).")?;
+        self.require_bin(
+            "railway",
+            "railway_up",
+            "Install Railway CLI (`npm i -g @railway/cli`).",
+        )?;
         self.enforce(
             "railway_up",
             "deploy to Railway".into(),
@@ -1285,13 +1688,21 @@ impl PlatformEngine {
     }
 
     pub fn render_whoami(&self) -> Result<PlatformOutput> {
-        self.require_bin("render", "render_whoami", "Install Render CLI (`npm i -g @renderinc/cli`).")?;
+        self.require_bin(
+            "render",
+            "render_whoami",
+            "Install Render CLI (`npm i -g @renderinc/cli`).",
+        )?;
         let args = vec!["whoami".into()];
         self.read("render_whoami", "render whoami", "render", &args)
     }
 
     pub fn render_services(&self) -> Result<PlatformOutput> {
-        self.require_bin("render", "render_services", "Install Render CLI (`npm i -g @renderinc/cli`).")?;
+        self.require_bin(
+            "render",
+            "render_services",
+            "Install Render CLI (`npm i -g @renderinc/cli`).",
+        )?;
         let args = vec!["services".into()];
         self.read("render_services", "render services", "render", &args)
     }
@@ -1300,7 +1711,11 @@ impl PlatformEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("render", "render_deploy", "Install Render CLI (`npm i -g @renderinc/cli`).")?;
+        self.require_bin(
+            "render",
+            "render_deploy",
+            "Install Render CLI (`npm i -g @renderinc/cli`).",
+        )?;
         self.enforce(
             "render_deploy",
             "trigger a deploy on Render".into(),
@@ -1320,22 +1735,40 @@ impl PlatformEngine {
     }
 
     pub fn netlify_whoami(&self) -> Result<PlatformOutput> {
-        self.require_bin("netlify", "netlify_whoami", "Install Netlify CLI (`npm i -g netlify-cli`).")?;
+        self.require_bin(
+            "netlify",
+            "netlify_whoami",
+            "Install Netlify CLI (`npm i -g netlify-cli`).",
+        )?;
         let args = vec!["status".into()];
         self.read("netlify_whoami", "netlify status", "netlify", &args)
     }
 
     pub fn netlify_sites(&self) -> Result<PlatformOutput> {
-        self.require_bin("netlify", "netlify_sites", "Install Netlify CLI (`npm i -g netlify-cli`).")?;
+        self.require_bin(
+            "netlify",
+            "netlify_sites",
+            "Install Netlify CLI (`npm i -g netlify-cli`).",
+        )?;
         let args = vec!["sites".into(), "list".into()];
         self.read("netlify_sites", "netlify sites list", "netlify", &args)
     }
 
-    pub fn netlify_deploy<F>(&self, dir: &str, prod: bool, site: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
+    pub fn netlify_deploy<F>(
+        &self,
+        dir: &str,
+        prod: bool,
+        site: Option<&str>,
+        approver: &mut F,
+    ) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("netlify", "netlify_deploy", "Install Netlify CLI (`npm i -g netlify-cli`).")?;
+        self.require_bin(
+            "netlify",
+            "netlify_deploy",
+            "Install Netlify CLI (`npm i -g netlify-cli`).",
+        )?;
         self.enforce(
             "netlify_deploy",
             "deploy to Netlify".into(),
@@ -1362,16 +1795,29 @@ impl PlatformEngine {
     }
 
     pub fn firebase_projects(&self) -> Result<PlatformOutput> {
-        self.require_bin("firebase", "firebase_projects", "Install Firebase CLI (`npm i -g firebase-tools`).")?;
+        self.require_bin(
+            "firebase",
+            "firebase_projects",
+            "Install Firebase CLI (`npm i -g firebase-tools`).",
+        )?;
         let args = vec!["projects".into(), "list".into()];
-        self.read("firebase_projects", "firebase projects list", "firebase", &args)
+        self.read(
+            "firebase_projects",
+            "firebase projects list",
+            "firebase",
+            &args,
+        )
     }
 
     pub fn firebase_deploy<F>(&self, only: Option<&str>, approver: &mut F) -> Result<PlatformOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.require_bin("firebase", "firebase_deploy", "Install Firebase CLI (`npm i -g firebase-tools`).")?;
+        self.require_bin(
+            "firebase",
+            "firebase_deploy",
+            "Install Firebase CLI (`npm i -g firebase-tools`).",
+        )?;
         self.enforce(
             "firebase_deploy",
             "deploy to Firebase Hosting / Functions".into(),
@@ -1387,8 +1833,17 @@ impl PlatformEngine {
     }
 
     pub fn firebase_functions(&self) -> Result<PlatformOutput> {
-        self.require_bin("firebase", "firebase_functions", "Install Firebase CLI (`npm i -g firebase-tools`).")?;
+        self.require_bin(
+            "firebase",
+            "firebase_functions",
+            "Install Firebase CLI (`npm i -g firebase-tools`).",
+        )?;
         let args = vec!["functions".into(), "list".into()];
-        self.read("firebase_functions", "firebase functions list", "firebase", &args)
+        self.read(
+            "firebase_functions",
+            "firebase functions list",
+            "firebase",
+            &args,
+        )
     }
 }

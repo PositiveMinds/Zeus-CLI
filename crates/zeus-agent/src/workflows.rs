@@ -70,7 +70,10 @@ pub fn parse_workflow(path: &Path) -> Option<Workflow> {
             return None;
         }
     };
-    let fallback = path.file_stem().and_then(|s| s.to_str()).unwrap_or("workflow");
+    let fallback = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("workflow");
     let id = file
         .name
         .unwrap_or_else(|| fallback.to_string())
@@ -157,7 +160,10 @@ gate = true
         );
         let w = parse_workflow(&p).unwrap();
         assert_eq!(w.id, "build-backend");
-        assert_eq!(w.description, "Design, implement, then verify a backend feature");
+        assert_eq!(
+            w.description,
+            "Design, implement, then verify a backend feature"
+        );
         assert_eq!(w.phases.len(), 2);
         assert_eq!(w.phases[0].persona, "architect");
         assert_eq!(w.phases[0].read_only, true);
@@ -168,9 +174,13 @@ gate = true
     #[test]
     fn id_falls_back_to_file_stem() {
         let tmp = TempDir::new().unwrap();
-        let p = write(tmp.path(), "release.toml", r#"[[phase]]
+        let p = write(
+            tmp.path(),
+            "release.toml",
+            r#"[[phase]]
 persona = "qa-engineer"
-prompt = "run the tests""#);
+prompt = "run the tests""#,
+        );
         let w = parse_workflow(&p).unwrap();
         assert_eq!(w.id, "release");
     }
@@ -208,10 +218,14 @@ prompt = "project phase""#,
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("workflows");
         write(&dir, "bad.toml", "name = [broken");
-        write(&dir, "good.toml", r#"name = "ok"
+        write(
+            &dir,
+            "good.toml",
+            r#"name = "ok"
 [[phase]]
 persona = "backend"
-prompt = "hello""#);
+prompt = "hello""#,
+        );
         let found = discover(&dir);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, "ok");

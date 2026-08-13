@@ -90,7 +90,10 @@ pub fn contains_path(root: &Path, child: &Path) -> bool {
     if child_comps.len() < root_comps.len() {
         return false;
     }
-    root_comps.iter().zip(child_comps.iter()).all(|(a, b)| a == b)
+    root_comps
+        .iter()
+        .zip(child_comps.iter())
+        .all(|(a, b)| a == b)
 }
 
 pub fn path_kind(path: &Path) -> PathKind {

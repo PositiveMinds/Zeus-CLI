@@ -18,11 +18,11 @@ pub struct MemoryEntry {
 
 impl MemoryEntry {
     pub fn new(text: impl Into<String>, source: impl Into<String>) -> Self {
-        let created_at_secs = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        {
-            Ok(d) => d.as_secs(),
-            Err(_) => 0,
-        };
+        let created_at_secs =
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_secs(),
+                Err(_) => 0,
+            };
         Self {
             text: text.into(),
             source: source.into(),

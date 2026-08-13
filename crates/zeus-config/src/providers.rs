@@ -466,7 +466,7 @@ prompt_cache = false
             },
         );
         Self { providers }
-}
+    }
 }
 
 #[cfg(test)]

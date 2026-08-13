@@ -5,8 +5,8 @@
 use std::io::Read;
 use std::path::Path;
 
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::Reader;
 
 /// Result of extracting a document.
 #[derive(Debug, Default)]
@@ -53,7 +53,11 @@ pub fn extract(path: &Path, max_chars: usize) -> Result<Document, String> {
                 }
             };
             Document {
-                summary: if ext.is_empty() { "text".into() } else { ext.clone() },
+                summary: if ext.is_empty() {
+                    "text".into()
+                } else {
+                    ext.clone()
+                },
                 text: raw,
             }
         }
@@ -73,7 +77,8 @@ fn extract_pdf(path: &Path) -> Result<Document, String> {
         .map_err(|e| format!("unable to parse PDF: {e}"))?;
     if text.trim().is_empty() {
         return Err(
-            "PDF parsed but no extractable text found (scanned/image-only PDF? use read_image)".into(),
+            "PDF parsed but no extractable text found (scanned/image-only PDF? use read_image)"
+                .into(),
         );
     }
     Ok(Document {
@@ -111,7 +116,9 @@ fn extract_ooxml(path: &Path, kind: OfficeKind) -> Result<Document, String> {
                 .by_name("word/document.xml")
                 .map_err(|_| "docx missing word/document.xml".to_string())?;
             let mut raw = String::new();
-            doc_xml.read_to_string(&mut raw).map_err(|e| e.to_string())?;
+            doc_xml
+                .read_to_string(&mut raw)
+                .map_err(|e| e.to_string())?;
             let paragraphs = count_tag(&raw, "w:p");
             let text = text_of(&raw, &["w:t"], &["w:p"]);
             Ok(Document {
@@ -142,7 +149,7 @@ fn extract_ooxml(path: &Path, kind: OfficeKind) -> Result<Document, String> {
             let slide_count = slides.len();
             let mut out = Vec::new();
             for (num, name) in &slides {
-                let mut f = archive.by_name(&name).map_err(|e| e.to_string())?;
+                let mut f = archive.by_name(name).map_err(|e| e.to_string())?;
                 let mut raw = String::new();
                 f.read_to_string(&mut raw).map_err(|e| e.to_string())?;
                 let txt = text_of(&raw, &["a:t"], &["a:p"]);
@@ -180,7 +187,7 @@ fn extract_ooxml(path: &Path, kind: OfficeKind) -> Result<Document, String> {
             let shared = read_shared_strings(&mut archive)?;
             let mut out = Vec::new();
             for (num, name) in &sheets {
-                let mut f = archive.by_name(&name).map_err(|e| e.to_string())?;
+                let mut f = archive.by_name(name).map_err(|e| e.to_string())?;
                 let mut raw = String::new();
                 f.read_to_string(&mut raw).map_err(|e| e.to_string())?;
                 let grid = sheet_rows(&raw, &shared);
@@ -288,18 +295,20 @@ fn count_tag(xml: &str, tag: &str) -> usize {
 fn sheet_rows(xml: &str, shared: &[String]) -> String {
     let mut grid: Vec<Vec<String>> = Vec::new();
     let mut rest = xml;
-    loop {
-        let Some(open) = rest.find("<row") else { break };
+    while let Some(open) = rest.find("<row") {
         let after_open = &rest[open..];
-        let Some(gt) = after_open.find('>') else { break };
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
         let chunk_start = open + gt + 1;
         let tail = &rest[chunk_start..];
-        let Some(close) = tail.find("</row>") else { break };
+        let Some(close) = tail.find("</row>") else {
+            break;
+        };
         let chunk = &tail[..close];
         let mut row = Vec::new();
         let mut from = 0usize;
-        loop {
-            let Some(cs) = chunk[from..].find("<c") else { break };
+        while let Some(cs) = chunk[from..].find("<c") {
             let cstart = from + cs;
             let ctail = &chunk[cstart..];
             let Some(ce) = ctail.find("</c>") else { break };
@@ -317,10 +326,7 @@ fn sheet_rows(xml: &str, shared: &[String]) -> String {
             out.push_str(&format!("row {}: {}\n", ri + 1, row.join(" | ")));
         }
     }
-    collapse_ws(&out)
-    .split('\n')
-    .collect::<Vec<_>>()
-    .join("\n")
+    collapse_ws(&out).split('\n').collect::<Vec<_>>().join("\n")
 }
 
 /// A single cell: `<v>` (number or shared-string index) else inline `<is><t>`.

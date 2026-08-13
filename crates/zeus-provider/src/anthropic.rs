@@ -62,7 +62,8 @@ impl AnthropicProvider {
         if let Some(key) = &self.api_key {
             map.insert(
                 "x-api-key",
-                key.parse().unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("")),
+                key.parse()
+                    .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("")),
             );
         }
         map.insert(
@@ -147,11 +148,13 @@ fn system_text(messages: &[Message]) -> String {
 fn to_anthropic_tools(tools: &[ToolSpec]) -> Vec<Value> {
     tools
         .iter()
-        .map(|t| json!({
-            "name": t.name,
-            "description": t.description,
-            "input_schema": t.parameters,
-        }))
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.parameters,
+            })
+        })
         .collect()
 }
 
@@ -256,10 +259,7 @@ impl ModelProvider for AnthropicProvider {
                     tool_calls.push(ToolCall {
                         id: block.id.unwrap_or_default(),
                         name: block.name.unwrap_or_default(),
-                        arguments: block
-                            .input
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
+                        arguments: block.input.map(|v| v.to_string()).unwrap_or_default(),
                     });
                 }
                 _ => {}
@@ -334,7 +334,10 @@ impl ModelProvider for AnthropicProvider {
                     None => {
                         let _ = tx
                             .send(Ok(StreamEvent::Done {
-                                finish_reason: map_anthropic_reason(stop_reason.as_deref(), saw_tool_call),
+                                finish_reason: map_anthropic_reason(
+                                    stop_reason.as_deref(),
+                                    saw_tool_call,
+                                ),
                                 usage: last_usage,
                             }))
                             .await;
@@ -471,10 +474,14 @@ async fn handle_anthropic_event(
                     } else {
                         // A tool delta arrived without a matching start block;
                         // synthesize one so downstream can assemble arguments.
-                        tool_buf.entry(idx).or_insert_with(|| {
-                            *saw_tool_call = true;
-                            ("tool_unknown".to_string(), String::new(), String::new())
-                        }).2.push_str(partial);
+                        tool_buf
+                            .entry(idx)
+                            .or_insert_with(|| {
+                                *saw_tool_call = true;
+                                ("tool_unknown".to_string(), String::new(), String::new())
+                            })
+                            .2
+                            .push_str(partial);
                     }
                 }
                 _ => {}

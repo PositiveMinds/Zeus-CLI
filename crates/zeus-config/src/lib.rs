@@ -5,11 +5,11 @@
 //!
 //! Filesystem is the source of truth; no application database.
 
+mod error;
+mod keys;
 mod paths;
 mod providers;
 mod settings;
-mod error;
-mod keys;
 
 pub use error::{ConfigError, Result};
 pub use keys::KeysFile;
@@ -193,7 +193,9 @@ mod tests {
         let ancestor_marker = (0..64)
             .scan(Some(isolated.clone()), |acc, _| {
                 let current = acc.clone();
-                *acc = current.as_ref().and_then(|c| c.parent().map(Path::to_path_buf));
+                *acc = current
+                    .as_ref()
+                    .and_then(|c| c.parent().map(Path::to_path_buf));
                 current
             })
             .any(|p| p.join(".agent").is_dir() || p.join(".git").is_dir());

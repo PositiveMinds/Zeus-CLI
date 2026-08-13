@@ -19,7 +19,12 @@ pub struct Hit {
 impl Hit {
     pub fn new(chunk: Chunk, keyword: f32, vector: f32) -> Self {
         let score = 0.6 * keyword + 0.4 * vector;
-        Self { chunk, keyword, vector, score }
+        Self {
+            chunk,
+            keyword,
+            vector,
+            score,
+        }
     }
 }
 
@@ -160,8 +165,16 @@ mod tests {
     #[test]
     fn keyword_search_ranks_relevant_higher() {
         let mut idx = crate::RagIndex::new(std::path::PathBuf::from("/fake"));
-        idx.add_chunk(crate::Chunk::new("lib.rs".into(), 0, "fn add(a, b) { a + b }".into()));
-        idx.add_chunk(crate::Chunk::new("util.rs".into(), 1, "fn subtract(a, b) { a - b }".into()));
+        idx.add_chunk(crate::Chunk::new(
+            "lib.rs".into(),
+            0,
+            "fn add(a, b) { a + b }".into(),
+        ));
+        idx.add_chunk(crate::Chunk::new(
+            "util.rs".into(),
+            1,
+            "fn subtract(a, b) { a - b }".into(),
+        ));
         let hits = idx.search("add", 1);
         assert_eq!(hits.len(), 1);
         assert!(hits[0].chunk.text.contains("add"));
@@ -170,7 +183,7 @@ mod tests {
     #[test]
     fn idf_penalizes_common_terms() {
         let mut idx = crate::RagIndex::new(std::path::PathBuf::from("/fake"));
-        idx.add_chunk(crate::Chunk::new("a.rs".into(), 0, "fn the_value" .into()));
+        idx.add_chunk(crate::Chunk::new("a.rs".into(), 0, "fn the_value".into()));
         idx.add_chunk(crate::Chunk::new("b.rs".into(), 1, "fn the_other".into()));
         idx.add_chunk(crate::Chunk::new("c.rs".into(), 2, "fn rare_symbol".into()));
         // Searching a term unique to c.rs should rank c above a.

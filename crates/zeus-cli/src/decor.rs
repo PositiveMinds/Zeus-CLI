@@ -81,5 +81,4 @@ mod tests {
             assert!(v > 0.5 && v <= 1.0, "v={v}");
         }
     }
-
 }

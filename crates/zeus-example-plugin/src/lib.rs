@@ -64,8 +64,7 @@ pub unsafe extern "C" fn zeus_plugin_call_tool(
         Ok(s) => s,
         Err(_) => return to_c_string(err_result("arguments were not valid UTF-8").to_string()),
     };
-    let args: serde_json::Value =
-        serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
+    let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
 
     let result = match name {
         "shout" => {
@@ -103,10 +102,10 @@ fn to_c_string(s: String) -> *mut c_char {
     // across the FFI boundary on a genuine NUL, which would be UB.
     match CString::new(s) {
         Ok(c) => c.into_raw(),
-        Err(_) => {
-            CString::new("{\"content\":\"internal error: NUL byte in plugin output\",\"is_error\":true}")
-                .unwrap()
-                .into_raw()
-        }
+        Err(_) => CString::new(
+            "{\"content\":\"internal error: NUL byte in plugin output\",\"is_error\":true}",
+        )
+        .unwrap()
+        .into_raw(),
     }
 }

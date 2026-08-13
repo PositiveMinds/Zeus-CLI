@@ -1,4 +1,4 @@
-﻿//! The Agent Loop: message history â‡„ tool calls â‡„ tool results, cancellable.
+//! The Agent Loop: message history â‡„ tool calls â‡„ tool results, cancellable.
 //!
 //! Cycle (matches the blueprint's "The Agent Loop" section):
 //! 1. Append user message.
@@ -10,7 +10,9 @@
 
 use crate::context::{CompactResult, ContextManager};
 use crate::error::{AgentError, Result};
-use crate::personas::{persona_by_id, personas_by_department, recommend_persona, recommend_reviewer, Persona};
+use crate::personas::{
+    persona_by_id, personas_by_department, recommend_persona, recommend_reviewer, Persona,
+};
 use crate::plans::TaskPlan;
 use crate::session::{ConversationState, SessionStore};
 use crate::tools::{ToolManager, ToolResult};
@@ -81,50 +83,93 @@ pub enum AgentEvent {
     /// The model called `todowrite` — it owns and replaces its whole
     /// checklist on every call (not an incremental patch), so the UI should
     /// just overwrite whatever it was showing rather than merge.
-    TodosUpdated { todos: Vec<TodoStatus> },
+    TodosUpdated {
+        todos: Vec<TodoStatus>,
+    },
     /// Orchestrated `/plan` runs: the planning pass produced an ordered
     /// list of subtasks to execute.
-    PlanGenerated { steps: Vec<PlanStep> },
+    PlanGenerated {
+        steps: Vec<PlanStep>,
+    },
     /// A subtask from the plan is about to be executed as its own turn.
-    PlanStepStarted { step: PlanStep },
+    PlanStepStarted {
+        step: PlanStep,
+    },
     /// A subtask finished and produced a final answer.
-    PlanStepDone { step: PlanStep, summary: String },
+    PlanStepDone {
+        step: PlanStep,
+        summary: String,
+    },
     /// A review pass over completed plan work ran; `persona` is the reviewer
     /// id that drove it and `report` is its findings.
-    PlanReviewed { persona: String, report: String },
+    PlanReviewed {
+        persona: String,
+        report: String,
+    },
     /// The lead-reviewer gate rejected the completed work: the plan ran, but
     /// the reviewer's findings mean it isn't DONE. `report` is the reviewer
     /// verdict the user declined to accept.
-    OrchestrationRevision { report: String },
+    OrchestrationRevision {
+        report: String,
+    },
     /// The user declined an individual recommended step; it is skipped while
     /// the rest of the plan continues.
-    PlanStepDeclined { step: PlanStep },
+    PlanStepDeclined {
+        step: PlanStep,
+    },
     /// All subtasks completed; `summary` is the combined result.
-    OrchestrationDone { summary: String },
+    OrchestrationDone {
+        summary: String,
+    },
     /// A `/workflow` run started: `id` is the workflow name and `description`
     /// its one-liner, `phases` the ordered specialist pipeline it will follow.
-    WorkflowStarted { id: String, description: String, phases: Vec<crate::workflows::WorkflowPhaseDef> },
+    WorkflowStarted {
+        id: String,
+        description: String,
+        phases: Vec<crate::workflows::WorkflowPhaseDef>,
+    },
     /// One phase of a `/workflow` run is about to execute as its own turn.
-    WorkflowPhaseStarted { name: String, persona: String },
+    WorkflowPhaseStarted {
+        name: String,
+        persona: String,
+    },
     /// A `/workflow` phase finished; `summary` is its final answer.
-    WorkflowPhaseDone { name: String, persona: String, summary: String },
+    WorkflowPhaseDone {
+        name: String,
+        persona: String,
+        summary: String,
+    },
     /// Every phase of a `/workflow` run completed; `summary` is the stitched
     /// result.
-    WorkflowDone { summary: String },
+    WorkflowDone {
+        summary: String,
+    },
     /// Repository understanding (computed once per session): `stack` is the
     /// deterministic project banner, `relevance` is this request's existing-
     /// code matches. Shown to the user so they see what zeus found before it
     /// writes anything.
-    RepoAnalyzed { stack: String, relevance: String },
-    RepoRelevanceUpdated { relevance: String },
+    RepoAnalyzed {
+        stack: String,
+        relevance: String,
+    },
+    RepoRelevanceUpdated {
+        relevance: String,
+    },
     /// `/orient` finished and wrote the generated docs into `.agent/`.
-    OrientationSaved { docs: crate::project::WrittenDocs },
+    OrientationSaved {
+        docs: crate::project::WrittenDocs,
+    },
     /// A standalone `/review` pass over the current uncommitted diff finished;
     /// `persona` is the reviewer id that drove it and `report` its findings.
-    ReviewUncommitted { persona: String, report: String },
+    ReviewUncommitted {
+        persona: String,
+        report: String,
+    },
     /// A `/suggest` pass produced next-feature recommendations grounded in the
     /// project's current implementation; `report` is the ranked list.
-    FeaturesSuggested { report: String },
+    FeaturesSuggested {
+        report: String,
+    },
 }
 
 /// One row of the model-owned checklist the `todowrite` tool writes —
@@ -255,7 +300,10 @@ impl Agent {
     /// `/model` picker UI (list + select) rather than requiring the user to
     /// already know an exact model name to type.
     pub async fn list_models(&self) -> Result<Vec<zeus_provider::ModelInfo>> {
-        self.provider.list_models().await.map_err(AgentError::Provider)
+        self.provider
+            .list_models()
+            .await
+            .map_err(AgentError::Provider)
     }
 
     /// Plan mode: read-only research/proposal, no mutating tool calls â€”
@@ -274,7 +322,8 @@ impl Agent {
     /// a single pass. Selectable alongside Build (direct) and Plan (read-only)
     /// in the mode switch.
     pub fn set_auto_mode(&self, enabled: bool) {
-        self.auto_mode.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.auto_mode
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn auto_mode(&self) -> bool {
@@ -386,40 +435,73 @@ impl Agent {
         self.drive_turn(on_event, approver).await
     }
 
-/// Cheap, deterministic check for whether a request is plausibly about the
-/// codebase at all. Greetings/small talk/meta questions get sent to the
-/// model as-is, with no repo banner, project rules, memory context, or
-/// "verify with grep/glob" nudge attached — none of that helps answer
-/// "hello", it costs real tokens on *every* turn regardless of relevance
-/// (`repo_context` used to run unconditionally), and the "verify with grep"
-/// instruction in particular risked nudging the model toward an unneeded
-/// exploratory tool call on a message that was never asking for one.
-///
-/// Errs toward `true` (include full context) whenever it isn't confident —
-/// a false "needs context" costs a few hundred tokens; a false "doesn't
-/// need it" risks answering a real coding question blind. Only an exact
-/// (case-insensitive, punctuation-trimmed) match against a short list of
-/// unambiguous small talk short-circuits it; anything longer or unrecognized
-/// falls through to the normal full-context path.
-fn request_likely_needs_context(request: &str) -> bool {
-    let trimmed = request.trim();
-    if trimmed.chars().count() > 60 {
-        return true;
+    /// Cheap, deterministic check for whether a request is plausibly about the
+    /// codebase at all. Greetings/small talk/meta questions get sent to the
+    /// model as-is, with no repo banner, project rules, memory context, or
+    /// "verify with grep/glob" nudge attached — none of that helps answer
+    /// "hello", it costs real tokens on *every* turn regardless of relevance
+    /// (`repo_context` used to run unconditionally), and the "verify with grep"
+    /// instruction in particular risked nudging the model toward an unneeded
+    /// exploratory tool call on a message that was never asking for one.
+    ///
+    /// Errs toward `true` (include full context) whenever it isn't confident —
+    /// a false "needs context" costs a few hundred tokens; a false "doesn't
+    /// need it" risks answering a real coding question blind. Only an exact
+    /// (case-insensitive, punctuation-trimmed) match against a short list of
+    /// unambiguous small talk short-circuits it; anything longer or unrecognized
+    /// falls through to the normal full-context path.
+    fn request_likely_needs_context(request: &str) -> bool {
+        let trimmed = request.trim();
+        if trimmed.chars().count() > 60 {
+            return true;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let lower = lower.trim_end_matches(|c: char| c.is_ascii_punctuation());
+        const SMALL_TALK: &[&str] = &[
+            "hi",
+            "hello",
+            "hey",
+            "yo",
+            "sup",
+            "hiya",
+            "howdy",
+            "thanks",
+            "thank you",
+            "thx",
+            "ty",
+            "cheers",
+            "ok",
+            "okay",
+            "cool",
+            "nice",
+            "great",
+            "awesome",
+            "got it",
+            "sounds good",
+            "np",
+            "how are you",
+            "how's it going",
+            "who are you",
+            "what are you",
+            "what can you do",
+            "good morning",
+            "good afternoon",
+            "good evening",
+            "good night",
+            "bye",
+            "goodbye",
+            "see you",
+            "later",
+            "yes",
+            "no",
+            "sure",
+            "yep",
+            "nope",
+        ];
+        !SMALL_TALK.contains(&lower)
     }
-    let lower = trimmed.to_ascii_lowercase();
-    let lower = lower.trim_end_matches(|c: char| c.is_ascii_punctuation());
-    const SMALL_TALK: &[&str] = &[
-        "hi", "hello", "hey", "yo", "sup", "hiya", "howdy",
-        "thanks", "thank you", "thx", "ty", "cheers",
-        "ok", "okay", "cool", "nice", "great", "awesome", "got it", "sounds good", "np",
-        "how are you", "how's it going", "who are you", "what are you", "what can you do",
-        "good morning", "good afternoon", "good evening", "good night",
-        "bye", "goodbye", "see you", "later", "yes", "no", "sure", "yep", "nope",
-    ];
-    !SMALL_TALK.contains(&lower)
-}
 
-/// Compute (once) and root the conversation in the repository: cache the
+    /// Compute (once) and root the conversation in the repository: cache the
     /// deterministic fingerprint and return the "repository understanding"
     /// block for this request (stack banner + existing related code). The
     /// fingerprint is also handed to the tool layer (`understand_repo`).
@@ -561,18 +643,12 @@ fn request_likely_needs_context(request: &str) -> bool {
         let root = self.tools.project_root();
         let mut written = crate::project::WrittenDocs::default();
         if let Some(body) = arch {
-            written.architecture = crate::project::write_generated_doc(
-                &root,
-                crate::project::ARCHITECTURE_DOC,
-                &body,
-            );
+            written.architecture =
+                crate::project::write_generated_doc(&root, crate::project::ARCHITECTURE_DOC, &body);
         }
         if let Some(body) = conv {
-            written.conventions = crate::project::write_generated_doc(
-                &root,
-                crate::project::CONVENTIONS_DOC,
-                &body,
-            );
+            written.conventions =
+                crate::project::write_generated_doc(&root, crate::project::CONVENTIONS_DOC, &body);
         }
         on_event(AgentEvent::OrientationSaved { docs: written });
 
@@ -596,7 +672,9 @@ fn request_likely_needs_context(request: &str) -> bool {
         let _ = self.cancel_tx.send(false);
         let report = self.repo_context("review uncommitted changes", &mut on_event);
         let persona = recommend_reviewer("uncommitted changes review");
-        let hunter = persona.map(|p| prepend_persona_prompt(&mut self.state, p.id)).unwrap_or(false);
+        let hunter = persona
+            .map(|p| prepend_persona_prompt(&mut self.state, p.id))
+            .unwrap_or(false);
 
         let prompt = format!(
             "Review the uncommitted working-tree changes in this repository.\n\
@@ -626,7 +704,9 @@ fn request_likely_needs_context(request: &str) -> bool {
         if hunter {
             self.state.messages.remove(0);
         }
-        let persona_id = persona.map(|p| p.id.to_string()).unwrap_or_else(|| "reviewer".into());
+        let persona_id = persona
+            .map(|p| p.id.to_string())
+            .unwrap_or_else(|| "reviewer".into());
         on_event(AgentEvent::ReviewUncommitted {
             persona: persona_id,
             report: turn.final_text.clone(),
@@ -709,7 +789,9 @@ fn request_likely_needs_context(request: &str) -> bool {
         }
 
         let (steps, plan_usage) = self.plan_task(goal).await?;
-        on_event(AgentEvent::PlanGenerated { steps: steps.clone() });
+        on_event(AgentEvent::PlanGenerated {
+            steps: steps.clone(),
+        });
 
         // Research pass: read-only by force, so the plan is grounded in real
         // files rather than guesses. Runs as the goal's recommended
@@ -768,7 +850,9 @@ fn request_likely_needs_context(request: &str) -> bool {
 
         let (steps, usage) = self.plan_task(goal).await?;
         add_usage(&mut total_usage, &usage);
-        on_event(AgentEvent::PlanGenerated { steps: steps.clone() });
+        on_event(AgentEvent::PlanGenerated {
+            steps: steps.clone(),
+        });
 
         // Persist the drafted plan up front, then hold at the review gate:
         // nothing below executes until the user approves. This is the
@@ -828,10 +912,7 @@ fn request_likely_needs_context(request: &str) -> bool {
                 tool: "plan_step".into(),
                 path: self.options.tasks_file.clone(),
                 command: None,
-                description: format!(
-                    "accept recommended step {}: {}",
-                    step.id, step.description
-                ),
+                description: format!("accept recommended step {}: {}", step.id, step.description),
                 preview: Some(Self::step_preview(step)),
                 overwrites: false,
             });
@@ -1027,9 +1108,8 @@ fn request_likely_needs_context(request: &str) -> bool {
                 decision,
                 ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession
             ) {
-                let summary = format!(
-                    "Work for '{goal}' was NOT accepted by the lead reviewer.\n\n{report}"
-                );
+                let summary =
+                    format!("Work for '{goal}' was NOT accepted by the lead reviewer.\n\n{report}");
                 on_event(AgentEvent::OrchestrationRevision {
                     report: summary.clone(),
                 });
@@ -1227,19 +1307,19 @@ fn request_likely_needs_context(request: &str) -> bool {
     }
 
     /// One-line preview of a single planned step, including the rationale for
-/// choosing that approach. Used for the per-step accept/deny gate.
-fn step_preview(step: &PlanStep) -> String {
-    let mut s = format!("{}. {}", step.id, step.description);
-    if let Some(p) = step.persona.as_deref() {
-        s.push_str(&format!("  [{p}]"));
+    /// choosing that approach. Used for the per-step accept/deny gate.
+    fn step_preview(step: &PlanStep) -> String {
+        let mut s = format!("{}. {}", step.id, step.description);
+        if let Some(p) = step.persona.as_deref() {
+            s.push_str(&format!("  [{p}]"));
+        }
+        if !step.rationale.is_empty() {
+            s.push_str(&format!("\n   why: {}", step.rationale));
+        }
+        s
     }
-    if !step.rationale.is_empty() {
-        s.push_str(&format!("\n   why: {}", step.rationale));
-    }
-    s
-}
 
-/// One read-only review pass over completed `work`, driven by a
+    /// One read-only review pass over completed `work`, driven by a
     /// `reviewer: true` persona matched to the goal. Emits a `PlanReviewed`
     /// event with the report. Returns `(report, usage, was_cancelled)` —
     /// `report` is `None` when no reviewer is available *or* the pass was
@@ -1355,7 +1435,11 @@ fn step_preview(step: &PlanStep) -> String {
                         })
                     })
                     .collect();
-                if steps.is_empty() { fallback() } else { steps }
+                if steps.is_empty() {
+                    fallback()
+                } else {
+                    steps
+                }
             }
             None => fallback(),
         };
@@ -1414,7 +1498,10 @@ fn step_preview(step: &PlanStep) -> String {
             ));
         };
 
-        let mut messages = vec![Message::system(persona.system_prompt()), Message::user(args.task)];
+        let mut messages = vec![
+            Message::system(persona.system_prompt()),
+            Message::user(args.task),
+        ];
         let mut usage = TokenUsage::default();
         const MAX_ITERATIONS: usize = 5;
         for _ in 0..MAX_ITERATIONS {
@@ -1443,7 +1530,11 @@ fn step_preview(step: &PlanStep) -> String {
             while let Some(ev) = stream.next().await {
                 match ev.map_err(AgentError::Provider)? {
                     StreamEvent::TextDelta { text: t } => text.push_str(&t),
-                    StreamEvent::ToolCallDelta { id, name, arguments_delta } => {
+                    StreamEvent::ToolCallDelta {
+                        id,
+                        name,
+                        arguments_delta,
+                    } => {
                         let entry = calls.entry(id.clone()).or_insert_with(|| {
                             call_order.push(id.clone());
                             (None, String::new())
@@ -1453,7 +1544,10 @@ fn step_preview(step: &PlanStep) -> String {
                         }
                         entry.1.push_str(&arguments_delta);
                     }
-                    StreamEvent::Done { finish_reason, usage: u } => {
+                    StreamEvent::Done {
+                        finish_reason,
+                        usage: u,
+                    } => {
                         usage.prompt_tokens += u.prompt_tokens;
                         usage.completion_tokens += u.completion_tokens;
                         usage.total_tokens += u.total_tokens;
@@ -1489,9 +1583,11 @@ fn step_preview(step: &PlanStep) -> String {
                 // auto-approve rather than surface a second, confusing
                 // permission prompt for a sub-consultation the user
                 // didn't directly initiate.
-                let result = self.tools.dispatch_with_approver(&call.name, &call.arguments, |_: &PermissionRequest| {
-                    ApprovalDecision::Approved
-                })?;
+                let result = self.tools.dispatch_with_approver(
+                    &call.name,
+                    &call.arguments,
+                    |_: &PermissionRequest| ApprovalDecision::Approved,
+                )?;
                 messages.push(Message::tool_result(call.id.clone(), result.content));
             }
         }
@@ -1510,11 +1606,7 @@ fn step_preview(step: &PlanStep) -> String {
     /// until a plain-text final answer or the iteration budget runs out.
     /// Both `run_turn` and `orchestrate` reuse this, so a step in a plan
     /// runs through exactly the same loop as a standalone turn.
-    async fn drive_turn<E, A>(
-        &mut self,
-        mut on_event: E,
-        mut approver: A,
-    ) -> Result<TurnResult>
+    async fn drive_turn<E, A>(&mut self, mut on_event: E, mut approver: A) -> Result<TurnResult>
     where
         E: FnMut(AgentEvent),
         A: FnMut(&PermissionRequest) -> ApprovalDecision,
@@ -1602,7 +1694,10 @@ fn step_preview(step: &PlanStep) -> String {
                         }
                         entry.1.push_str(&arguments_delta);
                     }
-                    StreamEvent::Done { finish_reason, usage } => {
+                    StreamEvent::Done {
+                        finish_reason,
+                        usage,
+                    } => {
                         total_usage.prompt_tokens += usage.prompt_tokens;
                         total_usage.completion_tokens += usage.completion_tokens;
                         total_usage.total_tokens += usage.total_tokens;
@@ -1636,7 +1731,9 @@ fn step_preview(step: &PlanStep) -> String {
                 let trimmed = text.trim();
                 let is_degenerate = trimmed.is_empty()
                     || (!trimmed.is_empty()
-                        && trimmed.chars().all(|c| c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']')));
+                        && trimmed
+                            .chars()
+                            .all(|c| c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']')));
                 let mut final_text = text;
                 if is_degenerate {
                     let note = "\n\n(that came back empty/malformed instead of a real answer â€” \
@@ -1645,7 +1742,9 @@ fn step_preview(step: &PlanStep) -> String {
                     on_event(AgentEvent::TextDelta(note.to_string()));
                     final_text.push_str(note);
                 }
-                self.state.messages.push(Message::assistant(final_text.clone()));
+                self.state
+                    .messages
+                    .push(Message::assistant(final_text.clone()));
                 self.persist()?;
                 on_event(AgentEvent::Done);
                 self.tools.hooks().run_on_stop(
@@ -1768,7 +1867,9 @@ fn step_preview(step: &PlanStep) -> String {
             total_tool_calls, self.options.max_tool_iterations
         );
         on_event(AgentEvent::TextDelta(fallback_text.clone()));
-        self.state.messages.push(Message::assistant(fallback_text.clone()));
+        self.state
+            .messages
+            .push(Message::assistant(fallback_text.clone()));
         self.persist()?;
         on_event(AgentEvent::Done);
         self.tools
@@ -1844,7 +1945,10 @@ fn step_preview(step: &PlanStep) -> String {
 
         let summary_text = match self
             .provider
-            .chat(ChatRequest::new(self.options.model.clone(), vec![Message::user(summary_prompt)]))
+            .chat(ChatRequest::new(
+                self.options.model.clone(),
+                vec![Message::user(summary_prompt)],
+            ))
             .await
         {
             Ok(resp) => resp.message.content,
@@ -1893,7 +1997,9 @@ fn prepend_persona_prompt(state: &mut super::session::ConversationState, id: &st
     let Some(persona) = persona_by_id(id) else {
         return false;
     };
-    state.messages.insert(0, Message::system(persona.system_prompt()));
+    state
+        .messages
+        .insert(0, Message::system(persona.system_prompt()));
     true
 }
 
@@ -1999,7 +2105,10 @@ async fn run_headless_step(
         match ev.map_err(AgentError::Provider)? {
             StreamEvent::TextDelta { text: t } => text.push_str(&t),
             StreamEvent::ToolCallDelta { .. } => {}
-            StreamEvent::Done { finish_reason, usage: u } => {
+            StreamEvent::Done {
+                finish_reason,
+                usage: u,
+            } => {
                 if finish_reason == FinishReason::Cancelled {
                     cancelled = true;
                 }
@@ -2025,7 +2134,10 @@ fn delegate_tool_spec() -> ToolSpec {
     // can call `/agents`-equivalent info via the roster departments here
     // and pick a specific id from context/its own knowledge; getting an
     // unknown id back is handled gracefully (`run_delegate` reports it).
-    let departments: Vec<&str> = personas_by_department().into_iter().map(|(d, _)| d).collect();
+    let departments: Vec<&str> = personas_by_department()
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
     ToolSpec {
         name: "delegate".to_string(),
         description: format!(
@@ -2075,7 +2187,10 @@ fn split_orientation_docs(text: &str) -> (Option<String>, Option<String>) {
         let end = text[start..].find(close)?;
         Some(text[start..start + end].trim().to_string())
     }
-    (extract(text, "[ARCH]", "[/ARCH]"), extract(text, "[CONV]", "[/CONV]"))
+    (
+        extract(text, "[ARCH]", "[/ARCH]"),
+        extract(text, "[CONV]", "[/CONV]"),
+    )
 }
 
 #[cfg(test)]
@@ -2224,14 +2339,20 @@ mod tests {
             }])
         }
 
-        async fn embeddings(&self, _request: EmbeddingRequest) -> zeus_provider::Result<EmbeddingResponse> {
+        async fn embeddings(
+            &self,
+            _request: EmbeddingRequest,
+        ) -> zeus_provider::Result<EmbeddingResponse> {
             Ok(EmbeddingResponse {
                 vectors: Vec::new(),
                 usage: TokenUsage::new(0, 0),
             })
         }
 
-        async fn count_tokens(&self, _request: TokenCountRequest) -> zeus_provider::Result<TokenCountResponse> {
+        async fn count_tokens(
+            &self,
+            _request: TokenCountRequest,
+        ) -> zeus_provider::Result<TokenCountResponse> {
             Ok(TokenCountResponse {
                 tokens: 1,
                 approximate: true,
@@ -2264,8 +2385,8 @@ mod tests {
             terminal,
             background,
             hooks,
-            Vec::new(),   // no MCP
-            Vec::new(),   // no plugins
+            Vec::new(), // no MCP
+            Vec::new(), // no plugins
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         tools.set_global_skills_dir(None);
@@ -2384,9 +2505,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut agent = test_agent(
             tmp.path(),
-            MockProvider::new(vec![MockReply::Text(
-                "1. auth (M)\n2. observer (S)".into(),
-            )]),
+            MockProvider::new(vec![MockReply::Text("1. auth (M)\n2. observer (S)".into())]),
         );
         let mut events: Vec<AgentEvent> = Vec::new();
         let result = agent
@@ -2396,9 +2515,9 @@ mod tests {
 
         assert!(!result.cancelled);
         assert_eq!(result.final_text, "1. auth (M)\n2. observer (S)");
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::FeaturesSuggested { report } if report.contains("auth"))));
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::FeaturesSuggested { report } if report.contains("auth"))
+        ));
     }
 
     /// Approve everything except the lead-reviewer gate, so we can exercise
@@ -2435,11 +2554,7 @@ mod tests {
         );
         let mut events: Vec<AgentEvent> = Vec::new();
         let (summary, _usage) = agent
-            .orchestrate(
-                "add a test",
-                |ev| events.push(ev),
-                approve_but_deny_review,
-            )
+            .orchestrate("add a test", |ev| events.push(ev), approve_but_deny_review)
             .await
             .unwrap();
 

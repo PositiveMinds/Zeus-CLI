@@ -90,7 +90,7 @@ pub fn pascal_case(name: &str) -> String {
         .map(|w| {
             let mut chars = w.chars();
             match chars.next() {
-                Some(first) => first.to_ascii_uppercase().to_string() + &chars.as_str(),
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
                 None => String::new(),
             }
         })

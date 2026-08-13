@@ -208,7 +208,12 @@ pub fn discover_in_dir(dir: &Path, tier: SkillTier) -> Vec<Skill> {
 }
 
 /// One built-in skill entry: (name, description, depends_on, SKILL.md text).
-pub type BuiltinSkillDef = (&'static str, &'static str, &'static [&'static str], &'static str);
+pub type BuiltinSkillDef = (
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+);
 
 /// Skills shipped inside the zeus binary. Real SKILL.md content is embedded
 /// verbatim via `include_str!` so the instructions read exactly like files a
@@ -345,10 +350,7 @@ pub fn skill_resources(skill: &Skill) -> Vec<String> {
 /// `(meta_yaml, body)`. When no fence is found, `("", raw)`.
 fn split_frontmatter(raw: &str) -> (String, &str) {
     let is_fence = |l: &str| l.trim() == "---" || l.trim() == "+++";
-    let lines: Vec<&str> = raw
-        .split('\n')
-        .map(|l| l.trim_end_matches('\r'))
-        .collect();
+    let lines: Vec<&str> = raw.split('\n').map(|l| l.trim_end_matches('\r')).collect();
     let first = match lines.iter().position(|l| is_fence(l.trim())) {
         Some(i) if i <= 2 => i,
         _ => return (String::new(), raw),
@@ -427,7 +429,12 @@ mod tests {
     #[test]
     fn discover_in_dir_collects_only_valid() {
         let tmp = TempDir::new().unwrap();
-        write_skill(tmp.path(), "alpha", "---\nname: alpha\ndescription: a\n---", "a");
+        write_skill(
+            tmp.path(),
+            "alpha",
+            "---\nname: alpha\ndescription: a\n---",
+            "a",
+        );
         write_skill(tmp.path(), "beta", "---\nname: beta\n---", "b");
         std::fs::create_dir_all(tmp.path().join("not-a-skill")).unwrap();
         let found = discover_in_dir(tmp.path(), SkillTier::Builtin);

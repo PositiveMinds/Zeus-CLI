@@ -75,8 +75,11 @@ pub fn detect_install_method() -> InstallMethod {
         }
     }
     let s = exe.to_string_lossy().to_ascii_lowercase();
-    if s.contains(".cargo") || s.contains("target/debug") || s.contains("target/release")
-        || s.contains("target\\debug") || s.contains("target\\release")
+    if s.contains(".cargo")
+        || s.contains("target/debug")
+        || s.contains("target/release")
+        || s.contains("target\\debug")
+        || s.contains("target\\release")
     {
         return InstallMethod::Cargo;
     }
@@ -90,9 +93,8 @@ struct GhRelease {
 
 /// Latest published version, tag-prefix (`v`) stripped.
 pub async fn latest_version() -> Result<String> {
-    let url = format!(
-        "https://api.github.com/repos/{RELEASES_OWNER}/{RELEASES_REPO}/releases/latest"
-    );
+    let url =
+        format!("https://api.github.com/repos/{RELEASES_OWNER}/{RELEASES_REPO}/releases/latest");
     let client = reqwest::Client::builder()
         .user_agent(format!("zeus-cli/{}", current_version()))
         .build()
@@ -149,7 +151,9 @@ pub fn run_script_update(target_version: &str) -> Result<()> {
         );
         std::process::Command::new("sh")
             .arg("-c")
-            .arg(format!("curl -fsSL {script_url} | ZEUS_VERSION={target_version} sh"))
+            .arg(format!(
+                "curl -fsSL {script_url} | ZEUS_VERSION={target_version} sh"
+            ))
             .status()
             .context("spawn shell to run install.sh")?
     };
@@ -173,7 +177,10 @@ pub async fn cmd_update(check_only: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("update available: {current} -> {latest} (installed via {})", method.label());
+    println!(
+        "update available: {current} -> {latest} (installed via {})",
+        method.label()
+    );
 
     if check_only {
         println!("run `zeus update` (without --check) to install it.");

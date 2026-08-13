@@ -193,10 +193,7 @@ impl FileEngine {
         let mut approver = approver;
         // Ask outside files already touched this session.
         let desc = if exists {
-            format!(
-                "overwrite {}",
-                display_rel(&self.project_root, &path)
-            )
+            format!("overwrite {}", display_rel(&self.project_root, &path))
         } else {
             format!("create {}", display_rel(&self.project_root, &path))
         };
@@ -726,15 +723,31 @@ fn looks_binary(bytes: &[u8]) -> bool {
         return false;
     }
     let sample = &bytes[..bytes.len().min(8000)];
-    sample.contains(&0) || sample.iter().filter(|b| **b < 9 && **b != b'\n' && **b != b'\r' && **b != b'\t').count() > sample.len() / 10
+    sample.contains(&0)
+        || sample
+            .iter()
+            .filter(|b| **b < 9 && **b != b'\n' && **b != b'\r' && **b != b'\t')
+            .count()
+            > sample.len() / 10
 }
 
 fn looks_binary_path(path: &Path) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => matches!(
             ext.to_ascii_lowercase().as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "pdf" | "zip" | "exe" | "dll" | "so" | "o"
-                | "wasm" | "bin"
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "pdf"
+                | "zip"
+                | "exe"
+                | "dll"
+                | "so"
+                | "o"
+                | "wasm"
+                | "bin"
         ),
         None => false,
     }
@@ -791,8 +804,8 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::permission::ApprovalDecision;
-    use zeus_config::AgentSettings;
     use tempfile::TempDir;
+    use zeus_config::AgentSettings;
 
     fn engine(root: &Path) -> FileEngine {
         let settings = AgentSettings::default();
@@ -814,9 +827,16 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         let eng = engine(&root);
 
-        eng.write(Path::new("src/a.txt"), "hello world", WriteOptions::default(), approve)
+        eng.write(
+            Path::new("src/a.txt"),
+            "hello world",
+            WriteOptions::default(),
+            approve,
+        )
+        .unwrap();
+        let r = eng
+            .read(Path::new("src/a.txt"), ReadOptions::default())
             .unwrap();
-        let r = eng.read(Path::new("src/a.txt"), ReadOptions::default()).unwrap();
         assert!(r.content.contains("hello world"));
 
         eng.edit(
@@ -852,9 +872,15 @@ mod tests {
         let root = tmp.path().join("proj");
         std::fs::create_dir_all(&root).unwrap();
         let eng = engine(&root);
-        eng.write(Path::new("a.txt"), "x x x", WriteOptions::default(), approve)
+        eng.write(
+            Path::new("a.txt"),
+            "x x x",
+            WriteOptions::default(),
+            approve,
+        )
+        .unwrap();
+        eng.read(Path::new("a.txt"), ReadOptions::default())
             .unwrap();
-        eng.read(Path::new("a.txt"), ReadOptions::default()).unwrap();
         let err = eng
             .edit(
                 Path::new("a.txt"),
@@ -880,7 +906,10 @@ mod tests {
         eng.delete(Path::new("z.txt"), approve).unwrap();
         assert!(!root.join("z.txt").exists());
         eng.checkpoints.restore("test-turn", &root).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("z.txt")).unwrap(), "keepme");
+        assert_eq!(
+            std::fs::read_to_string(root.join("z.txt")).unwrap(),
+            "keepme"
+        );
     }
 
     #[test]
@@ -942,7 +971,11 @@ mod tests {
         let real_name = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(|e| e.ok())
-            .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case("d.txt"))
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("d.txt")
+            })
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .unwrap();
         assert_eq!(real_name, "D.TXT");

@@ -18,8 +18,12 @@ use std::time::{Duration, Instant};
 pub enum PreToolUseOutcome {
     /// Allowed to run. `modified_arguments` replaces the original JSON
     /// arguments when the hook printed valid JSON to stdout.
-    Allow { modified_arguments: Option<String> },
-    Block { reason: String },
+    Allow {
+        modified_arguments: Option<String>,
+    },
+    Block {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,13 +108,12 @@ impl HookRunner {
             Ok(output) => {
                 if output.success {
                     let trimmed = output.stdout.trim();
-                    let modified = if !trimmed.is_empty()
-                        && serde_json::from_str::<Value>(trimmed).is_ok()
-                    {
-                        Some(trimmed.to_string())
-                    } else {
-                        None
-                    };
+                    let modified =
+                        if !trimmed.is_empty() && serde_json::from_str::<Value>(trimmed).is_ok() {
+                            Some(trimmed.to_string())
+                        } else {
+                            None
+                        };
                     PreToolUseOutcome::Allow {
                         modified_arguments: modified,
                     }
@@ -228,7 +231,10 @@ fn run_capturing(mut cmd: Command, timeout: Duration) -> std::io::Result<Capture
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "hook timed out"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "hook timed out",
+            ));
         }
         std::thread::sleep(Duration::from_millis(25));
     };
@@ -262,7 +268,9 @@ fn spawn_reader<R: Read + Send + 'static>(
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if reader.read_to_end(&mut bytes).is_ok() {
-            buf.lock().unwrap().push_str(&String::from_utf8_lossy(&bytes));
+            buf.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&bytes));
         }
         done.store(true, Ordering::SeqCst);
     });
@@ -280,7 +288,11 @@ mod tests {
     }
 
     fn win_or_unix(win: &str, unix: &str) -> String {
-        if cfg!(windows) { win.to_string() } else { unix.to_string() }
+        if cfg!(windows) {
+            win.to_string()
+        } else {
+            unix.to_string()
+        }
     }
 
     #[test]
@@ -290,7 +302,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let runner = HookRunner::new(root.join(".agent/hooks"), root.clone());
         let outcome = runner.run_pre_tool_use("write", r#"{"path":"a.txt"}"#);
-        assert_eq!(outcome, PreToolUseOutcome::Allow { modified_arguments: None });
+        assert_eq!(
+            outcome,
+            PreToolUseOutcome::Allow {
+                modified_arguments: None
+            }
+        );
     }
 
     #[test]
@@ -324,7 +341,9 @@ mod tests {
         let runner = HookRunner::new(hooks_dir, root);
         let outcome = runner.run_pre_tool_use("write", r#"{"path":"a.txt"}"#);
         match outcome {
-            PreToolUseOutcome::Allow { modified_arguments: Some(args) } => {
+            PreToolUseOutcome::Allow {
+                modified_arguments: Some(args),
+            } => {
                 assert!(args.contains("b.txt"));
             }
             other => panic!("expected modified Allow, got {other:?}"),

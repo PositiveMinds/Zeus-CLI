@@ -181,8 +181,7 @@ impl CheckpointStore {
                     if let Some(parent) = full.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| FsError::io(parent, e))?;
                     }
-                    let bytes = base64_decode(content_b64)
-                        .map_err(FsError::Checkpoint)?;
+                    let bytes = base64_decode(content_b64).map_err(FsError::Checkpoint)?;
                     std::fs::write(&full, bytes).map_err(|e| FsError::io(&full, e))?;
                     restored += 1;
                 }

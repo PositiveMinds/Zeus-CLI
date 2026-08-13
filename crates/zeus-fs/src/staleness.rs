@@ -25,10 +25,7 @@ impl ReadTracker {
     }
 
     pub fn record(&self, path: &Path, stamp: FileStamp) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(path.to_path_buf(), stamp);
+        self.inner.lock().unwrap().insert(path.to_path_buf(), stamp);
     }
 
     pub fn get(&self, path: &Path) -> Option<FileStamp> {

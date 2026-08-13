@@ -19,27 +19,33 @@
 
 use crate::{
     build_agent_repl_with, build_agent_repl_with_session, expand_slash_command,
-    git_engine_for_agent, known_slash_commands, list_models_by_provider,
-    persist_default_provider, print_repl_help_lines,
+    git_engine_for_agent, known_slash_commands, list_models_by_provider, persist_default_provider,
+    print_repl_help_lines,
 };
 use anyhow::{Context, Result};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use std::io;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use zeus_agent::{personas_by_department, Agent, AgentEvent, SessionStore, SessionSummary, TurnResult};
+use zeus_agent::{
+    personas_by_department, Agent, AgentEvent, SessionStore, SessionSummary, TurnResult,
+};
 use zeus_config::{Config, KeysFile};
 use zeus_fs::{ApprovalDecision, PermissionRequest};
 use zeus_provider::{create_provider, ModelInfo, TokenUsage};
@@ -144,7 +150,12 @@ impl Block_ {
         if self.expanded.get() || !matches!(self.role, Role::Tool | Role::ToolError) {
             return false;
         }
-        let body_line_count = self.text.splitn(2, '\n').nth(1).map(|b| b.lines().count()).unwrap_or(0);
+        let body_line_count = self
+            .text
+            .split_once('\n')
+            .map(|x| x.1)
+            .map(|b| b.lines().count())
+            .unwrap_or(0);
         body_line_count > Self::MAX_TOOL_LINES
     }
 
@@ -164,12 +175,7 @@ impl Block_ {
         }
         self.lines
             .iter()
-            .map(|spans| {
-                spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
+            .map(|spans| spans.iter().map(|s| s.content.as_ref()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -203,24 +209,32 @@ impl Block_ {
     /// truly empty, has none.
     fn has_output_body(&self) -> bool {
         self.text
-            .splitn(2, '\n')
-            .nth(1)
+            .split_once('\n')
+            .map(|x| x.1)
             .is_some_and(|body| !body.trim().is_empty())
     }
 
     /// A tool call that produced real output gets a left-accent-bar card —
-    /// the same visual language the composer already uses (`Borders::LEFT`
-    /// + a filled panel background) — instead of blending into the plain
-    /// log lines around it. Built by hand (spans with an explicit `bg`
-    /// filled out to `width`) rather than an actual `ratatui::widgets::Block`
-    /// because the whole transcript is one flattened `Text` rendered by a
-    /// single `Paragraph`, the same reason `bubble_lines` draws its own
-    /// border characters instead of nesting a real bordered widget.
+    /// the same visual language the composer already uses (`Borders::LEFT` +
+    /// a filled panel background) — instead of blending into the plain log
+    /// lines around it.
+    ///
+    /// Built by hand (spans with an explicit `bg` filled out to `width`)
+    /// rather than an actual `ratatui::widgets::Block` because the whole
+    /// transcript is one flattened `Text` rendered by a single `Paragraph`,
+    /// the same reason `bubble_lines` draws its own border characters
+    /// instead of nesting a real bordered widget.
     fn tool_card_lines(&self, width: u16) -> Vec<Line<'static>> {
         let is_error = self.role == Role::ToolError;
-        let accent = if is_error { theme::red() } else { theme::cyan() };
+        let accent = if is_error {
+            theme::red()
+        } else {
+            theme::cyan()
+        };
         let bg = theme::CARD_BG;
-        let avail = (width as usize).saturating_sub(2).clamp(20, Self::MAX_CONTENT_W);
+        let avail = (width as usize)
+            .saturating_sub(2)
+            .clamp(20, Self::MAX_CONTENT_W);
 
         let pad_row = || {
             Line::from(vec![
@@ -235,12 +249,16 @@ impl Block_ {
             let mut spans = vec![Span::styled("▎ ", accent.bg(bg))];
             let mut used = 2usize;
             for s in line.spans {
-                if used >= avail + 1 {
+                if used > avail {
                     break;
                 }
                 // Preserve a span's own background (e.g. a diff +/- line's
                 // tint) instead of flattening it into the card's panel bg.
-                let style = if s.style.bg.is_some() { s.style } else { s.style.bg(bg) };
+                let style = if s.style.bg.is_some() {
+                    s.style
+                } else {
+                    s.style.bg(bg)
+                };
                 let remaining = avail + 1 - used;
                 let content_len = s.content.chars().count();
                 if content_len > remaining {
@@ -263,7 +281,10 @@ impl Block_ {
                 spans.push(Span::styled(s.content, style));
             }
             if used < avail + 1 {
-                spans.push(Span::styled(" ".repeat(avail + 1 - used), Style::default().bg(bg)));
+                spans.push(Span::styled(
+                    " ".repeat(avail + 1 - used),
+                    Style::default().bg(bg),
+                ));
             }
             out.push(Line::from(spans));
         }
@@ -318,8 +339,11 @@ impl Block_ {
                 })
                 .collect();
             out.push(
-                Line::from(Span::styled("YOU", theme::dim().add_modifier(Modifier::BOLD)))
-                    .alignment(Alignment::Right),
+                Line::from(Span::styled(
+                    "YOU",
+                    theme::dim().add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Right),
             );
             out
         } else {
@@ -352,7 +376,10 @@ impl Block_ {
                     // a multi-line reply so the turn still reads as one
                     // continuous block while scrolling past it.
                     let mut spans = if i == 0 {
-                        vec![Span::styled("⚡ ", theme::violet().add_modifier(Modifier::BOLD))]
+                        vec![Span::styled(
+                            "⚡ ",
+                            theme::violet().add_modifier(Modifier::BOLD),
+                        )]
                     } else {
                         vec![Span::styled("│ ", theme::violet())]
                     };
@@ -406,14 +433,17 @@ impl Block_ {
             let header = header_and_body.next().unwrap_or("");
             let body = header_and_body.next().unwrap_or("");
 
-            let mut lines: Vec<Line<'static>> = vec![style_tool_header(header, self.role == Role::ToolError)];
+            let mut lines: Vec<Line<'static>> =
+                vec![style_tool_header(header, self.role == Role::ToolError)];
             let mut body_lines: Vec<Line<'static>> = if super::highlight::looks_like_diff(body) {
                 super::highlight::diff_lines(body, text_style, super::highlight::DIFF_DEFAULT_WIDTH)
                     .into_iter()
                     .map(Line::from)
                     .collect()
             } else {
-                body.lines().map(|l| style_tool_body_line(l, text_style)).collect()
+                body.lines()
+                    .map(|l| style_tool_body_line(l, text_style))
+                    .collect()
             };
             if body_lines.len() > Self::MAX_TOOL_LINES && !self.expanded.get() {
                 let omitted = body_lines.len() - Self::MAX_TOOL_LINES;
@@ -550,7 +580,11 @@ enum UiEvent {
     Agent(AgentEvent),
     Approval(ApprovalRequestMsg),
     /// `/model`'s picker finished probing — empty entries means "no models found".
-    ModelPickerReady(Vec<PickerEntry>, usize, Vec<(String, Vec<zeus_provider::ModelInfo>)>),
+    ModelPickerReady(
+        Vec<PickerEntry>,
+        usize,
+        Vec<(String, Vec<zeus_provider::ModelInfo>)>,
+    ),
     /// The one-shot startup version check (see `run_app`) found a newer
     /// release than `update::current_version()`. Carries the latest version
     /// string, shown as a small dim notice — never auto-installed.
@@ -560,13 +594,21 @@ enum UiEvent {
 enum Mode {
     Chat,
     Approval(ApprovalRequestMsg),
-    ModelPicker { entries: Vec<PickerEntry>, selected: usize },
+    ModelPicker {
+        entries: Vec<PickerEntry>,
+        selected: usize,
+    },
     /// Grouped provider picker (paid / free / local) — arrow keys to move,
     /// Enter to select. Selecting a provider without a key opens `KeyEntry`.
-    ProviderPicker { entries: Vec<ProviderEntry>, selected: usize },
+    ProviderPicker {
+        entries: Vec<ProviderEntry>,
+        selected: usize,
+    },
     /// Pasting an API key for the named provider. Enter saves it (persisted
     /// to keys.toml, env var set, provider switched) and returns to Chat.
-    KeyEntry { provider: String },
+    KeyEntry {
+        provider: String,
+    },
 }
 
 /// One row in the model picker: a non-selectable provider-group header, or
@@ -584,7 +626,10 @@ enum PickerEntry {
     /// matches on `Model { .. }` specifically, so this needs no separate
     /// handling there.
     SubHeader(String),
-    Model { provider: String, model: ModelInfo },
+    Model {
+        provider: String,
+        model: ModelInfo,
+    },
 }
 
 /// One row in the provider picker: a non-selectable group header (paid /
@@ -858,7 +903,10 @@ fn model_family(id: &str) -> Option<&'static str> {
         ("nova", "Amazon Nova"),
         ("yi-", "01.AI"),
     ];
-    FAMILIES.iter().find(|(prefix, _)| lower.starts_with(prefix)).map(|(_, family)| *family)
+    FAMILIES
+        .iter()
+        .find(|(prefix, _)| lower.starts_with(prefix))
+        .map(|(_, family)| *family)
 }
 
 /// Splits a provider's model catalog into vendor-family sub-groups for
@@ -890,7 +938,11 @@ fn group_models_by_family(
     if !unrecognized.is_empty() {
         groups.push((None, unrecognized));
     }
-    groups.extend(by_family.into_iter().map(|(f, ms)| (Some(f.to_string()), ms)));
+    groups.extend(
+        by_family
+            .into_iter()
+            .map(|(f, ms)| (Some(f.to_string()), ms)),
+    );
     groups
 }
 
@@ -919,9 +971,8 @@ const POPULAR_PROVIDERS: [&str; 4] = ["opencodezen", "openrouter", "anthropic", 
 fn provider_short_desc(name: &str, kind: &str) -> String {
     match name {
         "opencodezen" => "(Recommended)".to_string(),
-        "openrouter" | "anthropic" | "openai" | "deepseek" | "mistral" | "groq" | "together" | "fireworks" => {
-            "(API key)".to_string()
-        }
+        "openrouter" | "anthropic" | "openai" | "deepseek" | "mistral" | "groq" | "together"
+        | "fireworks" => "(API key)".to_string(),
         "ollama" | "lmstudio" | "llamacpp" => "(local)".to_string(),
         _ => format!("({kind})"),
     }
@@ -940,7 +991,12 @@ fn provider_picker_entries(config: &Config, current: &str) -> (Vec<ProviderEntry
             rest.push(name);
         }
     }
-    popular.sort_by_key(|n| POPULAR_PROVIDERS.iter().position(|p| *p == n.as_str()).unwrap_or(usize::MAX));
+    popular.sort_by_key(|n| {
+        POPULAR_PROVIDERS
+            .iter()
+            .position(|p| *p == n.as_str())
+            .unwrap_or(usize::MAX)
+    });
 
     let mut entries = Vec::new();
     let mut selected = 0;
@@ -950,7 +1006,9 @@ fn provider_picker_entries(config: &Config, current: &str) -> (Vec<ProviderEntry
         }
         entries.push(ProviderEntry::Header(title.to_string()));
         for name in names {
-            let Some(cfg) = config.providers.get(name.as_str()) else { continue };
+            let Some(cfg) = config.providers.get(name.as_str()) else {
+                continue;
+            };
             let ready = provider_status_ok(config, name);
             if name.as_str() == current {
                 selected = entries.len();
@@ -992,7 +1050,10 @@ fn build_model_picker_entries(
     };
     let mut entries = Vec::new();
     let mut selected = None;
-    let push_section = |entries: &mut Vec<PickerEntry>, selected: &mut Option<usize>, title: &str, pairs: &[(String, String)]| {
+    let push_section = |entries: &mut Vec<PickerEntry>,
+                        selected: &mut Option<usize>,
+                        title: &str,
+                        pairs: &[(String, String)]| {
         let rows: Vec<(String, zeus_provider::ModelInfo)> = pairs
             .iter()
             .filter_map(|(p, m)| find(p, m).map(|mi| (p.clone(), mi)))
@@ -1026,10 +1087,16 @@ fn build_model_picker_entries(
                 entries.push(PickerEntry::SubHeader(family));
             }
             for model in family_models {
-                if selected.is_none() && model.id == current_model && provider_name == current_provider {
+                if selected.is_none()
+                    && model.id == current_model
+                    && provider_name == current_provider
+                {
                     selected = Some(entries.len());
                 }
-                entries.push(PickerEntry::Model { provider: provider_name.clone(), model });
+                entries.push(PickerEntry::Model {
+                    provider: provider_name.clone(),
+                    model,
+                });
             }
         }
     }
@@ -1041,7 +1108,10 @@ fn build_model_picker_entries(
 /// Enter works immediately without an arrow-key press first (index 0 is
 /// always a `Header`).
 fn first_selectable_picker(entries: &[PickerEntry]) -> usize {
-    entries.iter().position(|e| matches!(e, PickerEntry::Model { .. })).unwrap_or(0)
+    entries
+        .iter()
+        .position(|e| matches!(e, PickerEntry::Model { .. }))
+        .unwrap_or(0)
 }
 
 /// Opens the `/provider` picker popup — shared by the `/provider` command
@@ -1219,7 +1289,7 @@ struct AppState {
     /// newer release exists — `None` means either still checking, offline,
     /// or already up to date, all of which render identically (silent).
     update_available: Option<String>,
-/// Highlighted row in the slash-command dropdown; clamped against the
+    /// Highlighted row in the slash-command dropdown; clamped against the
     /// current match count wherever it's read; reset to 0 whenever the
     /// input text changes so the highlight always starts back at the top
     /// match instead of pointing at a stale/since-filtered-out row.
@@ -1384,13 +1454,15 @@ struct SessionPickerState {
 
 /// Sessions matching `picker.search` (id or last-user-message substring,
 /// case-insensitive) — everything when the query is empty.
-fn session_picker_filtered<'a>(picker: &'a SessionPickerState) -> Vec<&'a SessionSummary> {
+fn session_picker_filtered(picker: &SessionPickerState) -> Vec<&SessionSummary> {
     let q = picker.search.to_lowercase();
     picker
         .entries
         .iter()
         .filter(|s| {
-            q.is_empty() || s.id.to_lowercase().contains(&q) || s.last_user.to_lowercase().contains(&q)
+            q.is_empty()
+                || s.id.to_lowercase().contains(&q)
+                || s.last_user.to_lowercase().contains(&q)
         })
         .collect()
 }
@@ -1430,7 +1502,11 @@ impl AppState {
             pending_plan_goal: None,
             quit: false,
             mode: Mode::Chat,
-            agent_mode: if start_in_plan { AgentMode::Plan } else { AgentMode::Build },
+            agent_mode: if start_in_plan {
+                AgentMode::Plan
+            } else {
+                AgentMode::Build
+            },
             model: agent.model().to_string(),
             provider: agent.provider_id().to_string(),
             session_id: agent.session_id().to_string(),
@@ -1484,7 +1560,11 @@ impl AppState {
         } else {
             (current + lines).min(self.transcript_max_scroll)
         };
-        self.transcript_scroll = if next >= self.transcript_max_scroll { None } else { Some(next) };
+        self.transcript_scroll = if next >= self.transcript_max_scroll {
+            None
+        } else {
+            Some(next)
+        };
     }
 
     /// Appends a submitted input to history (skipping exact-duplicate
@@ -1506,8 +1586,10 @@ impl AppState {
     /// the front if already present, caps the list so the "Recent" section
     /// doesn't grow forever.
     fn record_recent_model(&mut self, provider: &str, model: &str) {
-        self.recent_models.retain(|(p, m)| !(p == provider && m == model));
-        self.recent_models.insert(0, (provider.to_string(), model.to_string()));
+        self.recent_models
+            .retain(|(p, m)| !(p == provider && m == model));
+        self.recent_models
+            .insert(0, (provider.to_string(), model.to_string()));
         self.recent_models.truncate(8);
     }
 
@@ -1522,7 +1604,8 @@ impl AppState {
         {
             self.favorite_models.remove(pos);
         } else {
-            self.favorite_models.push((provider.to_string(), model.to_string()));
+            self.favorite_models
+                .push((provider.to_string(), model.to_string()));
         }
         save_favorites(config, &self.favorite_models);
     }
@@ -1546,24 +1629,38 @@ impl AppState {
     fn apply_agent_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::TextDelta(t) => self.current_reply.push_str(&t),
-            AgentEvent::ToolCallStarted { id, name, arguments } => {
+            AgentEvent::ToolCallStarted {
+                id,
+                name,
+                arguments,
+            } => {
                 self.flush_current_reply();
                 let path = touched_path(&name, &arguments);
-                self.tool_call_meta.insert(id, (std::time::Instant::now(), path));
-                self.transcript.push(Block_::new(
-                    Role::Tool,
-                    format!("{name} {arguments}"),
-                ));
+                self.tool_call_meta
+                    .insert(id, (std::time::Instant::now(), path));
+                self.transcript
+                    .push(Block_::new(Role::Tool, format!("{name} {arguments}")));
             }
-            AgentEvent::ToolCallFinished { id, name, result, is_error } => {
+            AgentEvent::ToolCallFinished {
+                id,
+                name,
+                result,
+                is_error,
+            } => {
                 self.flush_current_reply();
                 let (elapsed, path) = match self.tool_call_meta.remove(&id) {
                     Some((start, path)) => (Some(start.elapsed()), path),
                     None => (None, None),
                 };
-                let role = if is_error { Role::ToolError } else { Role::Tool };
+                let role = if is_error {
+                    Role::ToolError
+                } else {
+                    Role::Tool
+                };
                 let marker = if is_error { "failed" } else { "done" };
-                let timing = elapsed.map(|d| format!(", {}", fmt_duration(d))).unwrap_or_default();
+                let timing = elapsed
+                    .map(|d| format!(", {}", fmt_duration(d)))
+                    .unwrap_or_default();
                 self.transcript.push(Block_::new(
                     role,
                     format!("{name} ({marker}{timing})\n{result}"),
@@ -1583,13 +1680,19 @@ impl AppState {
                 // first-undone because some unrelated tool call succeeded.
                 if !is_error
                     && !self.plan_active
-                    && matches!(name.as_str(), "apply_patch" | "write" | "edit" | "update" | "run" | "patch")
+                    && matches!(
+                        name.as_str(),
+                        "apply_patch" | "write" | "edit" | "update" | "run" | "patch"
+                    )
                 {
                     self.complete_task(&name);
                 }
             }
             AgentEvent::Compacted(c) => {
-                self.push_info(format!("(compacted {} earlier message(s))", c.removed_messages));
+                self.push_info(format!(
+                    "(compacted {} earlier message(s))",
+                    c.removed_messages
+                ));
             }
             AgentEvent::Cancelled => {
                 self.push_info("(cancelled)");
@@ -1629,13 +1732,19 @@ impl AppState {
                 // behind it still gets its own after-the-fact entry there).
                 self.todos = steps
                     .iter()
-                    .map(|s| TodoItem { text: s.description.clone(), done: false, active: false, duration: None })
+                    .map(|s| TodoItem {
+                        text: s.description.clone(),
+                        done: false,
+                        active: false,
+                        duration: None,
+                    })
                     .collect();
             }
             AgentEvent::PlanStepStarted { step } => {
                 self.push_info(format!("plan step {} · {}", step.id, step.description));
                 self.active_persona = step.persona.clone();
-                self.plan_step_started.insert(step.description.clone(), std::time::Instant::now());
+                self.plan_step_started
+                    .insert(step.description.clone(), std::time::Instant::now());
                 if let Some(t) = self.todos.iter_mut().find(|t| t.text == step.description) {
                     t.active = true;
                 }
@@ -1647,11 +1756,19 @@ impl AppState {
                 ));
             }
             AgentEvent::PlanStepDone { step, summary } => {
-                let elapsed = self.plan_step_started.remove(&step.description).map(|t| t.elapsed());
-                let timing = elapsed.map(|d| format!(" ({})", fmt_duration(d))).unwrap_or_default();
+                let elapsed = self
+                    .plan_step_started
+                    .remove(&step.description)
+                    .map(|t| t.elapsed());
+                let timing = elapsed
+                    .map(|d| format!(" ({})", fmt_duration(d)))
+                    .unwrap_or_default();
                 self.transcript.push(Block_::new(
                     Role::Tool,
-                    format!("step {} done{timing} · {}\n{}", step.id, step.description, summary),
+                    format!(
+                        "step {} done{timing} · {}\n{}",
+                        step.id, step.description, summary
+                    ),
                 ));
                 if let Some(t) = self.todos.iter_mut().find(|t| t.text == step.description) {
                     t.done = true;
@@ -1683,7 +1800,11 @@ impl AppState {
                     format!("lead reviewer did NOT accept\n{report}"),
                 ));
             }
-            AgentEvent::WorkflowStarted { id, description, phases } => {
+            AgentEvent::WorkflowStarted {
+                id,
+                description,
+                phases,
+            } => {
                 let roster = phases
                     .iter()
                     .map(|p| format!("{} [{}]", p.prompt, p.persona))
@@ -1691,13 +1812,17 @@ impl AppState {
                     .join(" → ");
                 self.push_info(format!("workflow '{id}' — {description}"));
                 self.transcript
-                    .push(Block_::new(Role::Info, format!("{roster}")));
+                    .push(Block_::new(Role::Info, roster.to_string()));
             }
             AgentEvent::WorkflowPhaseStarted { name, persona } => {
                 self.push_info(format!("▶ {name} [as {persona}]"));
                 self.active_persona = Some(persona);
             }
-            AgentEvent::WorkflowPhaseDone { name, persona, summary } => {
+            AgentEvent::WorkflowPhaseDone {
+                name,
+                persona,
+                summary,
+            } => {
                 self.transcript.push(Block_::new(
                     Role::Tool,
                     format!("phase · {name} [{persona}]\n{summary}"),
@@ -1739,10 +1864,8 @@ impl AppState {
             }
             AgentEvent::ReviewUncommitted { persona, report } => {
                 self.flush_current_reply();
-                self.transcript.push(Block_::new(
-                    Role::Info,
-                    format!("review ({persona})"),
-                ));
+                self.transcript
+                    .push(Block_::new(Role::Info, format!("review ({persona})")));
                 self.transcript.push(Block_::new(Role::Assistant, report));
             }
             AgentEvent::FeaturesSuggested { report } => {
@@ -1780,10 +1903,18 @@ impl AppState {
             let text = if self.todos.is_empty() {
                 format!("Complete {tool}")
             } else {
-                self.todos.last().map(|x| x.text.clone()).unwrap_or_default()
+                self.todos
+                    .last()
+                    .map(|x| x.text.clone())
+                    .unwrap_or_default()
             };
             if !self.todos.iter().any(|x| x.done && x.text == text) {
-                self.todos.push(TodoItem { text, done: true, active: false, duration: None });
+                self.todos.push(TodoItem {
+                    text,
+                    done: true,
+                    active: false,
+                    duration: None,
+                });
             }
         }
     }
@@ -1816,7 +1947,11 @@ impl AppState {
     /// uses (`transcript_block_rows`), just driving scroll instead of a
     /// clipboard copy.
     fn search_jump_to_current(&mut self) {
-        let Some(block_idx) = self.search.as_ref().and_then(|s| s.matches.get(s.current).copied()) else {
+        let Some(block_idx) = self
+            .search
+            .as_ref()
+            .and_then(|s| s.matches.get(s.current).copied())
+        else {
             return;
         };
         if let Some(&(start, _)) = self.transcript_block_rows.get(block_idx) {
@@ -1837,7 +1972,9 @@ impl AppState {
     }
 
     fn toggle_todo(&mut self, idx: usize) {
-        let Some(t) = self.todos.get_mut(idx) else { return };
+        let Some(t) = self.todos.get_mut(idx) else {
+            return;
+        };
         t.done = !t.done;
         if t.done {
             t.active = false;
@@ -1950,7 +2087,12 @@ fn load_favorites(config: &Config) -> Vec<(String, String)> {
         return Vec::new();
     };
     toml::from_str::<FavoritesFile>(&text)
-        .map(|f| f.favorites.into_iter().map(|e| (e.provider, e.model)).collect())
+        .map(|f| {
+            f.favorites
+                .into_iter()
+                .map(|e| (e.provider, e.model))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1959,7 +2101,10 @@ fn save_favorites(config: &Config, favorites: &[(String, String)]) {
     let file = FavoritesFile {
         favorites: favorites
             .iter()
-            .map(|(provider, model)| FavEntry { provider: provider.clone(), model: model.clone() })
+            .map(|(provider, model)| FavEntry {
+                provider: provider.clone(),
+                model: model.clone(),
+            })
             .collect(),
     };
     if let Ok(text) = toml::to_string_pretty(&file) {
@@ -1971,7 +2116,10 @@ fn save_favorites(config: &Config, favorites: &[(String, String)]) {
 }
 
 fn byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 fn insert_char_at(s: &mut String, char_idx: usize, c: char) {
@@ -2088,7 +2236,11 @@ mod theme {
     /// afterwards updates these same atomics directly, so a change applies
     /// immediately without a restart, the same way switching model/provider
     /// already does.
-    pub fn init_runtime(accent_hex: Option<&str>, reduced_motion: bool, notify_on_completion: bool) {
+    pub fn init_runtime(
+        accent_hex: Option<&str>,
+        reduced_motion: bool,
+        notify_on_completion: bool,
+    ) {
         if let Some(color) = accent_hex.and_then(parse_hex_color) {
             set_accent(color);
         }
@@ -2143,7 +2295,11 @@ mod theme {
         if packed == ACCENT_UNSET {
             VIOLET
         } else {
-            Color::Rgb(((packed >> 16) & 0xff) as u8, ((packed >> 8) & 0xff) as u8, (packed & 0xff) as u8)
+            Color::Rgb(
+                ((packed >> 16) & 0xff) as u8,
+                ((packed >> 8) & 0xff) as u8,
+                (packed & 0xff) as u8,
+            )
         }
     }
 
@@ -2220,7 +2376,13 @@ fn menu_height(matches: &[(&str, &str)]) -> u16 {
 /// highlight bar on the selected row (mirrors the HTML `.palette-item`
 /// rows: `.pc` command labels colored `--mode-color`, `.pd` descriptions
 /// dim, `.active` row tinted with the mode color).
-fn render_menu(f: &mut Frame, area: Rect, matches: &[(&str, &str)], selected: usize, accent: Color) -> Rect {
+fn render_menu(
+    f: &mut Frame,
+    area: Rect,
+    matches: &[(&str, &str)],
+    selected: usize,
+    accent: Color,
+) -> Rect {
     // Backdrop-dim, opaque fill, violet chrome, solid selection bar — the
     // same modal treatment as the picker family, since this is a real modal
     // (opened by typing "/" or ctrl+p) rather than a passive dropdown, even
@@ -2234,19 +2396,30 @@ fn render_menu(f: &mut Frame, area: Rect, matches: &[(&str, &str)], selected: us
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let name_width = matches.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max(8);
+    let name_width = matches
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
     let items: Vec<ListItem> = matches
         .iter()
         .map(|(name, desc)| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!("/{name:<name_width$}"), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("/{name:<name_width$}"),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled(desc.to_string(), placeholder_style()),
             ]))
         })
         .collect();
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::MODAL_SELECTED_BG).fg(theme::VOID).add_modifier(Modifier::BOLD),
+        Style::default()
+            .bg(theme::MODAL_SELECTED_BG)
+            .fg(theme::VOID)
+            .add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(selected.min(matches.len().saturating_sub(1))));
@@ -2327,7 +2500,10 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
         Line::from(Span::raw(state.input.clone()))
     } else if state.busy {
         Line::from(Span::styled(
-            format!("{} zeus is working… (you can type the next message)", spinner_glyph(state)),
+            format!(
+                "{} zeus is working… (you can type the next message)",
+                spinner_glyph(state)
+            ),
             placeholder_style(),
         ))
     } else {
@@ -2336,15 +2512,24 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
             Span::styled("\"Fix a TODO in the codebase\"", placeholder_style()),
         ])
     };
-    f.render_widget(Paragraph::new(input_line).wrap(Wrap { trim: false }), text_row);
+    f.render_widget(
+        Paragraph::new(input_line).wrap(Wrap { trim: false }),
+        text_row,
+    );
 
     // Mode · model provider — no send button, no caret; Enter is the only
     // way to send, same as it always was, just no longer advertised with a
     // dedicated button now that the box has no border to anchor one to.
     let status = Line::from(vec![
-        Span::styled(state.agent_mode.label(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            state.agent_mode.label(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" · ", theme::faint()),
-        Span::styled(state.model.clone(), theme::text().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            state.model.clone(),
+            theme::text().add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::styled(state.provider.clone(), theme::dim()),
     ]);
@@ -2360,7 +2545,9 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
         let typed_before: String = state.input.chars().take(state.cursor).collect();
         let wrapped_before = wrap_text(&typed_before, inner.width.max(1) as usize);
         let last_row = input_text_h.saturating_sub(1);
-        let row = (wrapped_before.len() as u16).saturating_sub(1).min(last_row);
+        let row = (wrapped_before.len() as u16)
+            .saturating_sub(1)
+            .min(last_row);
         let col = wrapped_before.last().map(|l| char_count(l)).unwrap_or(0) as u16;
         f.set_cursor_position((text_row.x + col, text_row.y + row));
     }
@@ -2457,7 +2644,12 @@ fn render_search_bar(f: &mut Frame, area: Rect, search: &SearchState) {
     } else if search.matches.is_empty() {
         format!("{}  ·  no matches", search.query)
     } else {
-        format!("{}  ·  {}/{}", search.query, search.current + 1, search.matches.len())
+        format!(
+            "{}  ·  {}/{}",
+            search.query,
+            search.current + 1,
+            search.matches.len()
+        )
     };
     let width = (label.chars().count() as u16 + 8).clamp(24, area.width.saturating_sub(4).max(24));
     let bar_area = Rect {
@@ -2474,14 +2666,20 @@ fn render_search_bar(f: &mut Frame, area: Rect, search: &SearchState) {
         .style(Style::default().bg(theme::PANEL))
         .title(Line::from(Span::styled(
             " find ",
-            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
         )))
         .title_bottom(
-            Line::from(Span::styled(" enter next · esc close ", theme::dim())).alignment(Alignment::Center),
+            Line::from(Span::styled(" enter next · esc close ", theme::dim()))
+                .alignment(Alignment::Center),
         );
     let inner = block.inner(bar_area);
     f.render_widget(block, bar_area);
-    f.render_widget(Paragraph::new(Line::from(Span::styled(label, theme::text()))), inner);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(label, theme::text()))),
+        inner,
+    );
 }
 
 /// The `/sessions` picker: saved conversations, arrow keys or click to
@@ -2514,8 +2712,11 @@ fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionPickerState)
             .alignment(Alignment::Right),
         )
         .title_bottom(
-            Line::from(Span::styled(" ↑/↓ navigate · enter resume · esc dismiss ", theme::dim()))
-                .alignment(Alignment::Center),
+            Line::from(Span::styled(
+                " ↑/↓ navigate · enter resume · esc dismiss ",
+                theme::dim(),
+            ))
+            .alignment(Alignment::Center),
         );
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -2555,7 +2756,10 @@ fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionPickerState)
         })
         .collect();
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::MODAL_SELECTED_BG).fg(theme::VOID).add_modifier(Modifier::BOLD),
+        Style::default()
+            .bg(theme::MODAL_SELECTED_BG)
+            .fg(theme::VOID)
+            .add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(picker.selected.min(filtered.len().saturating_sub(1))));
@@ -2585,7 +2789,12 @@ fn reset_conversation_view(state: &mut AppState) {
 /// `/sessions` picker's resume action. Restores the *context* the model
 /// continues from; it doesn't replay the old messages into the visible
 /// transcript (see `build_agent_repl_with_session`).
-async fn resume_session(session_id: String, config: &Config, agent_slot: &mut Option<Agent>, state: &mut AppState) {
+async fn resume_session(
+    session_id: String,
+    config: &Config,
+    agent_slot: &mut Option<Agent>,
+    state: &mut AppState,
+) {
     let result = build_agent_repl_with_session(
         config,
         Some(state.provider.clone()),
@@ -2601,7 +2810,9 @@ async fn resume_session(session_id: String, config: &Config, agent_slot: &mut Op
             state.provider = agent.provider_id().to_string();
             *agent_slot = Some(agent);
             reset_conversation_view(state);
-            state.push_info(format!("resumed session={session_id} — continuing from its saved context"));
+            state.push_info(format!(
+                "resumed session={session_id} — continuing from its saved context"
+            ));
         }
         Err(e) => state.push_error(format!("couldn't resume session '{session_id}': {e:#}")),
     }
@@ -2631,7 +2842,9 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     // not a full box border).
     let composer_inner_w = area.width.saturating_sub(3).max(10) as usize;
     let max_input_rows = (area.height / 3).clamp(6, 20) as usize;
-    let input_text_h = wrap_text(&state.input, composer_inner_w).len().clamp(1, max_input_rows) as u16;
+    let input_text_h = wrap_text(&state.input, composer_inner_w)
+        .len()
+        .clamp(1, max_input_rows) as u16;
     // +1 for the status row, +1 for a blank row of top padding — a
     // one-line-tall composer (the common case: a short command) otherwise
     // reads as barely a sliver next to the transcript above it.
@@ -2687,7 +2900,13 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     // drawn fresh and undimmed right next to a dimmed transcript.
     state.command_menu_area = if menu_h > 0 {
         let matches = state.command_matches();
-        Some(render_menu(f, rows[1], &matches, state.command_selected, mode_accent(state.agent_mode)))
+        Some(render_menu(
+            f,
+            rows[1],
+            &matches,
+            state.command_selected,
+            mode_accent(state.agent_mode),
+        ))
     } else {
         None
     };
@@ -2745,10 +2964,17 @@ fn render_key_entry_modal(f: &mut Frame, area: Rect, provider: &str, input: &str
     // same length as typed, so a long one (some provider tokens run past
     // 100 chars) needs the same wrap-and-grow treatment as any other input
     // box instead of running off the edge of a fixed single-line field.
-    let key_display_len = if input.is_empty() { 0 } else { char_count(input) };
-    let input_text_h = wrap_text(&"x".repeat(key_display_len), (width as usize).saturating_sub(6).max(10))
-        .len()
-        .clamp(1, 5) as u16;
+    let key_display_len = if input.is_empty() {
+        0
+    } else {
+        char_count(input)
+    };
+    let input_text_h = wrap_text(
+        &"x".repeat(key_display_len),
+        (width as usize).saturating_sub(6).max(10),
+    )
+    .len()
+    .clamp(1, 5) as u16;
     // title, blank, blurb lines, blank, url line (if any), blank, input box (border×2 + text), blank, footer
     let height = (3 + blurb_lines + if url.is_some() { 2 } else { 0 } + 4 + input_text_h as usize)
         .clamp(9, area.height.saturating_sub(4).max(9) as usize) as u16;
@@ -2823,12 +3049,17 @@ fn render_key_entry_modal(f: &mut Frame, area: Rect, provider: &str, input: &str
     f.render_widget(input_block, rows[r]);
     if input.is_empty() {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled("paste or type your key…", placeholder_style()))),
+            Paragraph::new(Line::from(Span::styled(
+                "paste or type your key…",
+                placeholder_style(),
+            ))),
             input_inner,
         );
     } else {
         f.render_widget(
-            Paragraph::new(mask_secret(input)).style(theme::text()).wrap(Wrap { trim: false }),
+            Paragraph::new(mask_secret(input))
+                .style(theme::text())
+                .wrap(Wrap { trim: false }),
             input_inner,
         );
     }
@@ -2891,7 +3122,12 @@ fn render_approval_modal(f: &mut Frame, area: Rect, pending: &ApprovalRequestMsg
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("Allow {}?", req.description),
@@ -2976,7 +3212,10 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> 
         .iter()
         .flat_map(|s| {
             let style = s.style;
-            s.content.chars().map(move |c| (c, style)).collect::<Vec<_>>()
+            s.content
+                .chars()
+                .map(move |c| (c, style))
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -3002,7 +3241,7 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> 
     let mut lines: Vec<Vec<(char, Style)>> = Vec::new();
     let mut current: Vec<(char, Style)> = Vec::new();
     for word in words {
-        if current.len() > 0 && current.len() + 1 + word.len() > width {
+        if !current.is_empty() && current.len() + 1 + word.len() > width {
             lines.push(std::mem::take(&mut current));
         }
         if !current.is_empty() {
@@ -3069,6 +3308,7 @@ const PICKER_MAX_H: u16 = 20;
 /// arrow keys or a mouse click/scroll to navigate, Enter or a click to
 /// select, Esc to close without changing anything. Modeled after opencode's
 /// own "Select model" popup.
+#[allow(clippy::too_many_arguments)] // single call-site UI modal; grouping has no reuse
 fn render_model_picker(
     f: &mut Frame,
     area: Rect,
@@ -3112,7 +3352,12 @@ fn render_model_picker(
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
     let search_line = if search.is_empty() {
         Line::from(vec![
             Span::styled("▸ ", theme::violet()),
@@ -3142,7 +3387,9 @@ fn render_model_picker(
             ])),
             PickerEntry::Model { provider, model } => {
                 let is_current = model.id == current_model && provider == current_provider;
-                let is_fav = favorites.iter().any(|(p, m)| p == provider && m == &model.id);
+                let is_fav = favorites
+                    .iter()
+                    .any(|(p, m)| p == provider && m == &model.id);
                 let marker = if is_current { "● " } else { "  " };
                 let marker_style = theme::gold().add_modifier(Modifier::BOLD);
                 let star = if is_fav { "★ " } else { "" };
@@ -3159,21 +3406,37 @@ fn render_model_picker(
                 }
                 if free {
                     meta_parts.push("Free".to_string());
-                } else if let Some((prompt_rate, completion_rate)) = cost_per_million_tokens(provider, &model.id) {
-                    meta_parts.push(format!("${}/${}", fmt_price(prompt_rate), fmt_price(completion_rate)));
+                } else if let Some((prompt_rate, completion_rate)) =
+                    cost_per_million_tokens(provider, &model.id)
+                {
+                    meta_parts.push(format!(
+                        "${}/${}",
+                        fmt_price(prompt_rate),
+                        fmt_price(completion_rate)
+                    ));
                 }
                 let tag = meta_parts.join("  ·  ");
-                let left_w = char_count(marker) + char_count(star) + char_count(&model.name) + char_count(&provider_suffix);
+                let left_w = char_count(marker)
+                    + char_count(star)
+                    + char_count(&model.name)
+                    + char_count(&provider_suffix);
                 let pad_w = inner_w.saturating_sub(left_w + char_count(&tag)).max(1);
                 let mut spans = vec![
                     Span::styled(marker, marker_style),
                     Span::styled(star, theme::gold()),
-                    Span::styled(model.name.clone(), theme::text().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        model.name.clone(),
+                        theme::text().add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(provider_suffix, theme::dim()),
                 ];
                 if !tag.is_empty() {
                     spans.push(Span::raw(" ".repeat(pad_w)));
-                    let tag_style = if free { theme::gold().add_modifier(Modifier::BOLD) } else { theme::faint() };
+                    let tag_style = if free {
+                        theme::gold().add_modifier(Modifier::BOLD)
+                    } else {
+                        theme::faint()
+                    };
                     spans.push(Span::styled(tag, tag_style));
                 }
                 ListItem::new(Line::from(spans))
@@ -3184,7 +3447,10 @@ fn render_model_picker(
     // the reference product's own selection style, instead of a subtle
     // panel-tint + colored-text highlight.
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::MODAL_SELECTED_BG).fg(theme::VOID).add_modifier(Modifier::BOLD),
+        Style::default()
+            .bg(theme::MODAL_SELECTED_BG)
+            .fg(theme::VOID)
+            .add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(selected.min(filtered.len().saturating_sub(1))));
@@ -3209,7 +3475,10 @@ fn render_provider_picker(
         .clamp(8, area.height.saturating_sub(4).max(8));
     let popup = centered_rect(width, height, area);
 
-    let provider_count = entries.iter().filter(|e| matches!(e, ProviderEntry::Provider { .. })).count();
+    let provider_count = entries
+        .iter()
+        .filter(|e| matches!(e, ProviderEntry::Provider { .. }))
+        .count();
 
     f.render_widget(Clear, popup);
     let corner = Line::from(vec![
@@ -3226,13 +3495,12 @@ fn render_provider_picker(
         .border_type(BorderType::Rounded)
         .border_style(border_style())
         .style(Style::default().bg(theme::MODAL_BG))
-        .title(Line::from(vec![
-            Span::styled(" Select provider ", theme::text().add_modifier(Modifier::BOLD)),
-        ]))
+        .title(Line::from(vec![Span::styled(
+            " Select provider ",
+            theme::text().add_modifier(Modifier::BOLD),
+        )]))
         .title(corner)
-        .title_bottom(
-            Line::from(Span::styled(footer, theme::dim())).alignment(Alignment::Center),
-        );
+        .title_bottom(Line::from(Span::styled(footer, theme::dim())).alignment(Alignment::Center));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -3271,7 +3539,10 @@ fn render_provider_picker(
         })
         .collect();
     let list = List::new(items).highlight_style(
-        Style::default().bg(theme::MODAL_SELECTED_BG).fg(theme::VOID).add_modifier(Modifier::BOLD),
+        Style::default()
+            .bg(theme::MODAL_SELECTED_BG)
+            .fg(theme::VOID)
+            .add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
     list_state.select(Some(selected.min(entries.len().saturating_sub(1))));
@@ -3320,7 +3591,10 @@ fn gradient_wordmark(text: &str) -> Vec<Span<'static>> {
             } else {
                 lerp_color(theme::WORDMARK_MID, theme::WORDMARK_END, (t - 0.52) / 0.48)
             };
-            Span::styled(c.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD))
+            Span::styled(
+                c.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
         })
         .collect()
 }
@@ -3337,9 +3611,15 @@ fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, _config: &Config) 
     // `reduced_motion = true` in settings.toml swaps it for plain static
     // text instead — a redraw every tick isn't welcome on every link
     // (slow SSH), and some people just don't want a pulsing CLI.
-    let mut logo_spans = vec![Span::styled("⚡ ", theme::violet().add_modifier(Modifier::BOLD))];
+    let mut logo_spans = vec![Span::styled(
+        "⚡ ",
+        theme::violet().add_modifier(Modifier::BOLD),
+    )];
     if theme::reduced_motion() {
-        logo_spans.push(Span::styled("ZEUS", theme::text().add_modifier(Modifier::BOLD)));
+        logo_spans.push(Span::styled(
+            "ZEUS",
+            theme::text().add_modifier(Modifier::BOLD),
+        ));
     } else {
         let t = state.started.elapsed().as_millis();
         logo_spans.extend(super::decor::animated_wordmark("ZEUS", t));
@@ -3510,7 +3790,10 @@ fn render_progress(f: &mut Frame, area: Rect, done: usize, total: usize, accent:
             } else {
                 1.0
             };
-            spans.push(Span::styled("█", Style::default().fg(lerp_color(theme::accent(), accent, t))));
+            spans.push(Span::styled(
+                "█",
+                Style::default().fg(lerp_color(theme::accent(), accent, t)),
+            ));
         } else {
             spans.push(Span::styled("·", theme::faint()));
         }
@@ -3522,9 +3805,10 @@ fn render_todos(f: &mut Frame, area: Rect, state: &AppState) {
     let accent = mode_accent(state.agent_mode);
     let mut lines = Vec::new();
     if state.todos.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  no tasks yet — ask Zeus to fix something", theme::faint()),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "  no tasks yet — ask Zeus to fix something",
+            theme::faint(),
+        )]));
         f.render_widget(Paragraph::new(lines), area);
         return;
     }
@@ -3536,8 +3820,14 @@ fn render_todos(f: &mut Frame, area: Rect, state: &AppState) {
         // another differently-colored checkbox row.
         let mut spans = if item.active {
             vec![
-                Span::styled("◆ ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-                Span::styled(item.text.clone(), theme::text().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "◆ ",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    item.text.clone(),
+                    theme::text().add_modifier(Modifier::BOLD),
+                ),
             ]
         } else {
             let box_mark = if item.done { "✓" } else { " " };
@@ -3550,7 +3840,9 @@ fn render_todos(f: &mut Frame, area: Rect, state: &AppState) {
                 theme::faint()
             };
             let label_style = if item.done {
-                Style::default().fg(theme::FAINT).add_modifier(Modifier::CROSSED_OUT)
+                Style::default()
+                    .fg(theme::FAINT)
+                    .add_modifier(Modifier::CROSSED_OUT)
             } else {
                 theme::text()
             };
@@ -3563,7 +3855,10 @@ fn render_todos(f: &mut Frame, area: Rect, state: &AppState) {
             ]
         };
         if let Some(d) = item.duration {
-            spans.push(Span::styled(format!("  {}", fmt_duration(d)), theme::faint()));
+            spans.push(Span::styled(
+                format!("  {}", fmt_duration(d)),
+                theme::faint(),
+            ));
         }
         lines.push(Line::from(spans));
     }
@@ -3727,7 +4022,6 @@ fn model_picker_filtered(entries: &[PickerEntry], search: &str) -> Vec<PickerEnt
         .collect()
 }
 
-
 /// The provider dot in the top-right button and pickers: green when the
 fn provider_status_ok(config: &Config, provider: &str) -> bool {
     let Some(cfg) = config.providers.get(provider) else {
@@ -3773,7 +4067,10 @@ fn opaque(f: &mut Frame, area: Rect) {
     // glyphs, so stale content underneath would otherwise show through
     // tinted rather than covered. `Clear` actually resets the cells first.
     f.render_widget(Clear, area);
-    f.render_widget(Block::default().style(Style::default().bg(theme::INK)), area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::INK)),
+        area,
+    );
 }
 
 /// The full-screen empty-state splash — `zeus-empty-state.html` reproduced
@@ -3787,7 +4084,10 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     // Plain `--ink` background — no animated network (removed: the braille
     // particle simulation redrawing every tick was a real, measurable
     // source of lag for little payoff on a screen that's mostly text).
-    f.render_widget(Block::default().style(Style::default().bg(theme::INK)), area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::INK)),
+        area,
+    );
 
     // Composer sizing computed up front, before `total_h` — the vertical
     // centering below needs the composer's *real* height (it grows with
@@ -3814,8 +4114,10 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
         .into_iter()
         .map(|(n, d)| (n.to_string(), d.to_string()))
         .collect();
-    let palette_refs: Vec<(&str, &str)> =
-        palette_matches.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+    let palette_refs: Vec<(&str, &str)> = palette_matches
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .collect();
     let menu_h = menu_height(&palette_refs);
 
     // ---- Centered content stack ----
@@ -3826,8 +4128,18 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     const HINT_H: u16 = 1;
     const GAP: u16 = 1;
     let menu_reserved_h = if menu_h > 0 { menu_h + GAP } else { 0 };
-    let total_h = STATUS_H + GAP + BANNER_H + GAP + QUESTION_H + GAP + composer_h + GAP
-        + menu_reserved_h + CHIPS_H + GAP + HINT_H;
+    let total_h = STATUS_H
+        + GAP
+        + BANNER_H
+        + GAP
+        + QUESTION_H
+        + GAP
+        + composer_h
+        + GAP
+        + menu_reserved_h
+        + CHIPS_H
+        + GAP
+        + HINT_H;
     let mut y = area.y + (area.height.saturating_sub(total_h)) / 2;
 
     // Status eyebrow: pulsing dot (mirrors the CSS `ping` keyframe) +
@@ -3884,7 +4196,8 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     let question_area = centered_row(area, y, QUESTION_H, question.chars().count() as u16 + 2);
     opaque(f, question_area);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(question, theme::muted()))).alignment(Alignment::Center),
+        Paragraph::new(Line::from(Span::styled(question, theme::muted())))
+            .alignment(Alignment::Center),
         question_area,
     );
     y += QUESTION_H + GAP;
@@ -3907,29 +4220,48 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
         .style(Style::default().bg(theme::INK));
     let composer_inner = composer_block.inner(composer_area);
     f.render_widget(composer_block, composer_area);
-    let cols = Layout::horizontal([Constraint::Length(2), Constraint::Min(0), Constraint::Length(3)]).split(composer_inner);
-    f.render_widget(Paragraph::new(Span::styled("›", theme::teal().add_modifier(Modifier::BOLD))), cols[0]);
+    let cols = Layout::horizontal([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(3),
+    ])
+    .split(composer_inner);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "›",
+            theme::teal().add_modifier(Modifier::BOLD),
+        )),
+        cols[0],
+    );
     let input_line = if state.input.is_empty() {
         Paragraph::new(Line::from(Span::styled(
             "Describe a task, or paste a file path…",
             theme::empty_faint(),
         )))
     } else {
-        Paragraph::new(Text::from(state.input.clone()).style(theme::text())).wrap(Wrap { trim: false })
+        Paragraph::new(Text::from(state.input.clone()).style(theme::text()))
+            .wrap(Wrap { trim: false })
     };
     f.render_widget(input_line, cols[1]);
     let send_style = if ready {
         // The lit-up half of the HTML's teal→cyan send-button gradient.
-        Style::default().fg(theme::EMPTY_CYAN).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme::EMPTY_CYAN)
+            .add_modifier(Modifier::BOLD)
     } else {
         theme::empty_faint()
     };
-    f.render_widget(Paragraph::new(Span::styled("➜", send_style)).alignment(Alignment::Right), cols[2]);
+    f.render_widget(
+        Paragraph::new(Span::styled("➜", send_style)).alignment(Alignment::Right),
+        cols[2],
+    );
     if matches!(state.mode, Mode::Chat) && !state.busy {
         let typed_before: String = state.input.chars().take(state.cursor).collect();
         let wrapped_before = wrap_text(&typed_before, composer_text_w);
         let last_row = composer_text_h.saturating_sub(1);
-        let cursor_row = (wrapped_before.len() as u16).saturating_sub(1).min(last_row);
+        let cursor_row = (wrapped_before.len() as u16)
+            .saturating_sub(1)
+            .min(last_row);
         let cursor_col = wrapped_before.last().map(|l| char_count(l)).unwrap_or(0) as u16;
         f.set_cursor_position((cols[1].x + cursor_col, cols[1].y + cursor_row));
     }
@@ -3961,14 +4293,22 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
         let label = format!("[ {chip} ]");
         let w = label.chars().count() as u16;
         spans.push(Span::styled(label, theme::dim()));
-        areas.push(Rect { x: col, y, width: w, height: 1 });
+        areas.push(Rect {
+            x: col,
+            y,
+            width: w,
+            height: 1,
+        });
         col += w;
         if i < EXAMPLE_CHIPS.len() - 1 {
             spans.push(Span::styled(gap, theme::faint()));
             col += gap.chars().count() as u16;
         }
     }
-    f.render_widget(Paragraph::new(Line::from(spans)).alignment(Alignment::Center), chips_area);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+        chips_area,
+    );
     state.chip_areas = areas;
     y += CHIPS_H + GAP;
 
@@ -3977,7 +4317,8 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     let hint_area = centered_row(area, y, HINT_H, hint.chars().count() as u16 + 2);
     opaque(f, hint_area);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, theme::empty_faint()))).alignment(Alignment::Center),
+        Paragraph::new(Line::from(Span::styled(hint, theme::empty_faint())))
+            .alignment(Alignment::Center),
         hint_area,
     );
 
@@ -3995,7 +4336,10 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     state.chip_areas.clear();
 
     // Fill the whole frame with the void background first.
-    f.render_widget(Block::default().style(Style::default().bg(theme::VOID)), area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::VOID)),
+        area,
+    );
 
     let rows = Layout::vertical([Constraint::Length(TOPBAR_H), Constraint::Min(0)]).split(area);
 
@@ -4019,7 +4363,10 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     render_chat_column(f, main[0], state);
 
     if has_side {
-        let divider = vec![Line::from(Span::styled("│", Style::default().fg(theme::BORDER))); main[2].height as usize];
+        let divider = vec![
+            Line::from(Span::styled("│", Style::default().fg(theme::BORDER)));
+            main[2].height as usize
+        ];
         f.render_widget(Paragraph::new(divider), main[2]);
         let list_area = render_side(f, main[3], state);
         state.todo_area = Some(list_area);
@@ -4033,7 +4380,10 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     // footprint on top, so it doesn't matter that this dims that area too.
     let any_modal_open = matches!(
         state.mode,
-        Mode::ModelPicker { .. } | Mode::ProviderPicker { .. } | Mode::KeyEntry { .. } | Mode::Approval(_)
+        Mode::ModelPicker { .. }
+            | Mode::ProviderPicker { .. }
+            | Mode::KeyEntry { .. }
+            | Mode::Approval(_)
     ) || state.session_picker.is_some();
     if any_modal_open {
         dim_backdrop(f, area);
@@ -4055,18 +4405,17 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     };
     state.model_picker_area = picker_area;
 
-    let provider_picker_area =
-        if let Mode::ProviderPicker { entries, selected } = &state.mode {
-            Some(render_provider_picker(
-                f,
-                area,
-                &state.provider,
-                entries,
-                *selected,
-            ))
-        } else {
-            None
-        };
+    let provider_picker_area = if let Mode::ProviderPicker { entries, selected } = &state.mode {
+        Some(render_provider_picker(
+            f,
+            area,
+            &state.provider,
+            entries,
+            *selected,
+        ))
+    } else {
+        None
+    };
     state.provider_picker_area = provider_picker_area;
 
     if let Mode::KeyEntry { provider } = &state.mode {
@@ -4078,7 +4427,9 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
         // row/col for a key long enough to have wrapped onto later rows.
         let wrapped_before = wrap_text(&"x".repeat(state.cursor), input_rect.width.max(1) as usize);
         let last_row = input_rect.height.saturating_sub(1);
-        let cursor_row = (wrapped_before.len() as u16).saturating_sub(1).min(last_row);
+        let cursor_row = (wrapped_before.len() as u16)
+            .saturating_sub(1)
+            .min(last_row);
         let cursor_col = wrapped_before.last().map(|l| char_count(l)).unwrap_or(0) as u16;
         f.set_cursor_position((input_rect.x + cursor_col, input_rect.y + cursor_row));
     }
@@ -4386,6 +4737,7 @@ fn start_suggest_turn(
 }
 
 /// `/workflow <name> <goal>`: run a declarative multi-specialist pipeline.
+#[allow(clippy::too_many_arguments)] // app plumbing + workflow args at a single call site
 fn start_workflow_turn(
     state: &mut AppState,
     agent_slot: &mut Option<Agent>,
@@ -4447,7 +4799,9 @@ async fn handle_key(
         let decision = match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalDecision::Approved),
             KeyCode::Char('s') | KeyCode::Char('S') => Some(ApprovalDecision::ApprovedForSession),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(ApprovalDecision::Denied),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                Some(ApprovalDecision::Denied)
+            }
             _ => None,
         };
         if let Some(decision) = decision {
@@ -4476,7 +4830,9 @@ async fn handle_key(
                 }
             }
             KeyCode::Enter => {
-                let id = session_picker_filtered(picker).get(picker.selected).map(|s| s.id.clone());
+                let id = session_picker_filtered(picker)
+                    .get(picker.selected)
+                    .map(|s| s.id.clone());
                 state.session_picker = None;
                 if let Some(id) = id {
                     resume_session(id, config, agent_slot, state).await;
@@ -4538,7 +4894,11 @@ async fn handle_key(
         && key.code == KeyCode::Char('f')
         && key.modifiers.contains(KeyModifiers::CONTROL)
     {
-        state.search = Some(SearchState { query: String::new(), matches: Vec::new(), current: 0 });
+        state.search = Some(SearchState {
+            query: String::new(),
+            matches: Vec::new(),
+            current: 0,
+        });
         return Ok(());
     }
 
@@ -4551,7 +4911,9 @@ async fn handle_key(
             return Ok(());
         }
         if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            let Mode::ModelPicker { entries, selected } = &state.mode else { unreachable!() };
+            let Mode::ModelPicker { entries, selected } = &state.mode else {
+                unreachable!()
+            };
             let filtered = model_picker_filtered(entries, &state.model_picker_search);
             if let Some(PickerEntry::Model { provider, model }) = filtered.get(*selected) {
                 let (provider, model_id) = (provider.clone(), model.id.clone());
@@ -4561,17 +4923,23 @@ async fn handle_key(
         }
         match key.code {
             KeyCode::Up => {
-                let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                let Mode::ModelPicker { entries, selected } = &mut state.mode else {
+                    unreachable!()
+                };
                 let filtered = model_picker_filtered(entries, &state.model_picker_search);
                 *selected = picker_move(&filtered, *selected, -1);
             }
             KeyCode::Down => {
-                let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                let Mode::ModelPicker { entries, selected } = &mut state.mode else {
+                    unreachable!()
+                };
                 let filtered = model_picker_filtered(entries, &state.model_picker_search);
                 *selected = picker_move(&filtered, *selected, 1);
             }
             KeyCode::Enter => {
-                let Mode::ModelPicker { entries, selected } = &state.mode else { unreachable!() };
+                let Mode::ModelPicker { entries, selected } = &state.mode else {
+                    unreachable!()
+                };
                 let filtered = model_picker_filtered(entries, &state.model_picker_search);
                 let chosen = match filtered.get(*selected) {
                     Some(PickerEntry::Model { provider, model }) => {
@@ -4591,13 +4959,17 @@ async fn handle_key(
             }
             KeyCode::Backspace => {
                 state.model_picker_search.pop();
-                let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                let Mode::ModelPicker { entries, selected } = &mut state.mode else {
+                    unreachable!()
+                };
                 let filtered = model_picker_filtered(entries, &state.model_picker_search);
                 *selected = first_selectable_picker(&filtered);
             }
             KeyCode::Char(c) => {
                 state.model_picker_search.push(c);
-                let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                let Mode::ModelPicker { entries, selected } = &mut state.mode else {
+                    unreachable!()
+                };
                 let filtered = model_picker_filtered(entries, &state.model_picker_search);
                 *selected = first_selectable_picker(&filtered);
             }
@@ -4609,15 +4981,21 @@ async fn handle_key(
     if let Mode::ProviderPicker { .. } = &state.mode {
         match key.code {
             KeyCode::Up => {
-                let Mode::ProviderPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                let Mode::ProviderPicker { entries, selected } = &mut state.mode else {
+                    unreachable!()
+                };
                 *selected = provider_picker_move(entries, *selected, -1);
             }
             KeyCode::Down => {
-                let Mode::ProviderPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                let Mode::ProviderPicker { entries, selected } = &mut state.mode else {
+                    unreachable!()
+                };
                 *selected = provider_picker_move(entries, *selected, 1);
             }
             KeyCode::Enter => {
-                let Mode::ProviderPicker { entries, selected } = &state.mode else { unreachable!() };
+                let Mode::ProviderPicker { entries, selected } = &state.mode else {
+                    unreachable!()
+                };
                 match entries.get(*selected) {
                     Some(ProviderEntry::Provider { name, ready, .. }) => {
                         let (name, ready) = (name.clone(), *ready);
@@ -4640,7 +5018,9 @@ async fn handle_key(
         match key.code {
             KeyCode::Enter => {
                 let Mode::KeyEntry { provider } = std::mem::replace(&mut state.mode, Mode::Chat)
-                    else { unreachable!() };
+                else {
+                    unreachable!()
+                };
                 let key = std::mem::take(&mut state.input);
                 state.cursor = 0;
                 let key = key.trim().to_string();
@@ -4752,7 +5132,8 @@ async fn handle_key(
                     state.input.clear();
                     state.cursor = 0;
                     state.push_user(trimmed.clone());
-                    state.push_info("queued — will send once the current turn finishes".to_string());
+                    state
+                        .push_info("queued — will send once the current turn finishes".to_string());
                     state.queued_messages.push_back(trimmed);
                 }
             }
@@ -4830,7 +5211,15 @@ async fn handle_key(
                 // there's nothing existing to conflict with.
                 if let Some(goal) = state.pending_plan_goal.take() {
                     state.push_info(format!("running plan: {goal}"));
-                    start_orchestrate_turn(state, agent_slot, turn_handle, cancel_tx, ui_tx, goal, yes);
+                    start_orchestrate_turn(
+                        state,
+                        agent_slot,
+                        turn_handle,
+                        cancel_tx,
+                        ui_tx,
+                        goal,
+                        yes,
+                    );
                 }
                 return Ok(());
             }
@@ -4854,9 +5243,12 @@ async fn handle_key(
                 match cmd {
                     "help" => state.push_info(print_repl_help_lines()),
                     "clear" => {
-                        let agent =
-                            build_agent_repl_with(config, Some(state.provider.clone()), Some(state.model.clone()))
-                                .await?;
+                        let agent = build_agent_repl_with(
+                            config,
+                            Some(state.provider.clone()),
+                            Some(state.model.clone()),
+                        )
+                        .await?;
                         apply_agent_mode(&agent, state.agent_mode);
                         state.session_id = agent.session_id().to_string();
                         state.model = agent.model().to_string();
@@ -4866,9 +5258,12 @@ async fn handle_key(
                         state.push_info(format!("cleared — new session={}", state.session_id));
                     }
                     "new" => {
-                        let agent =
-                            build_agent_repl_with(config, Some(state.provider.clone()), Some(state.model.clone()))
-                                .await?;
+                        let agent = build_agent_repl_with(
+                            config,
+                            Some(state.provider.clone()),
+                            Some(state.model.clone()),
+                        )
+                        .await?;
                         apply_agent_mode(&agent, state.agent_mode);
                         state.session_id = agent.session_id().to_string();
                         state.model = agent.model().to_string();
@@ -4933,7 +5328,9 @@ async fn handle_key(
                             let git = git_engine_for_agent(config, agent);
                             let staged = arg.eq_ignore_ascii_case("staged");
                             match git.diff(staged, &[]) {
-                                Ok(out) if out.stdout.trim().is_empty() => state.push_info("(no changes)"),
+                                Ok(out) if out.stdout.trim().is_empty() => {
+                                    state.push_info("(no changes)")
+                                }
                                 Ok(out) => state.push_info(out.stdout),
                                 Err(e) => state.push_error(format!("diff failed: {e}")),
                             }
@@ -4943,7 +5340,11 @@ async fn handle_key(
                         if let Some(agent) = agent_slot.as_ref() {
                             let ws = agent.workspace();
                             let turn_id = ws.files.turn_id.clone();
-                            let snaps = ws.files.checkpoints.load_snapshots(&turn_id).unwrap_or_default();
+                            let snaps = ws
+                                .files
+                                .checkpoints
+                                .load_snapshots(&turn_id)
+                                .unwrap_or_default();
                             if snaps.is_empty() {
                                 state.push_info("(nothing to undo this session)");
                             } else if arg.eq_ignore_ascii_case("confirm") {
@@ -5051,9 +5452,11 @@ async fn handle_key(
                                 let tx = ui_tx.clone();
                                 tokio::spawn(async move {
                                     let groups = list_models_by_provider(&cfg).await;
-                                    let (entries, selected) =
-                                        build_model_picker_entries(&groups, &provider, &model, &recent, &favorites);
-                                    let _ = tx.send(UiEvent::ModelPickerReady(entries, selected, groups));
+                                    let (entries, selected) = build_model_picker_entries(
+                                        &groups, &provider, &model, &recent, &favorites,
+                                    );
+                                    let _ = tx
+                                        .send(UiEvent::ModelPickerReady(entries, selected, groups));
                                 });
                             }
                         } else if let Some(agent) = agent_slot.as_mut() {
@@ -5069,12 +5472,14 @@ async fn handle_key(
                     "sessions" => {
                         let store = SessionStore::new(config.global.sessions.clone());
                         match store.summaries() {
-                            Ok(entries) if entries.is_empty() => state.push_info(
-                                "no saved sessions yet — send a message to create one",
-                            ),
+                            Ok(entries) if entries.is_empty() => state
+                                .push_info("no saved sessions yet — send a message to create one"),
                             Ok(entries) => {
-                                state.session_picker =
-                                    Some(SessionPickerState { entries, selected: 0, search: String::new() });
+                                state.session_picker = Some(SessionPickerState {
+                                    entries,
+                                    selected: 0,
+                                    search: String::new(),
+                                });
                             }
                             Err(e) => state.push_error(format!("couldn't list sessions: {e:#}")),
                         }
@@ -5082,7 +5487,8 @@ async fn handle_key(
                     "understand" => {
                         if arg.is_empty() {
                             state.push_error(
-                                "usage: /understand <topic> — e.g. /understand authentication".to_string(),
+                                "usage: /understand <topic> — e.g. /understand authentication"
+                                    .to_string(),
                             );
                         } else {
                             state.push_user(trimmed.clone());
@@ -5115,7 +5521,8 @@ async fn handle_key(
                             let total: usize = pools.iter().map(|(_, list)| list.len()).sum();
                             state.push_info(format!("{total} specialist agents"));
                         } else {
-                            let mut text = String::from("Specialist agent pool (grouped by department):");
+                            let mut text =
+                                String::from("Specialist agent pool (grouped by department):");
                             for (dept, people) in personas_by_department() {
                                 text.push_str(&format!("\n  {}:", dept));
                                 for p in people {
@@ -5225,7 +5632,8 @@ async fn handle_key(
                         let rest = parts.next().unwrap_or("").trim();
                         if rest.is_empty() {
                             state.push_error(
-                                "usage: /bg <goal> — run an orchestrated plan in the background".to_string(),
+                                "usage: /bg <goal> — run an orchestrated plan in the background"
+                                    .to_string(),
                             );
                         } else if matches!(rest, "list" | "output" | "stop" | "pause" | "resume") {
                             state.push_info(
@@ -5256,7 +5664,15 @@ async fn handle_key(
                         let expanded = expand_slash_command(config, trimmed.clone());
                         if expanded != trimmed {
                             state.push_user(trimmed.clone());
-                            start_turn(state, agent_slot, turn_handle, cancel_tx, ui_tx, expanded, yes);
+                            start_turn(
+                                state,
+                                agent_slot,
+                                turn_handle,
+                                cancel_tx,
+                                ui_tx,
+                                expanded,
+                                yes,
+                            );
                         } else {
                             state.push_error(format!("unknown command: /{cmd}"));
                         }
@@ -5277,7 +5693,15 @@ async fn handle_key(
                 return Ok(());
             }
             state.push_user(trimmed.clone());
-            start_turn(state, agent_slot, turn_handle, cancel_tx, ui_tx, trimmed, yes);
+            start_turn(
+                state,
+                agent_slot,
+                turn_handle,
+                cancel_tx,
+                ui_tx,
+                trimmed,
+                yes,
+            );
         }
         KeyCode::Backspace => {
             if state.cursor > 0 {
@@ -5331,7 +5755,11 @@ async fn handle_key(
             state.command_selected = 0;
         }
         KeyCode::PageUp | KeyCode::PageDown => {
-            let step = state.transcript_area.map(|a| a.height.saturating_sub(2)).unwrap_or(10).max(1);
+            let step = state
+                .transcript_area
+                .map(|a| a.height.saturating_sub(2))
+                .unwrap_or(10)
+                .max(1);
             state.scroll_transcript(key.code == KeyCode::PageUp, step);
         }
         _ => {}
@@ -5354,9 +5782,11 @@ async fn handle_mouse(
         let row = ev.row;
 
         // Empty-state example chips: click one to fill the composer.
-        if let Some(idx) = state.chip_areas.iter().position(|a| {
-            col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height
-        }) {
+        if let Some(idx) = state
+            .chip_areas
+            .iter()
+            .position(|a| col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height)
+        {
             if let Some(label) = EXAMPLE_CHIPS.get(idx) {
                 state.input = label.to_string();
                 state.cursor = char_count(&state.input);
@@ -5368,7 +5798,11 @@ async fn handle_mouse(
         // pressing Enter/Tab on the highlighted entry — fills the input
         // ready for arguments rather than sending immediately.
         if let Some(area) = state.command_menu_area {
-            if col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height {
+            if col >= area.x
+                && col < area.x + area.width
+                && row >= area.y
+                && row < area.y + area.height
+            {
                 let idx = (row - area.y) as usize;
                 let name = state.command_matches().get(idx).map(|(n, _)| n.to_string());
                 if let Some(name) = name {
@@ -5383,7 +5817,11 @@ async fn handle_mouse(
         // Session-resume picker: click a row to resume it immediately —
         // same click-to-choose interaction as the model picker.
         if let Some(area) = state.session_picker_area {
-            if col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height {
+            if col >= area.x
+                && col < area.x + area.width
+                && row >= area.y
+                && row < area.y + area.height
+            {
                 let idx = (row - area.y) as usize;
                 let session_id = state
                     .session_picker
@@ -5402,7 +5840,11 @@ async fn handle_mouse(
         // single most recent reply, with no way to reach back further.
         if matches!(state.mode, Mode::Chat) {
             if let Some(area) = state.transcript_area {
-                if col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height {
+                if col >= area.x
+                    && col < area.x + area.width
+                    && row >= area.y
+                    && row < area.y + area.height
+                {
                     let clicked_row = (row - area.y) + state.transcript_applied_scroll;
                     let hit = state
                         .transcript_block_rows
@@ -5434,7 +5876,6 @@ async fn handle_mouse(
                 }
             }
         }
-
 
         // Click a TODO row to toggle it (progress bar fills in live).
         if let Some(ta) = state.todo_area {
@@ -5511,21 +5952,29 @@ async fn handle_mouse(
                         && ev.row < area.y + area.height
                     {
                         let row = (ev.row - area.y) as usize;
-                        let Mode::ModelPicker { entries, .. } = &state.mode else { unreachable!() };
+                        let Mode::ModelPicker { entries, .. } = &state.mode else {
+                            unreachable!()
+                        };
                         let filtered = model_picker_filtered(entries, &state.model_picker_search);
                         if let Some(PickerEntry::Model { provider, model }) = filtered.get(row) {
                             let (provider, model_id) = (provider.clone(), model.id.clone());
-                            apply_model_choice_or_key_entry(provider, model_id, config, agent_slot, state);
+                            apply_model_choice_or_key_entry(
+                                provider, model_id, config, agent_slot, state,
+                            );
                         }
                     }
                 }
                 MouseEventKind::ScrollUp => {
-                    let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                    let Mode::ModelPicker { entries, selected } = &mut state.mode else {
+                        unreachable!()
+                    };
                     let filtered = model_picker_filtered(entries, &state.model_picker_search);
                     *selected = picker_move(&filtered, *selected, -1);
                 }
                 MouseEventKind::ScrollDown => {
-                    let Mode::ModelPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                    let Mode::ModelPicker { entries, selected } = &mut state.mode else {
+                        unreachable!()
+                    };
                     let filtered = model_picker_filtered(entries, &state.model_picker_search);
                     *selected = picker_move(&filtered, *selected, 1);
                 }
@@ -5544,27 +5993,31 @@ async fn handle_mouse(
                         && ev.row < area.y + area.height
                     {
                         let row = (ev.row - area.y) as usize;
-                        let Mode::ProviderPicker { entries, .. } = &state.mode else { unreachable!() };
-                        match entries.get(row) {
-                            Some(ProviderEntry::Provider { name, ready, .. }) => {
-                                apply_provider_picker_choice(
-                                    name.clone(),
-                                    *ready,
-                                    config,
-                                    agent_slot,
-                                    state,
-                                );
-                            }
-                            _ => {}
+                        let Mode::ProviderPicker { entries, .. } = &state.mode else {
+                            unreachable!()
+                        };
+                        if let Some(ProviderEntry::Provider { name, ready, .. }) = entries.get(row)
+                        {
+                            apply_provider_picker_choice(
+                                name.clone(),
+                                *ready,
+                                config,
+                                agent_slot,
+                                state,
+                            );
                         }
                     }
                 }
                 MouseEventKind::ScrollUp => {
-                    let Mode::ProviderPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                    let Mode::ProviderPicker { entries, selected } = &mut state.mode else {
+                        unreachable!()
+                    };
                     *selected = provider_picker_move(entries, *selected, -1);
                 }
                 MouseEventKind::ScrollDown => {
-                    let Mode::ProviderPicker { entries, selected } = &mut state.mode else { unreachable!() };
+                    let Mode::ProviderPicker { entries, selected } = &mut state.mode else {
+                        unreachable!()
+                    };
                     *selected = provider_picker_move(entries, *selected, 1);
                 }
                 _ => {}
@@ -5582,7 +6035,13 @@ async fn run_app<B: Backend>(
 ) -> Result<()> {
     let known_commands = known_slash_commands(config);
     let dir = build_dir_info(config);
-    let mut state = AppState::new(&agent, known_commands, dir, config.project_root.is_some(), config);
+    let mut state = AppState::new(
+        &agent,
+        known_commands,
+        dir,
+        config.project_root.is_some(),
+        config,
+    );
     let mut agent_slot = Some(agent);
     // When starting with an actual project, begin in read-only Plan mode so
     // the agent researches before it changes anything (and the injected
@@ -5619,7 +6078,7 @@ async fn run_app<B: Backend>(
         }
     });
 
-        terminal.draw(|f| render(f, &mut state, config))?;
+    terminal.draw(|f| render(f, &mut state, config))?;
     sync_cursor_visibility(terminal, &state);
 
     // Redraws happen on demand (key/mouse/agent events) everywhere else, but
@@ -5825,10 +6284,9 @@ fn wants_animation(state: &AppState) -> bool {
 /// Current git branch for the side-panel footer. Best-effort — any failure
 /// degrades silently to "(no git repo)".
 fn build_dir_info(config: &Config) -> DirInfo {
-    let path = config
-        .project_root
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    let path = config.project_root.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    });
 
     let git_branch = std::process::Command::new("git")
         .arg("-C")
@@ -5900,7 +6358,10 @@ mod tests {
 
     #[test]
     fn wrap_text_fits_on_one_line() {
-        assert_eq!(wrap_text("hello world", 20), vec!["hello world".to_string()]);
+        assert_eq!(
+            wrap_text("hello world", 20),
+            vec!["hello world".to_string()]
+        );
     }
 
     #[test]
@@ -5916,7 +6377,10 @@ mod tests {
         }
         // Rejoining with single spaces must reproduce the original words —
         // wrapping shouldn't drop or duplicate any text.
-        assert_eq!(lines.join(" "), "the quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            lines.join(" "),
+            "the quick brown fox jumps over the lazy dog"
+        );
     }
 
     /// Regression test for a real bug: a single unbroken token longer than
@@ -5987,14 +6451,32 @@ mod tests {
 
     #[test]
     fn centered_row_centers_horizontally_at_a_fixed_y() {
-        let area = Rect { x: 0, y: 0, width: 100, height: 50 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
         let r = centered_row(area, 10, 5, 20);
-        assert_eq!(r, Rect { x: 40, y: 10, width: 20, height: 5 });
+        assert_eq!(
+            r,
+            Rect {
+                x: 40,
+                y: 10,
+                width: 20,
+                height: 5
+            }
+        );
     }
 
     #[test]
     fn centered_row_clamps_width_to_the_area() {
-        let area = Rect { x: 0, y: 0, width: 100, height: 50 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
         let r = centered_row(area, 0, 5, 150);
         assert_eq!(r.width, 100);
         assert_eq!(r.x, 0);
@@ -6006,23 +6488,54 @@ mod tests {
         // overflowing empty-state screen: a row positioned past the visible
         // area shrinks to zero height instead of panicking or drawing
         // out-of-bounds.
-        let area = Rect { x: 0, y: 0, width: 100, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 10,
+        };
         let r = centered_row(area, 20, 5, 20);
         assert_eq!(r.height, 0);
     }
 
     #[test]
     fn centered_rect_centers_both_axes() {
-        let area = Rect { x: 0, y: 0, width: 100, height: 50 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
         let r = centered_rect(30, 10, area);
-        assert_eq!(r, Rect { x: 35, y: 20, width: 30, height: 10 });
+        assert_eq!(
+            r,
+            Rect {
+                x: 35,
+                y: 20,
+                width: 30,
+                height: 10
+            }
+        );
     }
 
     #[test]
     fn centered_rect_clamps_to_the_area_when_oversized() {
-        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
         let r = centered_rect(1000, 1000, area);
-        assert_eq!(r, Rect { x: 0, y: 0, width: 40, height: 20 });
+        assert_eq!(
+            r,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 20
+            }
+        );
     }
 
     #[test]

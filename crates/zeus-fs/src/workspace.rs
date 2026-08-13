@@ -4,9 +4,9 @@ use crate::checkpoint::CheckpointStore;
 use crate::ops::FileEngine;
 use crate::permission::PermissionGate;
 use crate::search::SearchEngine;
-use zeus_config::{AgentSettings, Config};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeus_config::{AgentSettings, Config};
 
 /// Fully wired project workspace for Phase 2 tools.
 pub struct Workspace {
@@ -19,10 +19,9 @@ pub struct Workspace {
 impl Workspace {
     /// Build from loaded config. Requires a project root.
     pub fn from_config(config: &Config) -> Result<Self, String> {
-        let project_root = config
-            .project_root
-            .clone()
-            .ok_or_else(|| "no project root detected; run inside a project or pass --project-root".to_string())?;
+        let project_root = config.project_root.clone().ok_or_else(|| {
+            "no project root detected; run inside a project or pass --project-root".to_string()
+        })?;
 
         let checkpoints_dir = config
             .project

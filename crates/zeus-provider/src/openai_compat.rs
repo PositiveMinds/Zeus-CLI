@@ -300,7 +300,8 @@ impl ModelProvider for OpenAiCompatProvider {
                 arguments: c.function.arguments,
             })
             .collect();
-        let finish_reason = map_finish_reason(choice.finish_reason.as_deref(), !tool_calls.is_empty());
+        let finish_reason =
+            map_finish_reason(choice.finish_reason.as_deref(), !tool_calls.is_empty());
         let mut message = Message::assistant(oa_msg.content.unwrap_or_default());
         message.tool_calls = tool_calls;
         let usage = parsed
@@ -436,10 +437,8 @@ impl ModelProvider for OpenAiCompatProvider {
                                 .unwrap_or_else(|| format!("call-{}", tc.index));
                             call_ids.entry(tc.index).or_insert_with(|| id.clone());
                             let name = tc.function.as_ref().and_then(|f| f.name.clone());
-                            let arguments_delta = tc
-                                .function
-                                .and_then(|f| f.arguments)
-                                .unwrap_or_default();
+                            let arguments_delta =
+                                tc.function.and_then(|f| f.arguments).unwrap_or_default();
                             if tx
                                 .send(Ok(StreamEvent::ToolCallDelta {
                                     id,
@@ -506,7 +505,7 @@ impl ModelProvider for OpenAiCompatProvider {
             usage: Option<OaUsage>,
         }
         let body = json!({ "model": request.model, "input": request.input });
-let resp = self
+        let resp = self
             .client
             .post(self.embeddings_url())
             .headers(self.reqwest_headers())
@@ -806,7 +805,10 @@ server.serve_forever()
         let server = TestServer::start(18098);
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let resp = provider
-            .chat(ChatRequest::new("null-tool-calls-model", vec![Message::user("hi")]))
+            .chat(ChatRequest::new(
+                "null-tool-calls-model",
+                vec![Message::user("hi")],
+            ))
             .await
             .unwrap();
         assert_eq!(resp.message.content, "no tools here");
@@ -820,7 +822,10 @@ server.serve_forever()
         let server = TestServer::start(18099);
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let mut stream = provider
-            .stream(ChatRequest::new("null-tool-calls-model", vec![Message::user("hi")]))
+            .stream(ChatRequest::new(
+                "null-tool-calls-model",
+                vec![Message::user("hi")],
+            ))
             .await
             .unwrap();
         let mut text = String::new();

@@ -116,7 +116,10 @@ pub fn locate_server_binary(binary_override: Option<&str>, bin_dir: &Path) -> Op
 
 /// Resolve the `llama-server` binary, downloading and extracting a llama.cpp
 /// release into `bin_dir` if it isn't already available locally.
-pub async fn ensure_server_binary(binary_override: Option<&str>, bin_dir: &Path) -> Result<PathBuf> {
+pub async fn ensure_server_binary(
+    binary_override: Option<&str>,
+    bin_dir: &Path,
+) -> Result<PathBuf> {
     if let Some(found) = locate_server_binary(binary_override, bin_dir) {
         return Ok(found);
     }
@@ -143,7 +146,8 @@ async fn stream_download(url: &str, dest: &Path) -> Result<()> {
         .await
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| ProviderError::Api(format!("create bin dir: {e}")))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ProviderError::Api(format!("create bin dir: {e}")))?;
     }
     std::fs::write(dest, &bytes).map_err(|e| ProviderError::Api(format!("write binary: {e}")))?;
     Ok(())
@@ -153,7 +157,8 @@ async fn stream_download(url: &str, dest: &Path) -> Result<()> {
 /// this platform, download + unzip it into `bin_dir`, and return the path to
 /// the extracted `llama-server`.
 async fn download_server_binary(bin_dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(bin_dir).map_err(|e| ProviderError::Api(format!("create bin dir: {e}")))?;
+    std::fs::create_dir_all(bin_dir)
+        .map_err(|e| ProviderError::Api(format!("create bin dir: {e}")))?;
 
     let api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
     let client = reqwest::Client::new();
@@ -217,10 +222,12 @@ async fn download_server_binary(bin_dir: &Path) -> Result<PathBuf> {
 /// Extract a `.zip` into `dest`, preserving paths and marking executables on
 /// unix.
 fn unzip(src: &Path, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest).map_err(|e| ProviderError::Api(format!("create extract dir: {e}")))?;
-    let file = std::fs::File::open(src).map_err(|e| ProviderError::Api(format!("open zip: {e}")))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| ProviderError::Api(format!("read zip: {e}")))?;
+    std::fs::create_dir_all(dest)
+        .map_err(|e| ProviderError::Api(format!("create extract dir: {e}")))?;
+    let file =
+        std::fs::File::open(src).map_err(|e| ProviderError::Api(format!("open zip: {e}")))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| ProviderError::Api(format!("read zip: {e}")))?;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -275,7 +282,8 @@ pub async fn spawn_server_and_wait(
     ctx: Option<u32>,
     timeout: Duration,
 ) -> Result<ServerInfo> {
-    std::fs::create_dir_all(logs_dir).map_err(|e| ProviderError::Api(format!("create logs dir: {e}")))?;
+    std::fs::create_dir_all(logs_dir)
+        .map_err(|e| ProviderError::Api(format!("create logs dir: {e}")))?;
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
@@ -420,7 +428,11 @@ mod tests {
     #[test]
     fn finds_server_nested_under_bin_dir() {
         let tmp = TempDir::new().unwrap();
-        let exe = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+        let exe = if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
         let dir = tmp.path().join("llama-b5144-bin-win-cpu-x64");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(exe), b"bin").unwrap();
@@ -432,7 +444,11 @@ mod tests {
     #[test]
     fn locate_prefers_override_when_it_exists() {
         let tmp = TempDir::new().unwrap();
-        let bin = tmp.path().join(if cfg!(windows) { "llama-server.exe" } else { "llama-server" });
+        let bin = tmp.path().join(if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        });
         std::fs::write(&bin, b"bin").unwrap();
         let found = locate_server_binary(Some(bin.to_str().unwrap()), tmp.path());
         assert_eq!(found, Some(bin));

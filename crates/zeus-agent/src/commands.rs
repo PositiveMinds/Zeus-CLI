@@ -87,7 +87,10 @@ mod tests {
     fn plain_message_is_unchanged() {
         let tmp = TempDir::new().unwrap();
         let cmds = SlashCommands::new(None, tmp.path().to_path_buf());
-        assert_eq!(cmds.expand("just a normal message"), ExpandResult::Unchanged);
+        assert_eq!(
+            cmds.expand("just a normal message"),
+            ExpandResult::Unchanged
+        );
     }
 
     #[test]

@@ -113,7 +113,14 @@ impl SearchEngine {
                 Some(p) if label.is_none() => resolve_in_project(&root, p)?,
                 _ => root.clone(),
             };
-            self.grep_root(&start, &root, label.as_deref(), &re, file_glob.as_ref(), &mut sink)?;
+            self.grep_root(
+                &start,
+                &root,
+                label.as_deref(),
+                &re,
+                file_glob.as_ref(),
+                &mut sink,
+            )?;
             if sink.out.len() >= opts.max_matches {
                 break;
             }
@@ -144,11 +151,7 @@ impl SearchEngine {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if !entry
-                .file_type()
-                .map(|t| t.is_file())
-                .unwrap_or(false)
-            {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
             let path = entry.path();
@@ -203,8 +206,7 @@ impl SearchEngine {
         })?;
 
         let mut builder = GlobSetBuilder::new();
-        builder
-            .add(Glob::new(pattern).map_err(|e| FsError::InvalidPath(e.to_string()))?);
+        builder.add(Glob::new(pattern).map_err(|e| FsError::InvalidPath(e.to_string()))?);
         let set = builder
             .build()
             .map_err(|e| FsError::InvalidPath(e.to_string()))?;
@@ -255,8 +257,8 @@ impl SearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeus_config::AgentSettings;
     use tempfile::TempDir;
+    use zeus_config::AgentSettings;
 
     #[test]
     fn grep_finds_line() {

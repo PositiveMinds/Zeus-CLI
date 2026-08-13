@@ -72,7 +72,11 @@ pub fn project_rules_context(root: &Path) -> String {
     if text.trim().is_empty() {
         String::new()
     } else {
-        format!("Project rules ({}/AGENTS.md or .agent/instructions.md):\n{}\n", root.display(), text.trim())
+        format!(
+            "Project rules ({}/AGENTS.md or .agent/instructions.md):\n{}\n",
+            root.display(),
+            text.trim()
+        )
     }
 }
 
@@ -186,8 +190,7 @@ pub(crate) fn safe_memory_name(name: &str) -> Option<String> {
 /// `(name, first meaningful line)` for every memory note, sorted by name.
 pub fn memory_index(root: &Path) -> Vec<(String, String)> {
     let dir = memory_dir(root);
-    let Ok(entries) = std::fs::read_dir(&dir).map(|e| e.flatten().collect::<Vec<_>>())
-    else {
+    let Ok(entries) = std::fs::read_dir(&dir).map(|e| e.flatten().collect::<Vec<_>>()) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -228,8 +231,7 @@ pub fn memory_context(root: &Path, request: &str) -> String {
     let lower = request.to_lowercase();
     let terms: Vec<String> = crate::analyze::subjects_for(request)
         .into_iter()
-        .map(|s| s.terms)
-        .flatten()
+        .flat_map(|s| s.terms)
         .collect();
     let mut lines = Vec::new();
     for (name, first) in memory_index(root) {
@@ -263,7 +265,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mp-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         write(&tmp, "src/lib.rs", "pub fn main() {}\n");
-        write(&tmp, "Cargo.toml", "[package]\nname = \"x\"\n[dependencies]\naxum = \"0.7\"\n");
+        write(
+            &tmp,
+            "Cargo.toml",
+            "[package]\nname = \"x\"\n[dependencies]\naxum = \"0.7\"\n",
+        );
         let fp = crate::analyze::analyze_repo(&tmp);
         persist(&tmp, &fp, Some("deadbeef:0"));
         let loaded: RepoFingerprint =
@@ -311,9 +317,15 @@ mod tests {
         assert_eq!(safe_memory_name("MY-NOTE").as_deref(), Some("my-note"));
         let idx = memory_index(&tmp);
         assert!(idx.iter().any(|(n, _)| n == "auth"));
-        assert_eq!(memory_read(&tmp, "auth").unwrap(), "use token-based auth, stored in Redis");
+        assert_eq!(
+            memory_read(&tmp, "auth").unwrap(),
+            "use token-based auth, stored in Redis"
+        );
         let ctx = memory_context(&tmp, "explain how authentication works");
-        assert!(ctx.contains("auth"), "expected memory in context, got: {ctx}");
+        assert!(
+            ctx.contains("auth"),
+            "expected memory in context, got: {ctx}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

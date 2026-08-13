@@ -81,10 +81,7 @@ impl RagIndex {
         P: ModelProvider + Send + Sync,
     {
         let n = self.documents.len();
-        let mut vectors = self
-            .vectors
-            .take()
-            .unwrap_or_else(|| vec![Vec::new(); n]);
+        let mut vectors = self.vectors.take().unwrap_or_else(|| vec![Vec::new(); n]);
         if vectors.len() != n {
             vectors = vec![Vec::new(); n];
         }
@@ -92,8 +89,10 @@ impl RagIndex {
         let mut embedded = 0usize;
         for start in (0..n).step_by(batch) {
             let end = (start + batch).min(n);
-            let texts: Vec<String> =
-                self.documents[start..end].iter().map(|c| c.text.clone()).collect();
+            let texts: Vec<String> = self.documents[start..end]
+                .iter()
+                .map(|c| c.text.clone())
+                .collect();
             match provider
                 .embeddings(EmbeddingRequest {
                     model: model.to_string(),

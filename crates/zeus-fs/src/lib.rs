@@ -18,12 +18,13 @@ mod staleness;
 mod workspace;
 
 pub use checkpoint::{CheckpointStore, CheckpointSummary, FileSnapshot};
-pub use codeint::{filter_out_own_index, paths_equal, word_boundary, IndexEngine, Symbol, SymbolIndex};
+pub use codeint::{
+    filter_out_own_index, paths_equal, word_boundary, IndexEngine, Symbol, SymbolIndex,
+};
 pub use device::{DeviceEngine, DeviceOutput};
 pub use diff::preview_diff;
 pub use error::{FsError, Result};
 pub use git::{GitEngine, GitOutput, ResetMode};
-pub use platform::{PlatformEngine, PlatformOutput};
 pub use ops::{
     BulkEditPlan, BulkEditResult, CopyOptions, EditOptions, FileEngine, ReadOptions, ReadResult,
     WriteOptions,
@@ -32,5 +33,6 @@ pub use pathutil::{contains_path, resolve_in_project, PathKind};
 pub use permission::{
     ApprovalDecision, PermissionContext, PermissionGate, PermissionRequest, ResolvedPermission,
 };
+pub use platform::{PlatformEngine, PlatformOutput};
 pub use search::{GlobMatch, GrepMatch, SearchEngine, SearchOptions};
 pub use workspace::Workspace;

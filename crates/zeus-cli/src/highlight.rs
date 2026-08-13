@@ -1,6 +1,6 @@
-use std::sync::OnceLock;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SC, FontStyle as SF, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -219,33 +219,31 @@ pub fn markdown_lines(text: &str, plain_style: Style) -> Vec<Vec<Span<'static>>>
     let mut lang: Option<String> = None;
     let mut in_fence = false;
 
-    let flush_plain =
-        |out: &mut Vec<Vec<Span<'static>>>, plain: &Vec<String>| {
-            for l in plain {
-                out.push(style_markdown_line(l, plain_style));
-            }
-        };
-    let flush_code = |out: &mut Vec<Vec<Span<'static>>>,
-                      code: &Vec<String>,
-                      lang: &Option<String>| {
-        let syntax = resolve_syntax(lang.as_deref());
-        let mut h = HighlightLines::new(syntax, theme());
-        for line_w in LinesWithEndings::from(&code.join("\n")) {
-            let line = line_w.trim_end_matches('\n');
-            let ranges = match h.highlight_line(line, syntax_set()) {
-                Ok(r) => r,
-                Err(_) => {
-                    out.push(vec![Span::styled(line.to_string(), plain_style)]);
-                    continue;
-                }
-            };
-            let spans: Vec<Span<'static>> = ranges
-                .iter()
-                .map(|(style, text)| Span::styled(text.to_string(), rock_style(style)))
-                .collect();
-            out.push(spans);
+    let flush_plain = |out: &mut Vec<Vec<Span<'static>>>, plain: &Vec<String>| {
+        for l in plain {
+            out.push(style_markdown_line(l, plain_style));
         }
     };
+    let flush_code =
+        |out: &mut Vec<Vec<Span<'static>>>, code: &Vec<String>, lang: &Option<String>| {
+            let syntax = resolve_syntax(lang.as_deref());
+            let mut h = HighlightLines::new(syntax, theme());
+            for line_w in LinesWithEndings::from(&code.join("\n")) {
+                let line = line_w.trim_end_matches('\n');
+                let ranges = match h.highlight_line(line, syntax_set()) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        out.push(vec![Span::styled(line.to_string(), plain_style)]);
+                        continue;
+                    }
+                };
+                let spans: Vec<Span<'static>> = ranges
+                    .iter()
+                    .map(|(style, text)| Span::styled(text.to_string(), rock_style(style)))
+                    .collect();
+                out.push(spans);
+            }
+        };
 
     for line in text.split('\n') {
         let trimmed = line.trim_start();
@@ -256,10 +254,10 @@ pub fn markdown_lines(text: &str, plain_style: Style) -> Vec<Vec<Span<'static>>>
             in_fence = false;
             continue;
         }
-        if trimmed.starts_with("```") {
+        if let Some(rest) = trimmed.strip_prefix("```") {
             flush_plain(&mut out, &plain);
             plain.clear();
-            lang = Some(trimmed[3..].trim().to_string());
+            lang = Some(rest.trim().to_string());
             code = Vec::new();
             in_fence = true;
             continue;
@@ -304,8 +302,14 @@ fn style_markdown_line(line: &str, base: Style) -> Vec<Span<'static>> {
         spans.extend(style_inline(rest, base.add_modifier(Modifier::ITALIC)));
         return spans;
     }
-    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
-        spans.push(Span::styled("• ", Style::default().fg(HUNK_FG).add_modifier(Modifier::BOLD)));
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        spans.push(Span::styled(
+            "• ",
+            Style::default().fg(HUNK_FG).add_modifier(Modifier::BOLD),
+        ));
         spans.extend(style_inline(rest, base));
         return spans;
     }
@@ -363,7 +367,9 @@ fn style_inline(text: &str, base: Style) -> Vec<Span<'static>> {
         };
         let (delim, delim_len, style_for): (&str, usize, fn(&str, Style) -> Style) = match kind {
             Kind::Bold => ("**", 2, |_, base| base.add_modifier(Modifier::BOLD)),
-            Kind::Code => ("`", 1, |_, _| Style::default().fg(INLINE_CODE_FG).bg(CODE_BG)),
+            Kind::Code => ("`", 1, |_, _| {
+                Style::default().fg(INLINE_CODE_FG).bg(CODE_BG)
+            }),
             Kind::Strike => ("~~", 2, |_, base| base.add_modifier(Modifier::CROSSED_OUT)),
         };
         match rest[pos + delim_len..].find(delim) {
@@ -389,43 +395,6 @@ fn style_inline(text: &str, base: Style) -> Vec<Span<'static>> {
         spans.push(Span::styled(String::new(), base));
     }
     spans
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::style::Style;
-
-    #[test]
-    fn plain_text_untouched() {
-        let lines = markdown_lines("hello world", Style::default());
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0][0].content, "hello world");
-    }
-
-    #[test]
-    fn fenced_rust_block() {
-        let text = "```rust\nfn main() {}\n```\nafter";
-        let lines = markdown_lines(text, Style::default());
-        let flat: String = lines
-            .iter()
-            .flat_map(|l| l.iter().map(|s| s.content.as_ref()))
-            .collect::<Vec<_>>()
-            .join("");
-        assert!(flat.contains("fn main() {}"));
-        assert!(flat.contains("after"));
-    }
-
-    #[test]
-    fn unlabeled_fence() {
-        let lines = markdown_lines("```\nx\n```", Style::default());
-        let flat: String = lines
-            .iter()
-            .flat_map(|l| l.iter().map(|s| s.content.as_ref()))
-            .collect::<Vec<_>>()
-            .join("");
-        assert!(flat.contains('x'));
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -458,16 +427,14 @@ const DEL_SIGN_FG: Color = Color::Rgb(0xf0, 0x6a, 0x9a);
 
 /// Heuristic: is this text a unified diff we should pass to `diff_lines`?
 pub fn looks_like_diff(text: &str) -> bool {
-    text.lines()
-        .take(40)
-        .any(|l| {
-            let t = l.trim_start();
-            t.starts_with("diff --git")
-                || t.starts_with("index ")
-                || t.starts_with("@@ -")
-                || t.starts_with("+++ ") && l.starts_with('+')
-                || t.starts_with("--- ") && (l.starts_with('-') || l.starts_with("--- "))
-        })
+    text.lines().take(40).any(|l| {
+        let t = l.trim_start();
+        t.starts_with("diff --git")
+            || t.starts_with("index ")
+            || t.starts_with("@@ -")
+            || t.starts_with("+++ ") && l.starts_with('+')
+            || t.starts_with("--- ") && (l.starts_with('-') || l.starts_with("--- "))
+    })
 }
 
 /// A changed line's background tint should read as a solid bar across the
@@ -488,14 +455,26 @@ fn pad_to(line: &str, width: usize) -> String {
 /// A changed line's leading `+`/`-` gets a brighter "sign" color than the
 /// rest of the line, both sharing the same background tint — reads as a
 /// distinct gutter marker rather than one flat-colored run of text.
-fn diff_body_spans(line: &str, sign_fg: Color, body_fg: Color, bg: Color, width: usize) -> Vec<Span<'static>> {
+fn diff_body_spans(
+    line: &str,
+    sign_fg: Color,
+    body_fg: Color,
+    bg: Color,
+    width: usize,
+) -> Vec<Span<'static>> {
     let mut chars = line.chars();
     let sign = chars.next().unwrap_or(' ');
     let rest: String = chars.collect();
     let padded_rest = pad_to(&format!("{sign}{rest}"), width);
     let rest_with_pad = padded_rest.chars().skip(1).collect::<String>();
     vec![
-        Span::styled(sign.to_string(), Style::default().fg(sign_fg).bg(bg).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            sign.to_string(),
+            Style::default()
+                .fg(sign_fg)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(rest_with_pad, Style::default().fg(body_fg).bg(bg)),
     ]
 }
@@ -536,7 +515,10 @@ pub fn diff_lines(text: &str, plain_style: Style, width: usize) -> Vec<Vec<Span<
                 }
                 '+' => diff_body_spans(l, ADD_SIGN_FG, ADD_FG, ADD_BG, width),
                 '-' => diff_body_spans(l, DEL_SIGN_FG, DEL_FG, DEL_BG, width),
-                '@' => vec![Span::styled(pad_to(l, width), Style::default().fg(HUNK_FG).bg(HUNK_BG))],
+                '@' => vec![Span::styled(
+                    pad_to(l, width),
+                    Style::default().fg(HUNK_FG).bg(HUNK_BG),
+                )],
                 _ => vec![Span::styled(l.to_string(), plain_style)],
             };
             spans
@@ -560,4 +542,41 @@ pub fn ansi_diff(text: &str) -> String {
         let _ = out.pop();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Style;
+
+    #[test]
+    fn plain_text_untouched() {
+        let lines = markdown_lines("hello world", Style::default());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0][0].content, "hello world");
+    }
+
+    #[test]
+    fn fenced_rust_block() {
+        let text = "```rust\nfn main() {}\n```\nafter";
+        let lines = markdown_lines(text, Style::default());
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(flat.contains("fn main() {}"));
+        assert!(flat.contains("after"));
+    }
+
+    #[test]
+    fn unlabeled_fence() {
+        let lines = markdown_lines("```\nx\n```", Style::default());
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(flat.contains('x'));
+    }
 }

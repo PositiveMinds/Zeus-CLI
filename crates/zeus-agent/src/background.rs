@@ -125,8 +125,8 @@ impl BackgroundTaskRegistry {
             started_at: chrono::Utc::now().to_rfc3339(),
             paused: false,
         };
-        let text = serde_json::to_string_pretty(&task)
-            .map_err(|e| AgentError::Terminal(e.to_string()))?;
+        let text =
+            serde_json::to_string_pretty(&task).map_err(|e| AgentError::Terminal(e.to_string()))?;
         std::fs::write(self.meta_path(id), text)?;
         Ok(id)
     }
@@ -178,17 +178,18 @@ impl BackgroundTaskRegistry {
             started_at: chrono::Utc::now().to_rfc3339(),
             paused: false,
         };
-        let text = serde_json::to_string_pretty(&task)
-            .map_err(|e| AgentError::Terminal(e.to_string()))?;
+        let text =
+            serde_json::to_string_pretty(&task).map_err(|e| AgentError::Terminal(e.to_string()))?;
         std::fs::write(self.meta_path(id), text)?;
         Ok(id)
     }
 
     /// Persist updated task metadata (used when toggling the paused flag).
     fn write_meta(&self, task: &BackgroundTask) -> Result<()> {
-        let text = serde_json::to_string_pretty(task)
-            .map_err(|e| AgentError::Terminal(e.to_string()))?;
-        std::fs::write(self.meta_path(task.id), text).map_err(|e| AgentError::Terminal(e.to_string()))
+        let text =
+            serde_json::to_string_pretty(task).map_err(|e| AgentError::Terminal(e.to_string()))?;
+        std::fs::write(self.meta_path(task.id), text)
+            .map_err(|e| AgentError::Terminal(e.to_string()))
     }
 
     /// Derive a task's status from its persisted `paused` flag plus liveness.
@@ -243,9 +244,7 @@ impl BackgroundTaskRegistry {
             TaskStatus::Exited => Err(AgentError::Terminal(format!(
                 "task {id} has already exited — nothing to pause"
             ))),
-            TaskStatus::Paused => Err(AgentError::Terminal(format!(
-                "task {id} is already paused"
-            ))),
+            TaskStatus::Paused => Err(AgentError::Terminal(format!("task {id} is already paused"))),
             TaskStatus::Running => {
                 suspend_process(task.pid)
                     .map_err(|e| AgentError::Terminal(format!("pause task {id}: {e}")))?;
@@ -267,9 +266,7 @@ impl BackgroundTaskRegistry {
             TaskStatus::Exited => Err(AgentError::Terminal(format!(
                 "task {id} has already exited — nothing to resume"
             ))),
-            TaskStatus::Running => Err(AgentError::Terminal(format!(
-                "task {id} is not paused"
-            ))),
+            TaskStatus::Running => Err(AgentError::Terminal(format!("task {id} is not paused"))),
             TaskStatus::Paused => {
                 resume_process(task.pid)
                     .map_err(|e| AgentError::Terminal(format!("resume task {id}: {e}")))?;
@@ -444,7 +441,9 @@ mod tests {
         assert_eq!(status, TaskStatus::Running);
 
         let listed = registry.list().unwrap();
-        assert!(listed.iter().any(|(t, s)| t.id == id && *s == TaskStatus::Running));
+        assert!(listed
+            .iter()
+            .any(|(t, s)| t.id == id && *s == TaskStatus::Running));
 
         registry.stop(id).unwrap();
         assert!(registry.get(id).unwrap().is_none());
@@ -499,7 +498,9 @@ mod tests {
         assert!(task.command.contains(&program));
 
         let listed = registry.list().unwrap();
-        assert!(listed.iter().any(|(t, s)| t.id == id && *s == TaskStatus::Running));
+        assert!(listed
+            .iter()
+            .any(|(t, s)| t.id == id && *s == TaskStatus::Running));
 
         registry.stop(id).unwrap();
         assert!(registry.get(id).unwrap().is_none());
@@ -512,7 +513,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
         assert!(registry
-            .spawn_argv("zeus_definitely_not_a_program_xyz", vec!["hi".into()], &root)
+            .spawn_argv(
+                "zeus_definitely_not_a_program_xyz",
+                vec!["hi".into()],
+                &root
+            )
             .is_err());
     }
 
@@ -568,7 +573,10 @@ mod tests {
         registry.resume(id).unwrap();
         let (_, status) = registry.get(id).unwrap().unwrap();
         assert_eq!(status, TaskStatus::Running);
-        assert!(registry.resume(id).is_err(), "resuming a running task fails");
+        assert!(
+            registry.resume(id).is_err(),
+            "resuming a running task fails"
+        );
 
         // Persisted: a fresh registry instance still sees the paused state.
         registry.pause(id).unwrap();

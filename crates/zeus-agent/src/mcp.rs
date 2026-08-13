@@ -175,10 +175,7 @@ impl McpClient {
         let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
         let result = self.send_request("tools/call", params)?;
         serde_json::from_value(result).map_err(|e| {
-            AgentError::Terminal(format!(
-                "mcp '{}': bad tools/call response: {e}",
-                self.name
-            ))
+            AgentError::Terminal(format!("mcp '{}': bad tools/call response: {e}", self.name))
         })
     }
 
@@ -211,10 +208,7 @@ impl McpClient {
             };
             let result = self.send_request("tools/list", params)?;
             let page: ToolsListResult = serde_json::from_value(result).map_err(|e| {
-                AgentError::Terminal(format!(
-                    "mcp '{}': bad tools/list response: {e}",
-                    self.name
-                ))
+                AgentError::Terminal(format!("mcp '{}': bad tools/list response: {e}", self.name))
             })?;
             tools.extend(page.tools);
             cursor = page.next_cursor;

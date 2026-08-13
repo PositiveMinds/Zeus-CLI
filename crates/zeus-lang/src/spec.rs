@@ -59,18 +59,18 @@ pub fn spec(lang: Language) -> &'static LangSpec {
         .expect("spec table covers every Language variant")
 }
 
-/// Convenient accessor: the four dev commands as
+/// Convenient accessor: the five dev commands as
 /// `(build, test, lint, lint_fix, format)` arg lists
 /// (empty = no standard command).
-pub fn dev_commands(
-    lang: Language,
-) -> (
-    &'static [&'static str],
-    &'static [&'static str],
-    &'static [&'static str],
-    &'static [&'static str],
-    &'static [&'static str],
-) {
+pub type DevCommands<'a> = (
+    &'a [&'static str],
+    &'a [&'static str],
+    &'a [&'static str],
+    &'a [&'static str],
+    &'a [&'static str],
+);
+
+pub fn dev_commands(lang: Language) -> DevCommands<'static> {
     let s = spec(lang);
     (s.build, s.test, s.lint, s.lint_fix, s.format)
 }
@@ -84,7 +84,13 @@ const SPECS: &[LangSpec] = &[
         build: &["cargo", "build"],
         test: &["cargo", "test"],
         lint: &["cargo", "clippy", "--all-targets", "--", "-D", "warnings"],
-        lint_fix: &["cargo", "clippy", "--fix", "--allow-dirty", "--allow-staged"],
+        lint_fix: &[
+            "cargo",
+            "clippy",
+            "--fix",
+            "--allow-dirty",
+            "--allow-staged",
+        ],
         format: &["cargo", "fmt"],
         format_style: FormatStyle::Project,
     },
@@ -92,7 +98,12 @@ const SPECS: &[LangSpec] = &[
         language: Language::Python,
         display_name: "Python",
         exts: &["py"],
-        markers: &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"],
+        markers: &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+        ],
         build: &["python", "-m", "build"],
         test: &["python", "-m", "pytest", "-q"],
         lint: &["ruff", "check", "."],

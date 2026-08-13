@@ -183,11 +183,8 @@ pub fn detect_source(path: &Path) -> Option<Language> {
 /// Walk `root` up to `max_depth` levels collecting extensions; the most
 /// frequent known-language extension decides the project's language.
 fn ext_census(root: &Path, max_depth: usize) -> Option<Language> {
-    let mut counts: Vec<(Language, usize)> = Language::ALL
-        .iter()
-        .copied()
-        .map(|l| (l, 0))
-        .collect();
+    let mut counts: Vec<(Language, usize)> =
+        Language::ALL.iter().copied().map(|l| (l, 0)).collect();
     let mut best: Option<Language> = None;
     let mut best_count = 0usize;
 
@@ -258,10 +255,7 @@ pub fn walk(root: &Path, max_depth: usize) -> Vec<(std::path::PathBuf, usize)> {
         for entry in entries.flatten() {
             let child = entry.path();
             if child.is_dir() {
-                let name = child
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let name = child.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name.starts_with('.') || SKIP_DIR_NAMES.contains(&name) {
                     continue;
                 }
@@ -358,8 +352,14 @@ mod tests {
 
     #[test]
     fn detects_source_from_extension() {
-        assert_eq!(detect_source(std::path::Path::new("a/main.rs")), Some(Language::Rust));
-        assert_eq!(detect_source(std::path::Path::new("b.tsx")), Some(Language::TypeScript));
+        assert_eq!(
+            detect_source(std::path::Path::new("a/main.rs")),
+            Some(Language::Rust)
+        );
+        assert_eq!(
+            detect_source(std::path::Path::new("b.tsx")),
+            Some(Language::TypeScript)
+        );
         assert_eq!(detect_source(std::path::Path::new("c.xyz")), None);
     }
 

@@ -103,7 +103,10 @@ const LANGS: &[Lang] = &[
             (r"\benum\s+([A-Za-z_$][\w$]*)\b", "enum"),
             (r"\btype\s+([A-Z][\w$]*)\s*=", "type"),
             (r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(", "function"),
-            (r"\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>", "function"),
+            (
+                r"\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>",
+                "function",
+            ),
             (r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", "const"),
         ],
     },
@@ -141,7 +144,10 @@ const LANGS: &[Lang] = &[
             (r"\binterface\s+([A-Z]\w*)\b", "interface"),
             (r"\benum\s+([A-Z]\w*)\b", "enum"),
             (r"\bfun\s+([A-Za-z_]\w*)\s*\(", "function"),
-            (r"^\s*(?:public|protected|private|static|final|default|\s)+\s+[A-Za-z_][\w<>,?.\[\] ]*\s+([a-z_]\w*)\s*\(", "method"),
+            (
+                r"^\s*(?:public|protected|private|static|final|default|\s)+\s+[A-Za-z_][\w<>,?.\[\] ]*\s+([a-z_]\w*)\s*\(",
+                "method",
+            ),
         ],
     },
     Lang {
@@ -180,9 +186,10 @@ const LANGS: &[Lang] = &[
     },
     Lang {
         exts: &["lua"],
-        patterns: &[
-            (r"^function\s+(?:[A-Za-z_]\w*[\.:])*([A-Za-z_]\w*)\s*\(", "function"),
-        ],
+        patterns: &[(
+            r"^function\s+(?:[A-Za-z_]\w*[\.:])*([A-Za-z_]\w*)\s*\(",
+            "function",
+        )],
     },
 ];
 
@@ -221,13 +228,17 @@ impl IndexEngine {
                 continue;
             }
             let path = entry.path();
-            let Some(lang) = language_for(path) else { continue };
+            let Some(lang) = language_for(path) else {
+                continue;
+            };
 
             let Ok(meta) = entry.metadata() else { continue };
             if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(path) else { continue };
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
             scanned += 1;
             let rel = path
                 .strip_prefix(&root_clone)
@@ -256,7 +267,11 @@ fn is_skipped_dir(entry: &walkdir::DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return false;
     }
-    let name = entry.file_name().to_str().unwrap_or_default().to_lowercase();
+    let name = entry
+        .file_name()
+        .to_str()
+        .unwrap_or_default()
+        .to_lowercase();
     if name.starts_with('.') {
         return true;
     }
@@ -358,7 +373,9 @@ impl SymbolIndex {
             .filter(|s| s.name.to_lowercase().contains(&lower))
             .map(|s| (s.name == needle, s))
             .collect();
-        hits.sort_by(|a, b| (b.0, a.1.file.as_str(), a.1.line).cmp(&(a.0, b.1.file.as_str(), b.1.line)));
+        hits.sort_by(|a, b| {
+            (b.0, a.1.file.as_str(), a.1.line).cmp(&(a.0, b.1.file.as_str(), b.1.line))
+        });
         hits.into_iter().map(|(_, s)| s).collect()
     }
 }
@@ -399,7 +416,12 @@ mod tests {
 
     fn extract(text: &str, path: &str) -> Vec<Symbol> {
         let mut out = Vec::new();
-        extract_symbols(&path.replace('\\', "/"), language_for(Path::new(path)).unwrap(), text, &mut out);
+        extract_symbols(
+            &path.replace('\\', "/"),
+            language_for(Path::new(path)).unwrap(),
+            text,
+            &mut out,
+        );
         out
     }
 
@@ -426,9 +448,24 @@ mod tests {
     fn query_is_substring_and_orders_by_file() {
         let idx = SymbolIndex {
             symbols: vec![
-                Symbol { name: "Foo".into(), kind: "function".into(), file: "a.rs".into(), line: 3 },
-                Symbol { name: "Foo".into(), kind: "struct".into(), file: "b.rs".into(), line: 1 },
-                Symbol { name: "NotUsage".into(), kind: "struct".into(), file: "a.rs".into(), line: 9 },
+                Symbol {
+                    name: "Foo".into(),
+                    kind: "function".into(),
+                    file: "a.rs".into(),
+                    line: 3,
+                },
+                Symbol {
+                    name: "Foo".into(),
+                    kind: "struct".into(),
+                    file: "b.rs".into(),
+                    line: 1,
+                },
+                Symbol {
+                    name: "NotUsage".into(),
+                    kind: "struct".into(),
+                    file: "a.rs".into(),
+                    line: 9,
+                },
             ],
             ..Default::default()
         };
@@ -450,9 +487,24 @@ mod tests {
         use crate::search::GrepMatch;
         let root = Path::new("C:/proj");
         let hits = vec![
-            GrepMatch { path: PathBuf::from("C:/proj/.agent/index.json"), line: 7, text: "x".into(), project: None },
-            GrepMatch { path: PathBuf::from(".agent/index.json"), line: 9, text: "y".into(), project: None },
-            GrepMatch { path: PathBuf::from("src/lib.rs"), line: 3, text: "z".into(), project: None },
+            GrepMatch {
+                path: PathBuf::from("C:/proj/.agent/index.json"),
+                line: 7,
+                text: "x".into(),
+                project: None,
+            },
+            GrepMatch {
+                path: PathBuf::from(".agent/index.json"),
+                line: 9,
+                text: "y".into(),
+                project: None,
+            },
+            GrepMatch {
+                path: PathBuf::from("src/lib.rs"),
+                line: 3,
+                text: "z".into(),
+                project: None,
+            },
         ];
         let kept = filter_out_own_index(root, hits);
         assert_eq!(kept.len(), 1);

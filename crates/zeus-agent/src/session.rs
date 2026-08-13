@@ -73,8 +73,8 @@ impl SessionStore {
         std::fs::create_dir_all(&self.dir)?;
         let mut state = state.clone();
         state.last_activity = unix_millis();
-        let text = serde_json::to_string_pretty(&state)
-            .map_err(|e| AgentError::Session(e.to_string()))?;
+        let text =
+            serde_json::to_string_pretty(&state).map_err(|e| AgentError::Session(e.to_string()))?;
         std::fs::write(self.path(&state.session_id), text)?;
         Ok(())
     }
@@ -94,7 +94,10 @@ impl SessionStore {
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str()).map(str::to_string);
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string);
             let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
                 continue;
             };
@@ -138,11 +141,7 @@ impl SessionStore {
                 modified: activity,
             });
         }
-        out.sort_by(|a, b| {
-            b.modified
-                .cmp(&a.modified)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
         Ok(out)
     }
 
@@ -195,8 +194,8 @@ mod tests {
         assert_eq!(loaded.messages[0].content, "hello");
     }
 
-#[test]
-fn list_session_ids_finds_saved_sessions() {
+    #[test]
+    fn list_session_ids_finds_saved_sessions() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path().to_path_buf());
         store.save(&ConversationState::new("a")).unwrap();

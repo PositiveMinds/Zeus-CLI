@@ -114,11 +114,7 @@ pub fn source_files(root: &Path) -> Vec<(PathBuf, String)> {
                 continue;
             }
             out.extend(source_files(&path));
-        } else if entry
-            .file_type()
-            .map(|t| t.is_file())
-            .unwrap_or(false)
-        {
+        } else if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             let Ok(meta) = entry.metadata() else { continue };
             if meta.len() > MAX_FILE_BYTES || meta.len() == 0 {
                 continue;

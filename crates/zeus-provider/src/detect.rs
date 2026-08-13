@@ -91,8 +91,14 @@ mod tests {
             local_probe_url(&cfg("llamacpp", Some("http://127.0.0.1:8080/v1/"))),
             Some("http://127.0.0.1:8080/v1/models".to_string())
         );
-        assert_eq!(local_probe_url(&cfg("anthropic", Some("https://api.anthropic.com"))), None);
-        assert_eq!(local_probe_url(&cfg("openai", Some("https://api.openai.com/v1"))), None);
+        assert_eq!(
+            local_probe_url(&cfg("anthropic", Some("https://api.anthropic.com"))),
+            None
+        );
+        assert_eq!(
+            local_probe_url(&cfg("openai", Some("https://api.openai.com/v1"))),
+            None
+        );
     }
 
     #[tokio::test]
@@ -116,7 +122,13 @@ mod tests {
 
     #[tokio::test]
     async fn non_local_kind_is_assumed_reachable_without_probing() {
-        assert!(is_provider_reachable(&cfg("anthropic", Some("https://ai.io")), Duration::from_millis(100)).await);
+        assert!(
+            is_provider_reachable(
+                &cfg("anthropic", Some("https://ai.io")),
+                Duration::from_millis(100)
+            )
+            .await
+        );
         assert!(
             is_provider_reachable(
                 &cfg("openai", Some("https://api.openai.com/v1")),

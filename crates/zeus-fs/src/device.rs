@@ -64,7 +64,11 @@ impl DeviceEngine {
         )
     }
 
-    fn into_output(status: std::process::ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> DeviceOutput {
+    fn into_output(
+        status: std::process::ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) -> DeviceOutput {
         let mut stdout = String::from_utf8_lossy(&stdout).into_owned();
         let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
         if stdout.len() > MAX_CAPTURED_BYTES {
@@ -127,7 +131,10 @@ impl DeviceEngine {
             Some(s) => Ok(Self::into_output(s, out, err)),
             None => {
                 let stderr = if err.is_empty() {
-                    format!("adb {args:?} timed out after {}s", ADB_COMMAND_TIMEOUT.as_secs())
+                    format!(
+                        "adb {args:?} timed out after {}s",
+                        ADB_COMMAND_TIMEOUT.as_secs()
+                    )
                 } else {
                     String::from_utf8_lossy(&err).into_owned()
                 };
@@ -168,7 +175,10 @@ impl DeviceEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.enforce(&format!("disconnect wireless device: {host_port}"), approver)?;
+        self.enforce(
+            &format!("disconnect wireless device: {host_port}"),
+            approver,
+        )?;
         self.run(&["disconnect", host_port])
     }
 
@@ -186,7 +196,10 @@ impl DeviceEngine {
         // against the zeus process's own cwd, not `project_root` — passing
         // the canonicalized absolute path removes that ambiguity too.
         let resolved = resolve_in_project(&self.project_root, std::path::Path::new(apk))?;
-        self.enforce(&format!("install APK on device: {}", resolved.display()), approver)?;
+        self.enforce(
+            &format!("install APK on device: {}", resolved.display()),
+            approver,
+        )?;
         let apk_path = resolved.to_string_lossy().into_owned();
         self.run(&["install", "-r", &apk_path])
     }
@@ -222,7 +235,13 @@ impl DeviceEngine {
             approver,
         )?;
         match activity {
-            Some(activity) => self.run(&["shell", "am", "start", "-n", &format!("{package}/{activity}")]),
+            Some(activity) => self.run(&[
+                "shell",
+                "am",
+                "start",
+                "-n",
+                &format!("{package}/{activity}"),
+            ]),
             None => self.run(&[
                 "shell",
                 "monkey",
@@ -249,7 +268,9 @@ impl DeviceEngine {
         self.enforce(
             &format!(
                 "dump device logcat{}",
-                filter.map(|f| format!(" filtered to {f}")).unwrap_or_default()
+                filter
+                    .map(|f| format!(" filtered to {f}"))
+                    .unwrap_or_default()
             ),
             approver,
         )?;
@@ -268,8 +289,15 @@ impl DeviceEngine {
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         let path = self.artifact_path(out, "screenshot", "png")?;
-        self.enforce(&format!("capture device screenshot to {}", path.display()), approver)?;
-        let mut out = self.exec_out_to_file(&["exec-out", "screencap", "-p"], &path, Duration::from_secs(20))?;
+        self.enforce(
+            &format!("capture device screenshot to {}", path.display()),
+            approver,
+        )?;
+        let mut out = self.exec_out_to_file(
+            &["exec-out", "screencap", "-p"],
+            &path,
+            Duration::from_secs(20),
+        )?;
         if out.success {
             out.stdout = format!("screenshot saved to {}", path.display());
         }
@@ -334,8 +362,8 @@ impl DeviceEngine {
                     if let Some(mut err) = child.stderr.take() {
                         let _ = err.read_to_string(&mut stderr);
                     }
-                    success = status.success()
-                        && dest.metadata().map(|m| m.len() > 0).unwrap_or(false);
+                    success =
+                        status.success() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false);
                     break;
                 }
                 Ok(None) => {
@@ -424,7 +452,10 @@ impl DeviceEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.enforce("manage adb reverse forwarding (device -> host localhost)", approver)?;
+        self.enforce(
+            "manage adb reverse forwarding (device -> host localhost)",
+            approver,
+        )?;
         match local_port {
             None => self.run(&["reverse", "--list"]),
             Some(lp) => {
@@ -465,7 +496,10 @@ impl DeviceEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.enforce(&format!("send input event on device: input {event}"), approver)?;
+        self.enforce(
+            &format!("send input event on device: input {event}"),
+            approver,
+        )?;
         let input_cmd = format!("input {event}");
         self.run(&["shell", input_cmd.as_str()])
     }
@@ -481,21 +515,29 @@ impl DeviceEngine {
 
     /// Copy a file or directory off the device. `local` is relative to the
     /// project root; a bare filename copies into the project root.
-    pub fn pull<F>(&self, remote: &str, local: Option<&str>, approver: &mut F) -> Result<DeviceOutput>
+    pub fn pull<F>(
+        &self,
+        remote: &str,
+        local: Option<&str>,
+        approver: &mut F,
+    ) -> Result<DeviceOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        let local = local
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                std::path::Path::new(remote)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().replace("/", "_"))
-                    .unwrap_or_else(|| format!("pull_{}", std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)))
-            });
+        let local = local.map(|s| s.to_string()).unwrap_or_else(|| {
+            std::path::Path::new(remote)
+                .file_name()
+                .map(|n| n.to_string_lossy().replace("/", "_"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "pull_{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    )
+                })
+        });
         // Contained the same way every other file-touching tool is — a bare
         // `project_root.join(local)` would let an absolute `local` (or a
         // `..` traversal) override the join entirely and write the pulled
@@ -585,8 +627,16 @@ mod tests {
             engine.input("tap 100 200", &mut approve),
             engine.logcat_clear(&mut approve),
             engine.pull("/sdcard/Download/readme.txt", None, &mut approve),
-            engine.pull("/sdcard/Download/readme.txt", Some("copies/readme.txt"), &mut approve),
-            engine.push("assets/data.json", "/sdcard/Download/data.json", &mut approve),
+            engine.pull(
+                "/sdcard/Download/readme.txt",
+                Some("copies/readme.txt"),
+                &mut approve,
+            ),
+            engine.push(
+                "assets/data.json",
+                "/sdcard/Download/data.json",
+                &mut approve,
+            ),
         ];
         for r in results {
             assert!(r.is_ok() || r.is_err());
@@ -598,7 +648,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let engine = engine(tmp.path());
         if let Ok(out) = engine.screenshot(None, &mut approve) {
-            assert!(out.artifact.is_some(), "screenshot must report a target path");
+            assert!(
+                out.artifact.is_some(),
+                "screenshot must report a target path"
+            );
         }
         // No device/adb -> the spawn error surfaced earlier; also valid.
     }

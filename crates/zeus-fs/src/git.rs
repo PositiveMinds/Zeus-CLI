@@ -275,7 +275,10 @@ impl GitEngine {
     {
         self.enforce(
             "git_branch_delete",
-            format!("delete branch '{name}'{}", if force { " (forced)" } else { "" }),
+            format!(
+                "delete branch '{name}'{}",
+                if force { " (forced)" } else { "" }
+            ),
             None,
             None,
             &mut approver,
@@ -284,7 +287,12 @@ impl GitEngine {
         self.run(&["branch", flag, name])
     }
 
-    pub fn tag_create<F>(&self, name: &str, message: Option<&str>, mut approver: F) -> Result<GitOutput>
+    pub fn tag_create<F>(
+        &self,
+        name: &str,
+        message: Option<&str>,
+        mut approver: F,
+    ) -> Result<GitOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
@@ -372,7 +380,11 @@ impl GitEngine {
         if force {
             desc.push_str(" --force");
         }
-        let command = if force { Some("--force".to_string()) } else { None };
+        let command = if force {
+            Some("--force".to_string())
+        } else {
+            None
+        };
         self.enforce("git_push", desc, None, command, &mut approver)?;
         let mut args = vec!["push"];
         if force {
@@ -419,7 +431,12 @@ impl GitEngine {
 
     /// `ResetMode::Hard` is denied by a built-in rule (`git_reset` + command
     /// pattern `--hard*`) — same rationale as force-push above.
-    pub fn reset<F>(&self, mode: ResetMode, target: Option<&str>, mut approver: F) -> Result<GitOutput>
+    pub fn reset<F>(
+        &self,
+        mode: ResetMode,
+        target: Option<&str>,
+        mut approver: F,
+    ) -> Result<GitOutput>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
@@ -593,7 +610,10 @@ impl GitEngine {
         self.require_gh("create")?;
         self.enforce(
             "git_pr_create",
-            format!("gh pr create title='{title}' base={}", base.unwrap_or("<default>")),
+            format!(
+                "gh pr create title='{title}' base={}",
+                base.unwrap_or("<default>")
+            ),
             None,
             None,
             &mut approver,
@@ -631,7 +651,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        Command::new("git").arg("init").current_dir(&root).output().unwrap();
+        Command::new("git")
+            .arg("init")
+            .current_dir(&root)
+            .output()
+            .unwrap();
         Command::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(&root)
@@ -654,7 +678,9 @@ mod tests {
             .current_dir(tmp.path().join("proj"))
             .output()
             .unwrap();
-        engine.commit(&format!("add {name}"), false, approve).unwrap();
+        engine
+            .commit(&format!("add {name}"), false, approve)
+            .unwrap();
     }
 
     #[test]
@@ -700,7 +726,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        Command::new("git").arg("init").current_dir(&root).output().unwrap();
+        Command::new("git")
+            .arg("init")
+            .current_dir(&root)
+            .output()
+            .unwrap();
         Command::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(&root)
@@ -749,7 +779,9 @@ mod tests {
             .unwrap();
         // Commit is allowed by default (reversible tier); push is on the ask
         // tier, so a denying approver aborts after the commit succeeds.
-        let err = engine.commit_and_push("msg", false, None, deny).unwrap_err();
+        let err = engine
+            .commit_and_push("msg", false, None, deny)
+            .unwrap_err();
         assert!(matches!(err, FsError::Denied(_)));
     }
 
@@ -794,7 +826,9 @@ mod tests {
         let (tmp, engine) = init_repo();
         commit_one(&tmp, &engine, "a.txt", "hello");
         commit_one(&tmp, &engine, "b.txt", "world");
-        let out = engine.reset(ResetMode::Soft, Some("HEAD~1"), approve).unwrap();
+        let out = engine
+            .reset(ResetMode::Soft, Some("HEAD~1"), approve)
+            .unwrap();
         assert!(out.success, "soft reset failed: {}", out.stderr);
     }
 
@@ -891,9 +925,15 @@ mod tests {
             .unwrap();
         engine.commit("feature change", false, approve).unwrap();
 
-        engine.checkout("master", approve).or_else(|_| engine.checkout("main", approve)).unwrap();
+        engine
+            .checkout("master", approve)
+            .or_else(|_| engine.checkout("main", approve))
+            .unwrap();
         let merged = engine.merge("feature", approve).unwrap();
         assert!(!merged.success);
-        assert!(merged.stdout.to_lowercase().contains("conflict") || merged.stderr.to_lowercase().contains("conflict"));
+        assert!(
+            merged.stdout.to_lowercase().contains("conflict")
+                || merged.stderr.to_lowercase().contains("conflict")
+        );
     }
 }

@@ -203,7 +203,14 @@ fn scan_local_models_from(
     let mut seen = HashSet::new();
     for root in roots {
         if root.dir.is_dir() {
-            scan_dir(&root.dir, &root.source, root.depth, root.filtered, &mut found, &mut seen);
+            scan_dir(
+                &root.dir,
+                &root.source,
+                root.depth,
+                root.filtered,
+                &mut found,
+                &mut seen,
+            );
         }
     }
     found
@@ -259,7 +266,14 @@ fn scan_system_models_from(
     let mut seen = HashSet::new();
     for root in roots {
         if root.dir.is_dir() {
-            scan_dir(&root.dir, &root.source, root.depth, root.filtered, &mut found, &mut seen);
+            scan_dir(
+                &root.dir,
+                &root.source,
+                root.depth,
+                root.filtered,
+                &mut found,
+                &mut seen,
+            );
         }
     }
     found
@@ -289,10 +303,7 @@ fn scan_dir(
         }
         if file_type.is_dir() {
             if filtered {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if SKIP_DIR_NAMES.contains(&name) {
                     continue;
                 }
@@ -339,13 +350,9 @@ pub fn import_model_file(
     dest_dir: &Path,
     do_move: bool,
 ) -> crate::Result<PathBuf> {
-    let name = file
-        .path
-        .file_name()
-        .ok_or_else(|| crate::ProviderError::InvalidRequest(format!(
-            "no file name for {}",
-            file.path.display()
-        )))?;
+    let name = file.path.file_name().ok_or_else(|| {
+        crate::ProviderError::InvalidRequest(format!("no file name for {}", file.path.display()))
+    })?;
     std::fs::create_dir_all(dest_dir).map_err(|e| crate::ProviderError::Other(Box::new(e)))?;
     let dest = dest_dir.join(name);
     if dest.exists() {
@@ -358,10 +365,10 @@ pub fn import_model_file(
     if do_move {
         if std::fs::rename(&file.path, &dest).is_err() {
             // Cross-device move: fall back to copy + delete.
-            std::fs::copy(&file.path, &dest).map_err(|e| {
-                crate::ProviderError::Other(Box::new(e))
-            })?;
-            std::fs::remove_file(&file.path).map_err(|e| crate::ProviderError::Other(Box::new(e)))?;
+            std::fs::copy(&file.path, &dest)
+                .map_err(|e| crate::ProviderError::Other(Box::new(e)))?;
+            std::fs::remove_file(&file.path)
+                .map_err(|e| crate::ProviderError::Other(Box::new(e)))?;
         }
     } else {
         std::fs::copy(&file.path, &dest).map_err(|e| crate::ProviderError::Other(Box::new(e)))?;
@@ -438,7 +445,10 @@ mod tests {
         std::fs::write(deep.join("too-deep.gguf"), b"fake").unwrap();
 
         let found = scan_local_models_from(&tmp.path().join("models"), &[], None);
-        assert!(found.is_empty(), "file beyond MAX_DEPTH should not be found");
+        assert!(
+            found.is_empty(),
+            "file beyond MAX_DEPTH should not be found"
+        );
     }
 
     #[test]
@@ -473,7 +483,8 @@ mod tests {
 
         // Downloads is both a profile root and a configured extra dir.
         let extra = fake_home.join("Downloads");
-        let found = scan_system_models_from(&zeus_dir, std::slice::from_ref(&extra), Some(&fake_home));
+        let found =
+            scan_system_models_from(&zeus_dir, std::slice::from_ref(&extra), Some(&fake_home));
         assert_eq!(found.len(), 1, "same file via two roots reported once");
     }
 

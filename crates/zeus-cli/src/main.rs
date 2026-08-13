@@ -1,36 +1,36 @@
 //! zeus — database-free AI coding agent CLI.
 
-mod tui;
-mod ui;
-mod highlight;
 mod clipboard;
 mod decor;
+mod highlight;
+mod tui;
+mod ui;
 mod update;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
+use std::io::{self, IsTerminal, Read as IoRead, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use tracing::{error, info, warn};
 use zeus_agent::{
     discover_workflows, load_custom_personas, personas_by_department, Agent, AgentEvent,
     AgentOptions, BackgroundTaskRegistry, ContextManager, ExpandResult, HookRunner, McpClient,
     SessionStore, SlashCommands, TerminalRunner, ToolManager, TurnResult,
 };
 use zeus_config::{Config, KeysFile};
+use zeus_fs::{filter_out_own_index, word_boundary, IndexEngine, SymbolIndex};
 use zeus_fs::{
     ApprovalDecision, CopyOptions, EditOptions, GitEngine, PermissionGate, PermissionRequest,
     ReadOptions, ResetMode, SearchOptions, Workspace, WriteOptions,
 };
-use zeus_fs::{filter_out_own_index, IndexEngine, SymbolIndex, word_boundary};
 use zeus_logging::{init as init_logging, LoggingOptions};
 use zeus_provider::{
     create_default, create_provider, ChatRequest, Message, ModelProvider, StreamEvent,
     UnconfiguredProvider,
 };
-use std::io::{self, IsTerminal, Read as IoRead, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use tracing::{error, info, warn};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -194,15 +194,10 @@ enum Commands {
     },
 
     /// Delete a file or directory (always asks unless --yes)
-    Rm {
-        path: PathBuf,
-    },
+    Rm { path: PathBuf },
 
     /// Rename or move a file/directory (git mv-aware)
-    Mv {
-        from: PathBuf,
-        to: PathBuf,
-    },
+    Mv { from: PathBuf, to: PathBuf },
 
     /// Copy a file
     Cp {
@@ -248,9 +243,7 @@ enum Commands {
     },
 
     /// Restore files from a checkpoint turn
-    Rewind {
-        turn_id: String,
-    },
+    Rewind { turn_id: String },
 
     /// List checkpoint turns
     Checkpoints,
@@ -350,9 +343,7 @@ enum CodeintCmd {
     },
     /// Go-to-definition — same as `find` but shows the resolved primary
     /// definition for the symbol.
-    Defs {
-        name: String,
-    },
+    Defs { name: String },
     /// Find references to a symbol across the project (and any configured
     /// extra project roots) via ripgrep.
     Refs {
@@ -662,9 +653,8 @@ async fn run() -> Result<()> {
     // — a stray log line written to stderr mid-session corrupts that
     // screen, so the console layer must be off before the TUI ever starts.
     // File logging (if configured) still captures everything either way.
-    let entering_tui = cli.command.is_none()
-        && io::stdin().is_terminal()
-        && io::stdout().is_terminal();
+    let entering_tui =
+        cli.command.is_none() && io::stdin().is_terminal() && io::stdout().is_terminal();
     let _ = init_logging(LoggingOptions {
         level,
         file: config.settings.logging.file,
@@ -697,19 +687,12 @@ async fn run() -> Result<()> {
             plan,
             auto,
             workflow,
-        }) => cmd_agent(
-            &config,
-            message,
-            provider,
-            model,
-            session,
-            resume,
-            plan,
-            auto,
-            workflow,
-            cli.yes,
-        )
-        .await,
+        }) => {
+            cmd_agent(
+                &config, message, provider, model, session, resume, plan, auto, workflow, cli.yes,
+            )
+            .await
+        }
         Some(Commands::Sessions) => cmd_sessions(&config),
         Some(Commands::Update { check }) => update::cmd_update(check).await,
         Some(Commands::Key { action }) => cmd_key(&config, action),
@@ -985,7 +968,8 @@ async fn resolve_provider(
 
     if !explicit {
         if let Some(cfg) = config.providers.get(&name) {
-            if !zeus_provider::is_provider_reachable(cfg, std::time::Duration::from_millis(800)).await
+            if !zeus_provider::is_provider_reachable(cfg, std::time::Duration::from_millis(800))
+                .await
             {
                 // Default provider is llama.cpp but no server is running yet:
                 // auto-download the llama-server binary + model file and launch
@@ -1004,9 +988,11 @@ async fn resolve_provider(
                         {
                             Ok(server) => {
                                 info!(origin = %server.origin, model = %entry.name, "auto-started llama.cpp local server");
-                                return create_provider(&name, &config.providers).or_else(|_| {
-                                    create_default(&name, &config.providers)
-                                }).with_context(|| format!("failed to create provider '{name}'"));
+                                return create_provider(&name, &config.providers)
+                                    .or_else(|_| create_default(&name, &config.providers))
+                                    .with_context(|| {
+                                        format!("failed to create provider '{name}'")
+                                    });
                             }
                             Err(e) => {
                                 info!(model = %entry.name, error = %e, "auto-start of llama.cpp failed; falling back")
@@ -1081,7 +1067,9 @@ pub(crate) fn describe_providers(config: &Config) -> Vec<String> {
     let stored = KeysFile::load(&config.global.keys_toml).unwrap_or_default();
     let mut out = Vec::new();
     for name in names {
-        let Some(cfg) = config.providers.get(name) else { continue };
+        let Some(cfg) = config.providers.get(name) else {
+            continue;
+        };
         let model = cfg.default_model.as_deref().unwrap_or("");
         let local = matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp");
         let status = if local {
@@ -1097,7 +1085,10 @@ pub(crate) fn describe_providers(config: &Config) -> Vec<String> {
         } else {
             "ready".to_string()
         };
-        out.push(format!("  {name:<11} kind={:<10} model={:<18} {status}", cfg.kind, model));
+        out.push(format!(
+            "  {name:<11} kind={:<10} model={:<18} {status}",
+            cfg.kind, model
+        ));
     }
     out
 }
@@ -1105,12 +1096,24 @@ pub(crate) fn describe_providers(config: &Config) -> Vec<String> {
 /// Persist the default provider (and optionally model) to the active
 /// settings.toml layer — so a `/provider` switch survives restarts. Returns
 /// the path written, for the confirm message.
-pub(crate) fn persist_default_provider(config: &Config, provider: &str, model: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn persist_default_provider(
+    config: &Config,
+    provider: &str,
+    model: Option<&str>,
+) -> Result<PathBuf> {
     let path = settings_file_path(config, false);
     let mut doc = load_toml_or_empty(&path)?;
-    set_toml_path(&mut doc, &["model", "provider"], toml::Value::String(provider.to_string()));
+    set_toml_path(
+        &mut doc,
+        &["model", "provider"],
+        toml::Value::String(provider.to_string()),
+    );
     if let Some(m) = model {
-        set_toml_path(&mut doc, &["model", "model"], toml::Value::String(m.to_string()));
+        set_toml_path(
+            &mut doc,
+            &["model", "model"],
+            toml::Value::String(m.to_string()),
+        );
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("create settings dir")?;
@@ -1144,7 +1147,11 @@ pub(crate) async fn list_models_by_provider(
             _ => None,
         }
     });
-    futures::future::join_all(fetches).await.into_iter().flatten().collect()
+    futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 async fn cmd_chat(
@@ -1169,9 +1176,7 @@ async fn cmd_chat(
     let request = ChatRequest::new(
         model.clone(),
         vec![
-            Message::system(
-                "You are zeus, a helpful coding assistant. Be concise and accurate.",
-            ),
+            Message::system("You are zeus, a helpful coding assistant. Be concise and accurate."),
             Message::user(message),
         ],
     );
@@ -1246,11 +1251,7 @@ async fn cmd_models(
 /// A model is "imported" by copying it into `~/.zeus/models`; `--move`
 /// relocates it instead. `import` indexes into the same listing shown by
 /// `zeus models --local`.
-fn cmd_local_models(
-    config: &Config,
-    import: Option<&Path>,
-    relocate: bool,
-) -> Result<()> {
+fn cmd_local_models(config: &Config, import: Option<&Path>, relocate: bool) -> Result<()> {
     let extra_dirs: Vec<PathBuf> = config
         .settings
         .extra_model_dirs
@@ -1269,7 +1270,7 @@ fn cmd_local_models(
         return cmd_import_model(config, model, relocate);
     }
 
-if found.is_empty() {
+    if found.is_empty() {
         println!("(no local model files found)");
         println!("scanned: {}", config.global.models.display());
         println!("hint: drop a .gguf/.safetensors under Downloads/Desktop/Documents or add `extra_model_dirs` to extend the scan.");
@@ -1279,12 +1280,7 @@ if found.is_empty() {
     println!("{} model files on this system:", found.len());
     for f in &found {
         let size_mb = f.size_bytes as f64 / (1024.0 * 1024.0);
-        println!(
-            "{:>10.1} MB  {}  [{}]",
-            size_mb,
-            f.path.display(),
-            f.source
-        );
+        println!("{:>10.1} MB  {}  [{}]", size_mb, f.path.display(), f.source);
     }
     println!();
     println!("import into the zeus library:  zeus models --import \"<path from above>\"   (add --move to relocate)");
@@ -1317,19 +1313,20 @@ fn cmd_import_model(
 async fn cmd_pull(config: &Config, source: PullCmd) -> Result<()> {
     match source {
         PullCmd::Ollama { model } => {
-            let cfg = config
-                .providers
-                .get("ollama")
-                .cloned()
-                .unwrap_or(zeus_config::ProviderConfig {
-                    kind: "ollama".into(),
-                    base_url: Some("http://127.0.0.1:11434".into()),
-                    api_key_env: None,
-                    default_model: None,
-                    headers: Default::default(),
-                    embeddings: true,
-                    prompt_cache: false,
-                });
+            let cfg =
+                config
+                    .providers
+                    .get("ollama")
+                    .cloned()
+                    .unwrap_or(zeus_config::ProviderConfig {
+                        kind: "ollama".into(),
+                        base_url: Some("http://127.0.0.1:11434".into()),
+                        api_key_env: None,
+                        default_model: None,
+                        headers: Default::default(),
+                        embeddings: true,
+                        prompt_cache: false,
+                    });
             let base_url = cfg
                 .base_url
                 .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
@@ -1345,19 +1342,20 @@ async fn cmd_pull(config: &Config, source: PullCmd) -> Result<()> {
             let dest_dir = config.global.models.clone();
             println!("downloading {repo}/{file} -> {}", dest_dir.display());
             let mut last_pct_reported = 0u64;
-            let path = zeus_provider::download_hf_file(&repo, &file, &dest_dir, |downloaded, total| {
-                if let Some(total) = total {
-                    if total > 0 {
-                        let pct = downloaded * 100 / total;
-                        if pct >= last_pct_reported + 10 || pct == 100 {
-                            last_pct_reported = pct;
-                            println!("  {pct}% ({downloaded}/{total} bytes)");
+            let path =
+                zeus_provider::download_hf_file(&repo, &file, &dest_dir, |downloaded, total| {
+                    if let Some(total) = total {
+                        if total > 0 {
+                            let pct = downloaded * 100 / total;
+                            if pct >= last_pct_reported + 10 || pct == 100 {
+                                last_pct_reported = pct;
+                                println!("  {pct}% ({downloaded}/{total} bytes)");
+                            }
                         }
                     }
-                }
-            })
-            .await
-            .context("hugging face download")?;
+                })
+                .await
+                .context("hugging face download")?;
             println!(
                 "done — saved to {}, now visible via `zeus models --local`",
                 path.display()
@@ -1408,10 +1406,7 @@ async fn cmd_serve(config: &Config, model: Option<String>) -> Result<()> {
             config.global.models.join(&entry.file).display()
         );
     }
-    println!(
-        "logs: {}/llamacpp.stderr.log",
-        config.global.logs.display()
-    );
+    println!("logs: {}/llamacpp.stderr.log", config.global.logs.display());
     println!(
         "connect with `zeus chat --provider llamacpp --model {}` or via `/provider` in the TUI",
         entry.file
@@ -1423,13 +1418,16 @@ async fn cmd_serve(config: &Config, model: Option<String>) -> Result<()> {
 /// a server that fails to start (bad command, crashes during handshake)
 /// logs a warning and is skipped rather than failing the whole agent turn —
 /// one misconfigured server shouldn't take down every other tool.
-fn connect_configured_mcp_servers(config: &Config, project_root: &std::path::Path) -> Vec<McpClient> {
+fn connect_configured_mcp_servers(
+    config: &Config,
+    project_root: &std::path::Path,
+) -> Vec<McpClient> {
     config
         .settings
         .mcp_servers
         .iter()
-        .filter_map(|s| {
-            match McpClient::connect(&s.name, &s.command, &s.args, project_root) {
+        .filter_map(
+            |s| match McpClient::connect(&s.name, &s.command, &s.args, project_root) {
                 Ok(client) => {
                     info!(server = %s.name, tools = client.tools().len(), "connected MCP server");
                     Some(client)
@@ -1438,8 +1436,8 @@ fn connect_configured_mcp_servers(config: &Config, project_root: &std::path::Pat
                     error!(server = %s.name, ?e, "failed to connect MCP server; skipping");
                     None
                 }
-            }
-        })
+            },
+        )
         .collect()
 }
 
@@ -1449,7 +1447,9 @@ fn render_sessions(config: &Config) -> Result<String> {
     let store = SessionStore::new(config.global.sessions.clone());
     let summaries = store.summaries().context("list sessions")?;
     if summaries.is_empty() {
-        return Ok("no saved sessions yet — run a turn (zeus agent \"...\") to create one.".to_string());
+        return Ok(
+            "no saved sessions yet — run a turn (zeus agent \"...\") to create one.".to_string(),
+        );
     }
     let mut lines = Vec::new();
     for s in &summaries {
@@ -1506,10 +1506,12 @@ fn cmd_key(config: &Config, action: KeyCmd) -> Result<()> {
             };
             let key = match key {
                 Some(k) => k,
-                None => match read_hidden_line(&format!("Paste {name} API key (input hidden): "))? {
-                    Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-                    _ => bail!("cancelled — no key set"),
-                },
+                None => {
+                    match read_hidden_line(&format!("Paste {name} API key (input hidden): "))? {
+                        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+                        _ => bail!("cancelled — no key set"),
+                    }
+                }
             };
             save_provider_key(config, &name, &key)?;
             println!(
@@ -1544,7 +1546,7 @@ fn prompt_choose_provider(config: &Config) -> Result<String> {
             .map(|c| matches!(c.kind.as_str(), "ollama" | "lmstudio" | "llamacpp"))
             .unwrap_or(false);
         let ready = local
-            || stored.get(*name).is_some()
+            || stored.get(name).is_some()
             || cfg
                 .and_then(|c| c.api_key_env.as_ref())
                 .map(|var| std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false))
@@ -1587,11 +1589,9 @@ async fn build_agent(
 /// startup: it wires an `UnconfiguredProvider` placeholder so the UI still
 /// launches and the user can set providers/keys in-app via `/provider`.
 async fn build_agent_unconfigured(config: &Config) -> Result<Agent> {
-    let provider: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::new(
-        UnconfiguredProvider {
-            requested: Some(config.settings.model.provider.clone()),
-        },
-    );
+    let provider: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::new(UnconfiguredProvider {
+        requested: Some(config.settings.model.provider.clone()),
+    });
     build_agent_with_provider(config, provider, config.settings.model.model.clone(), None).await
 }
 
@@ -1725,7 +1725,17 @@ fn build_project_survey(config: &Config) -> Option<String> {
     let skipped = |f: &str| {
         matches!(
             f,
-            ".git" | "node_modules" | "target" | ".agent" | ".zeus" | ".venv" | "__pycache__" | "dist" | "build" | ".next" | ".cache"
+            ".git"
+                | "node_modules"
+                | "target"
+                | ".agent"
+                | ".zeus"
+                | ".venv"
+                | "__pycache__"
+                | "dist"
+                | "build"
+                | ".next"
+                | ".cache"
         )
     };
     fn walk(
@@ -1739,7 +1749,9 @@ fn build_project_survey(config: &Config) -> Option<String> {
         if depth > 6 || *entries >= 500 {
             return;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in rd.flatten() {
             if *entries >= 500 {
                 return;
@@ -1758,11 +1770,25 @@ fn build_project_survey(config: &Config) -> Option<String> {
             }
             *entries += 1;
             if ft.is_dir() {
-                walk(&entry.path(), depth + 1, top_dirs, top_files, entries, skipped);
+                walk(
+                    &entry.path(),
+                    depth + 1,
+                    top_dirs,
+                    top_files,
+                    entries,
+                    skipped,
+                );
             }
         }
     }
-    walk(root, 0, &mut top_dirs, &mut top_files, &mut entries, &skipped);
+    walk(
+        root,
+        0,
+        &mut top_dirs,
+        &mut top_files,
+        &mut entries,
+        &skipped,
+    );
 
     let mut lines = vec![
         "PROJECT SURVEY (facts observed from the filesystem, not guesses — verify anything you rely on)".to_string(),
@@ -1792,7 +1818,10 @@ fn build_project_survey(config: &Config) -> Option<String> {
 /// Printed once before each turn starts, so `print_agent_event` itself can
 /// stay a stateless per-event renderer (it has no notion of "first delta").
 fn print_turn_header() {
-    println!("{}", ui::styled(ui::assistant_marker_style(), "● assistant"));
+    println!(
+        "{}",
+        ui::styled(ui::assistant_marker_style(), "● assistant")
+    );
 }
 
 fn print_agent_event(ev: AgentEvent) {
@@ -1803,14 +1832,21 @@ fn print_agent_event(ev: AgentEvent) {
             let _ = write!(out, "{t}");
             let _ = out.flush();
         }
-        AgentEvent::ToolCallStarted { name, arguments, .. } => {
+        AgentEvent::ToolCallStarted {
+            name, arguments, ..
+        } => {
             let _ = writeln!(
                 out,
                 "\n{}",
                 ui::styled(ui::tool_style(), &format!("⚙ {name} {arguments}"))
             );
         }
-        AgentEvent::ToolCallFinished { name, is_error, result, .. } => {
+        AgentEvent::ToolCallFinished {
+            name,
+            is_error,
+            result,
+            ..
+        } => {
             let label = if is_error {
                 ui::styled(ui::error_style(), &format!("✗ {name} failed"))
             } else {
@@ -1835,7 +1871,10 @@ fn print_agent_event(ev: AgentEvent) {
             let done = todos.iter().filter(|t| t.status == "completed").count();
             eprintln!(
                 "{}",
-                ui::styled(ui::dim_style(), &format!("(todos: {done}/{} done)", todos.len()))
+                ui::styled(
+                    ui::dim_style(),
+                    &format!("(todos: {done}/{} done)", todos.len())
+                )
             );
         }
         AgentEvent::PlanGenerated { steps } => {
@@ -1858,7 +1897,10 @@ fn print_agent_event(ev: AgentEvent) {
         AgentEvent::PlanStepStarted { step } => {
             eprintln!(
                 "{}",
-                ui::styled(ui::warn_style(), &format!("{}. {}", step.id, step.description))
+                ui::styled(
+                    ui::warn_style(),
+                    &format!("{}. {}", step.id, step.description)
+                )
             );
         }
         AgentEvent::PlanReviewed { persona, report } => {
@@ -1867,7 +1909,10 @@ fn print_agent_event(ev: AgentEvent) {
                 "{}",
                 ui::styled(
                     ui::tool_style(),
-                    &format!("◆ review ({persona}): {}", report.chars().take(300).collect::<String>())
+                    &format!(
+                        "◆ review ({persona}): {}",
+                        report.chars().take(300).collect::<String>()
+                    )
                 )
             );
         }
@@ -1892,14 +1937,26 @@ fn print_agent_event(ev: AgentEvent) {
             );
         }
         AgentEvent::OrchestrationDone { summary } => {
-            let _ = writeln!(out, "\n{}", ui::styled(ui::assistant_marker_style(), "● plan complete"));
+            let _ = writeln!(
+                out,
+                "\n{}",
+                ui::styled(ui::assistant_marker_style(), "● plan complete")
+            );
             let _ = writeln!(out, "{summary}");
         }
         AgentEvent::OrchestrationRevision { report } => {
-            let _ = writeln!(out, "\n{}", ui::styled(ui::warn_style(), "⊘ lead reviewer did NOT accept"));
+            let _ = writeln!(
+                out,
+                "\n{}",
+                ui::styled(ui::warn_style(), "⊘ lead reviewer did NOT accept")
+            );
             let _ = writeln!(out, "{report}");
         }
-        AgentEvent::WorkflowStarted { id, description, phases } => {
+        AgentEvent::WorkflowStarted {
+            id,
+            description,
+            phases,
+        } => {
             let roster = phases
                 .iter()
                 .map(|p| format!("{} [{}]", p.prompt, p.persona))
@@ -1920,20 +1977,34 @@ fn print_agent_event(ev: AgentEvent) {
                 "{}",
                 ui::styled(ui::warn_style(), &format!("▶ {}", name))
             );
-            eprintln!("{}", ui::styled(ui::dim_style(), &format!("   as {persona}")));
+            eprintln!(
+                "{}",
+                ui::styled(ui::dim_style(), &format!("   as {persona}"))
+            );
         }
-        AgentEvent::WorkflowPhaseDone { name, persona, summary } => {
+        AgentEvent::WorkflowPhaseDone {
+            name,
+            persona,
+            summary,
+        } => {
             let _ = writeln!(
                 out,
                 "{}",
                 ui::styled(
                     ui::tool_style(),
-                    &format!("✓ phase · {name} [{persona}]: {}", summary.chars().take(300).collect::<String>())
+                    &format!(
+                        "✓ phase · {name} [{persona}]: {}",
+                        summary.chars().take(300).collect::<String>()
+                    )
                 )
             );
         }
         AgentEvent::WorkflowDone { summary } => {
-            let _ = writeln!(out, "\n{}", ui::styled(ui::assistant_marker_style(), "● workflow complete"));
+            let _ = writeln!(
+                out,
+                "\n{}",
+                ui::styled(ui::assistant_marker_style(), "● workflow complete")
+            );
             let _ = writeln!(out, "{summary}");
         }
         AgentEvent::RepoAnalyzed { stack, relevance } => {
@@ -1968,10 +2039,10 @@ fn print_agent_event(ev: AgentEvent) {
                 let _ = writeln!(
                     out,
                     "{}",
-                    ui::styled(ui::assistant_marker_style(), &format!(
-                        "wrote {}",
-                        written.join(", ")
-                    ))
+                    ui::styled(
+                        ui::assistant_marker_style(),
+                        &format!("wrote {}", written.join(", "))
+                    )
                 );
             }
         }
@@ -1979,9 +2050,10 @@ fn print_agent_event(ev: AgentEvent) {
             let _ = writeln!(
                 out,
                 "{}",
-                ui::styled(ui::assistant_marker_style(), &format!(
-                    "review ({persona}) complete"
-                ))
+                ui::styled(
+                    ui::assistant_marker_style(),
+                    &format!("review ({persona}) complete")
+                )
             );
             let _ = writeln!(out, "{report}");
         }
@@ -2013,6 +2085,7 @@ fn expand_slash_command(config: &Config, message: String) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one flag per CLI option; matches clap's flat shape
 async fn cmd_agent(
     config: &Config,
     message: String,
@@ -2062,9 +2135,13 @@ async fn cmd_agent(
         // `--plan`: research read-only, persist .agent/tasks.json, don't
         // execute. Plan mode is forced on so no tool call can mutate.
         agent.set_plan_mode(true);
-        agent.plan_turn(&message, print_agent_event, approver(yes)).await
+        agent
+            .plan_turn(&message, print_agent_event, approver(yes))
+            .await
     } else {
-        agent.run_turn(&message, print_agent_event, approver(yes)).await
+        agent
+            .run_turn(&message, print_agent_event, approver(yes))
+            .await
     }
     .context("agent turn")?;
 
@@ -2095,29 +2172,86 @@ async fn cmd_agent(
 /// instead starts fresh unless `--session` is passed explicitly.
 const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("help", "show this list"),
-    ("clear", "start a fresh session (new session id, empty context)"),
+    (
+        "clear",
+        "start a fresh session (new session id, empty context)",
+    ),
     ("new", "start a fresh session (alias for /clear)"),
-    ("compact", "force context compaction now, even under the auto threshold"),
+    (
+        "compact",
+        "force context compaction now, even under the auto threshold",
+    ),
     ("autocompact", "toggle auto-compaction: /autocompact on|off"),
-    ("context", "show token usage against the model's context window"),
+    (
+        "context",
+        "show token usage against the model's context window",
+    ),
     ("diff", "show uncommitted changes: /diff or /diff staged"),
-    ("undo", "revert file changes made this session (confirm with /undo confirm)"),
-    ("settings", "view/change display settings: reduced_motion, notify, accent <#hex>|reset"),
-    ("model", "switch model (opens a picker), or /model <name> directly"),
-    ("provider", "list providers, switch (<name>), or set a key: /provider key <name> (prompts, hidden)"),
-    ("mode", "set agent mode: /mode build|plan|auto (Tab also cycles)"),
-    ("plan", "plan-only turn: research a goal read-only, persist the plan, don't execute"),
-    ("understand", "read-only repository scan: what already exists for a topic (/understand auth)"),
-    ("orient", "write .agent/architecture.md + .agent/conventions.md (read-only scan)"),
-    ("review", "read-only review of uncommitted changes (copy passes, verdict at the end)"),
-    ("suggest", "read-only next-feature recommendations grounded in what already exists"),
-    ("workflow", "run a named multi-specialist pipeline: /workflow <name> <goal>"),
-    ("workflows", "list available workflows from .agent/workflows and ~/.zeus/workflows"),
-    ("bg", "run the workforce in the background (/bg <goal>); manage with `zeus bg ...`"),
+    (
+        "undo",
+        "revert file changes made this session (confirm with /undo confirm)",
+    ),
+    (
+        "settings",
+        "view/change display settings: reduced_motion, notify, accent <#hex>|reset",
+    ),
+    (
+        "model",
+        "switch model (opens a picker), or /model <name> directly",
+    ),
+    (
+        "provider",
+        "list providers, switch (<name>), or set a key: /provider key <name> (prompts, hidden)",
+    ),
+    (
+        "mode",
+        "set agent mode: /mode build|plan|auto (Tab also cycles)",
+    ),
+    (
+        "plan",
+        "plan-only turn: research a goal read-only, persist the plan, don't execute",
+    ),
+    (
+        "understand",
+        "read-only repository scan: what already exists for a topic (/understand auth)",
+    ),
+    (
+        "orient",
+        "write .agent/architecture.md + .agent/conventions.md (read-only scan)",
+    ),
+    (
+        "review",
+        "read-only review of uncommitted changes (copy passes, verdict at the end)",
+    ),
+    (
+        "suggest",
+        "read-only next-feature recommendations grounded in what already exists",
+    ),
+    (
+        "workflow",
+        "run a named multi-specialist pipeline: /workflow <name> <goal>",
+    ),
+    (
+        "workflows",
+        "list available workflows from .agent/workflows and ~/.zeus/workflows",
+    ),
+    (
+        "bg",
+        "run the workforce in the background (/bg <goal>); manage with `zeus bg ...`",
+    ),
     ("session", "show the current session id"),
-    ("sessions", "list saved sessions (opens a resume picker in the TUI)"),
-    ("agents", "list the specialist-agents roster grouped by department (/agents count)"),
-    ("copy", "copy the last assistant reply to the system clipboard"),
+    (
+        "sessions",
+        "list saved sessions (opens a resume picker in the TUI)",
+    ),
+    (
+        "agents",
+        "list the specialist-agents roster grouped by department (/agents count)",
+    ),
+    (
+        "copy",
+        "copy the last assistant reply to the system clipboard",
+    ),
 ];
 
 fn print_repl_help_lines() -> String {
@@ -2143,13 +2277,13 @@ fn print_repl_help() {
 /// convenient for scripting but echoes the key to the terminal) and
 /// hidden-prompt (`/provider key <name>`, masked input) forms.
 fn save_provider_key(config: &Config, name: &str, key: &str) -> Result<()> {
-    let cfg = config
-        .providers
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("unknown provider '{name}' — see `zeus key list` or /provider for the list"))?;
+    let cfg = config.providers.get(name).ok_or_else(|| {
+        anyhow::anyhow!("unknown provider '{name}' — see `zeus key list` or /provider for the list")
+    })?;
     let mut keys = KeysFile::load(&config.global.keys_toml).context("read key store")?;
     keys.keys.insert(name.to_string(), key.to_string());
-    keys.save(&config.global.keys_toml).context("save key store")?;
+    keys.save(&config.global.keys_toml)
+        .context("save key store")?;
     if let Some(var) = &cfg.api_key_env {
         std::env::set_var(var, key);
     }
@@ -2206,10 +2340,17 @@ fn handle_settings_slash(arg: &str, config: &Config) {
     match parts.as_slice() {
         [] => {
             println!("reduced_motion:       {}", config.settings.reduced_motion);
-            println!("notify_on_completion: {}", config.settings.notify_on_completion);
+            println!(
+                "notify_on_completion: {}",
+                config.settings.notify_on_completion
+            );
             println!(
                 "accent_color:         {}",
-                config.settings.accent_color.as_deref().unwrap_or("(default violet)")
+                config
+                    .settings
+                    .accent_color
+                    .as_deref()
+                    .unwrap_or("(default violet)")
             );
             println!("Use /settings reduced_motion on|off, /settings notify on|off, /settings accent <#hex>|reset.");
         }
@@ -2235,7 +2376,9 @@ fn handle_settings_slash(arg: &str, config: &Config) {
             Ok(()) => println!("accent_color: {hex} (takes effect next launch)"),
             Err(e) => eprintln!("couldn't save setting: {e}"),
         },
-        _ => eprintln!("usage: /settings [reduced_motion on|off] [notify on|off] [accent <#hex>|reset]"),
+        _ => eprintln!(
+            "usage: /settings [reduced_motion on|off] [notify on|off] [accent <#hex>|reset]"
+        ),
     }
 }
 
@@ -2248,7 +2391,11 @@ async fn handle_provider_slash(arg: &str, config: &Config, agent: &mut Agent) {
     match parts.as_slice() {
         // `/provider` — show current + full configured roster.
         [] => {
-            println!("current provider: {} / model: {}", agent.provider_id(), agent.model());
+            println!(
+                "current provider: {} / model: {}",
+                agent.provider_id(),
+                agent.model()
+            );
             println!("Configured providers:");
             for line in describe_providers(config) {
                 println!("{line}");
@@ -2268,41 +2415,47 @@ async fn handle_provider_slash(arg: &str, config: &Config, agent: &mut Agent) {
         },
         // `/provider key <name>` — no key on the line, so prompt for one
         // with echo suppressed instead of requiring it in cleartext.
-        ["key", name] => match read_hidden_line(&format!("Paste {name} API key (input hidden): ")) {
-            Ok(Some(key)) if !key.trim().is_empty() => match save_provider_key(config, name, key.trim()) {
-                Ok(()) => println!(
-                    "key saved for '{name}' in {} — persistent across restarts.",
-                    config.global.keys_toml.display()
-                ),
-                Err(e) => eprintln!("{e:#}"),
-            },
-            Ok(_) => eprintln!("cancelled — no key set"),
-            Err(e) => eprintln!("couldn't read key: {e}"),
-        },
-        // `/provider key` with no args — usage hint, not a provider switch.
-        ["key"] => eprintln!("usage: /provider key <name> (prompts, hidden) or /provider key <name> <KEY>"),
-        // `/provider <name>` — switch the active provider + persist default.
-        [name] => {
-            match create_provider(name, &config.providers) {
-                Ok(handle) => {
-                    agent.set_provider(handle);
-                    let model = config
-                        .providers
-                        .get(name)
-                        .and_then(|c| c.default_model.clone())
-                        .unwrap_or_else(|| agent.model().to_string());
-                    agent.set_model(model.clone());
-                    match persist_default_provider(config, name, Some(&model)) {
-                        Ok(path) => println!(
-                            "switched to provider: {name} (model: {model}) — saved to {}",
-                            path.display()
+        ["key", name] => {
+            match read_hidden_line(&format!("Paste {name} API key (input hidden): ")) {
+                Ok(Some(key)) if !key.trim().is_empty() => {
+                    match save_provider_key(config, name, key.trim()) {
+                        Ok(()) => println!(
+                            "key saved for '{name}' in {} — persistent across restarts.",
+                            config.global.keys_toml.display()
                         ),
-                        Err(e) => eprintln!("switched to provider {name}, but saving default failed: {e:#}"),
+                        Err(e) => eprintln!("{e:#}"),
                     }
                 }
-                Err(e) => eprintln!("couldn't switch to '{name}': {e:#}"),
+                Ok(_) => eprintln!("cancelled — no key set"),
+                Err(e) => eprintln!("couldn't read key: {e}"),
             }
         }
+        // `/provider key` with no args — usage hint, not a provider switch.
+        ["key"] => {
+            eprintln!("usage: /provider key <name> (prompts, hidden) or /provider key <name> <KEY>")
+        }
+        // `/provider <name>` — switch the active provider + persist default.
+        [name] => match create_provider(name, &config.providers) {
+            Ok(handle) => {
+                agent.set_provider(handle);
+                let model = config
+                    .providers
+                    .get(name)
+                    .and_then(|c| c.default_model.clone())
+                    .unwrap_or_else(|| agent.model().to_string());
+                agent.set_model(model.clone());
+                match persist_default_provider(config, name, Some(&model)) {
+                    Ok(path) => println!(
+                        "switched to provider: {name} (model: {model}) — saved to {}",
+                        path.display()
+                    ),
+                    Err(e) => {
+                        eprintln!("switched to provider {name}, but saving default failed: {e:#}")
+                    }
+                }
+            }
+            Err(e) => eprintln!("couldn't switch to '{name}': {e:#}"),
+        },
         _ => eprintln!("usage: /provider | /provider <name> | /provider key <name> <KEY>"),
     }
 }
@@ -2445,12 +2598,14 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
             match cmd {
                 "help" => print_repl_help(),
                 "clear" => {
-                    let (provider, model) = (agent.provider_id().to_string(), agent.model().to_string());
+                    let (provider, model) =
+                        (agent.provider_id().to_string(), agent.model().to_string());
                     agent = build_agent_repl_with(config, Some(provider), Some(model)).await?;
                     println!("cleared — new session={}", agent.session_id());
                 }
                 "new" => {
-                    let (provider, model) = (agent.provider_id().to_string(), agent.model().to_string());
+                    let (provider, model) =
+                        (agent.provider_id().to_string(), agent.model().to_string());
                     agent = build_agent_repl_with(config, Some(provider), Some(model)).await?;
                     println!("new session started — session={}", agent.session_id());
                 }
@@ -2498,7 +2653,11 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                 "undo" => {
                     let ws = agent.workspace();
                     let turn_id = ws.files.turn_id.clone();
-                    let snaps = ws.files.checkpoints.load_snapshots(&turn_id).unwrap_or_default();
+                    let snaps = ws
+                        .files
+                        .checkpoints
+                        .load_snapshots(&turn_id)
+                        .unwrap_or_default();
                     if snaps.is_empty() {
                         println!("(nothing to undo this session)");
                     } else if arg.eq_ignore_ascii_case("confirm") {
@@ -2560,25 +2719,23 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                         }
                     }
                 }
-                "mode" => {
-                    match arg.to_ascii_lowercase().as_str() {
-                        "" => {
-                            let m = if agent.auto_mode() {
-                                "auto"
-                            } else if agent.plan_mode() {
-                                "plan"
-                            } else {
-                                "build"
-                            };
-                            println!("mode: {m}");
-                        }
-                        other => {
-                            agent.set_plan_mode(other == "plan");
-                            agent.set_auto_mode(other == "auto");
-                            println!("mode: {other}");
-                        }
+                "mode" => match arg.to_ascii_lowercase().as_str() {
+                    "" => {
+                        let m = if agent.auto_mode() {
+                            "auto"
+                        } else if agent.plan_mode() {
+                            "plan"
+                        } else {
+                            "build"
+                        };
+                        println!("mode: {m}");
                     }
-                }
+                    other => {
+                        agent.set_plan_mode(other == "plan");
+                        agent.set_auto_mode(other == "auto");
+                        println!("mode: {other}");
+                    }
+                },
                 "plan" => {
                     if arg.is_empty() {
                         eprintln!("usage: /plan <goal to plan>");
@@ -2607,15 +2764,13 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                         eprintln!("usage: /understand <topic> — e.g. /understand authentication");
                     } else {
                         print_turn_header();
-                        if let Err(e) =
-                            agent.understand_topic(arg, print_agent_event, approver(yes)).await
+                        if let Err(e) = agent
+                            .understand_topic(arg, print_agent_event, approver(yes))
+                            .await
                         {
                             eprintln!(
                                 "\n{}",
-                                ui::styled(
-                                    ui::error_style(),
-                                    &format!("understand failed: {e:#}")
-                                )
+                                ui::styled(ui::error_style(), &format!("understand failed: {e:#}"))
                             );
                         }
                     }
@@ -2625,10 +2780,7 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     if let Err(e) = agent.orient_turn(print_agent_event, approver(yes)).await {
                         eprintln!(
                             "\n{}",
-                            ui::styled(
-                                ui::error_style(),
-                                &format!("orient failed: {e:#}")
-                            )
+                            ui::styled(ui::error_style(), &format!("orient failed: {e:#}"))
                         );
                     }
                 }
@@ -2637,10 +2789,7 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     if let Err(e) = agent.review_turn(print_agent_event, approver(yes)).await {
                         eprintln!(
                             "\n{}",
-                            ui::styled(
-                                ui::error_style(),
-                                &format!("review failed: {e:#}")
-                            )
+                            ui::styled(ui::error_style(), &format!("review failed: {e:#}"))
                         );
                     }
                 }
@@ -2649,10 +2798,7 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     if let Err(e) = agent.suggest_turn(print_agent_event, approver(yes)).await {
                         eprintln!(
                             "\n{}",
-                            ui::styled(
-                                ui::error_style(),
-                                &format!("suggest failed: {e:#}")
-                            )
+                            ui::styled(ui::error_style(), &format!("suggest failed: {e:#}"))
                         );
                     }
                 }
@@ -2667,10 +2813,8 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                         eprintln!("usage: /workflow <name> <goal> — e.g. /workflow build-backend 'add a health endpoint'");
                         eprintln!("  (/workflows lists available workflows)");
                     } else {
-                        let workflows = discover_workflows(
-                            config.project_root.as_deref(),
-                            &config.global.root,
-                        );
+                        let workflows =
+                            discover_workflows(config.project_root.as_deref(), &config.global.root);
                         match workflows.iter().find(|w| w.id == name) {
                             Some(wf) => {
                                 print_turn_header();
@@ -2690,7 +2834,10 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                             None => {
                                 eprintln!(
                                     "{}",
-                                    ui::styled(ui::warn_style(), &format!("no workflow named '{name}'"))
+                                    ui::styled(
+                                        ui::warn_style(),
+                                        &format!("no workflow named '{name}'")
+                                    )
                                 );
                                 eprintln!("run /workflows to list available workflows");
                             }
@@ -2698,13 +2845,10 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     }
                 }
                 "workflows" => {
-                    let workflows = discover_workflows(
-                        config.project_root.as_deref(),
-                        &config.global.root,
-                    );
+                    let workflows =
+                        discover_workflows(config.project_root.as_deref(), &config.global.root);
                     if workflows.is_empty() {
                         eprintln!(
-                            "{}",
                             "no workflows found. Create `<project>/.agent/workflows/<name>.toml` or `~/.zeus/workflows/<name>.toml`."
                         );
                     } else {
@@ -2783,11 +2927,17 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
         });
 
         print_turn_header();
-        let result = match agent.run_turn(&message, print_agent_event, approver(yes)).await {
+        let result = match agent
+            .run_turn(&message, print_agent_event, approver(yes))
+            .await
+        {
             Ok(result) => result,
             Err(e) => {
                 watcher.abort();
-                eprintln!("\n{}", ui::styled(ui::error_style(), &format!("turn failed: {e:#}")));
+                eprintln!(
+                    "\n{}",
+                    ui::styled(ui::error_style(), &format!("turn failed: {e:#}"))
+                );
                 continue;
             }
         };
@@ -2829,10 +2979,7 @@ async fn cmd_tokens(
         })
         .await
         .context("count_tokens")?;
-    println!(
-        "tokens={} approximate={}",
-        resp.tokens, resp.approximate
-    );
+    println!("tokens={} approximate={}", resp.tokens, resp.approximate);
     Ok(())
 }
 
@@ -2845,10 +2992,7 @@ fn cmd_read(
     let ws = workspace(config)?;
     let result = ws
         .files
-        .read(
-            &path,
-            ReadOptions { offset, limit },
-        )
+        .read(&path, ReadOptions { offset, limit })
         .context("read")?;
     print!("{}", result.content);
     eprintln!(
@@ -2868,12 +3012,7 @@ fn cmd_write(config: &Config, path: PathBuf, content: String, yes: bool) -> Resu
         content
     };
     ws.files
-        .write(
-            &path,
-            &body,
-            WriteOptions::default(),
-            approver(yes),
-        )
+        .write(&path, &body, WriteOptions::default(), approver(yes))
         .context("write")?;
     println!("wrote {}", path.display());
     Ok(())
@@ -2911,18 +3050,14 @@ fn cmd_edit(
 
 fn cmd_rm(config: &Config, path: PathBuf, yes: bool) -> Result<()> {
     let ws = workspace(config)?;
-    ws.files
-        .delete(&path, approver(yes))
-        .context("delete")?;
+    ws.files.delete(&path, approver(yes)).context("delete")?;
     println!("deleted {}", path.display());
     Ok(())
 }
 
 fn cmd_mv(config: &Config, from: PathBuf, to: PathBuf, yes: bool) -> Result<()> {
     let ws = workspace(config)?;
-    ws.files
-        .rename(&from, &to, approver(yes))
-        .context("mv")?;
+    ws.files.rename(&from, &to, approver(yes)).context("mv")?;
     println!("moved {} -> {}", from.display(), to.display());
     Ok(())
 }
@@ -3000,12 +3135,7 @@ fn cmd_grep(
             .as_ref()
             .map(|p| format!("[{p}] "))
             .unwrap_or_default();
-        println!(
-            "{prefix}{}:{}:{}",
-            h.path.display(),
-            h.line,
-            h.text
-        );
+        println!("{prefix}{}:{}:{}", h.path.display(), h.line, h.text);
     }
     eprintln!("— {} match(es)", hits.len());
     Ok(())
@@ -3042,9 +3172,7 @@ fn cmd_codeint(config: &Config, action: CodeintCmd) -> Result<()> {
                     return Ok(());
                 }
             }
-            let idx = IndexEngine::new(&root)
-                .scan()
-                .context("scan symbols")?;
+            let idx = IndexEngine::new(&root).scan().context("scan symbols")?;
             idx.save(&root).context("save symbol index")?;
             println!(
                 "indexed {} symbol(s) in {} file(s) -> {}",
@@ -3241,9 +3369,8 @@ fn format_one(root: &Path, path: &Path) -> Result<()> {
 }
 
 fn format_project(root: &Path) -> Result<()> {
-    let lang = zeus_lang::detect_project(root).ok_or_else(|| {
-        anyhow::anyhow!("cannot detect language in {}", root.display())
-    })?;
+    let lang = zeus_lang::detect_project(root)
+        .ok_or_else(|| anyhow::anyhow!("cannot detect language in {}", root.display()))?;
     let spec = zeus_lang::spec(lang);
     if spec.format.is_empty() {
         bail!("no formatter configured for {}", spec.display_name);
@@ -3308,13 +3435,22 @@ fn cmd_rewind(config: &Config, turn_id: String) -> Result<()> {
 
 fn cmd_checkpoints(config: &Config) -> Result<()> {
     let ws = workspace(config)?;
-    let turns = ws.files.checkpoints.list_turns().context("list checkpoints")?;
+    let turns = ws
+        .files
+        .checkpoints
+        .list_turns()
+        .context("list checkpoints")?;
     if turns.is_empty() {
         println!("(no checkpoints)");
         return Ok(());
     }
     for t in turns {
-        println!("{}  files={}  {}", t.turn_id, t.file_count, t.path.display());
+        println!(
+            "{}  files={}  {}",
+            t.turn_id,
+            t.file_count,
+            t.path.display()
+        );
     }
     Ok(())
 }
@@ -3327,7 +3463,9 @@ fn user_command_dir(config: &Config, global: bool) -> Result<PathBuf> {
         .project
         .as_ref()
         .map(|p| p.commands.clone())
-        .ok_or_else(|| anyhow::anyhow!("no project active; pass --global or run `zeus init --with-project`"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no project active; pass --global or run `zeus init --with-project`")
+        })
 }
 
 fn cmd_user_commands(config: &Config, action: UserCommandCmd, yes: bool) -> Result<()> {
@@ -3456,7 +3594,9 @@ fn cmd_bg(config: &Config, action: BgCmd) -> Result<()> {
     let registry = BackgroundTaskRegistry::new(ws.project_root.join(".agent/background"));
     match action {
         BgCmd::Run { command } => {
-            let id = registry.spawn(&command, &ws.project_root).context("spawn background task")?;
+            let id = registry
+                .spawn(&command, &ws.project_root)
+                .context("spawn background task")?;
             println!("started background task id={id}: {command}");
             Ok(())
         }
@@ -3553,7 +3693,9 @@ fn cmd_git(config: &Config, action: GitCmd, yes: bool) -> Result<()> {
             let paths_ref: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
             report_git(engine.add(&paths_ref, approver(yes))?)
         }
-        GitCmd::Commit { message, all } => report_git(engine.commit(&message, all, approver(yes))?),
+        GitCmd::Commit { message, all } => {
+            report_git(engine.commit(&message, all, approver(yes))?)
+        }
         GitCmd::Stash { message } => {
             report_git(engine.stash_push(message.as_deref(), approver(yes))?)
         }
@@ -3568,18 +3710,16 @@ fn cmd_git(config: &Config, action: GitCmd, yes: bool) -> Result<()> {
         GitCmd::Checkout { target } => report_git(engine.checkout(&target, approver(yes))?),
         GitCmd::Fetch { remote } => report_git(engine.fetch(remote.as_deref(), approver(yes))?),
         GitCmd::Pull => report_git(engine.pull(approver(yes))?),
-        GitCmd::Push { remote, branch, force } => report_git(engine.push(
-            remote.as_deref(),
-            branch.as_deref(),
+        GitCmd::Push {
+            remote,
+            branch,
             force,
-            approver(yes),
-        )?),
-        GitCmd::CommitAndPush { message, all, remote } => report_git(engine.commit_and_push(
-            &message,
+        } => report_git(engine.push(remote.as_deref(), branch.as_deref(), force, approver(yes))?),
+        GitCmd::CommitAndPush {
+            message,
             all,
-            remote.as_deref(),
-            approver(yes),
-        )?),
+            remote,
+        } => report_git(engine.commit_and_push(&message, all, remote.as_deref(), approver(yes))?),
         GitCmd::Reset { mode, target } => {
             report_git(engine.reset(mode.into(), target.as_deref(), approver(yes))?)
         }
@@ -3587,7 +3727,9 @@ fn cmd_git(config: &Config, action: GitCmd, yes: bool) -> Result<()> {
         GitCmd::CherryPick { target } => report_git(engine.cherry_pick(&target, approver(yes))?),
         GitCmd::Rebase { onto } => report_git(engine.rebase(&onto, approver(yes))?),
         GitCmd::Merge { branch } => report_git(engine.merge(&branch, approver(yes))?),
-        GitCmd::PrList { limit, state } => report_git(engine.pr_list(&state, limit, approver(yes))?),
+        GitCmd::PrList { limit, state } => {
+            report_git(engine.pr_list(&state, limit, approver(yes))?)
+        }
         GitCmd::PrView { number } => report_git(engine.pr_view(&number, approver(yes))?),
         GitCmd::PrCreate { title, body, base } => {
             report_git(engine.pr_create(&title, body.as_deref(), base.as_deref(), approver(yes))?)
@@ -3619,28 +3761,46 @@ async fn provider_health(cfg: &zeus_config::ProviderConfig) -> ProviderHealth {
         {
             Ok(c) => c,
             Err(e) => {
-                return ProviderHealth { ok: false, detail: format!("couldn't build http client: {e}") }
+                return ProviderHealth {
+                    ok: false,
+                    detail: format!("couldn't build http client: {e}"),
+                }
             }
         };
         // Any response at all (2xx, 404, whatever) means something is
         // listening — that's the actual question, not whether the root
         // path happens to be a valid route for this server.
         match client.get(base).send().await {
-            Ok(_) => ProviderHealth { ok: true, detail: format!("reachable at {base}") },
+            Ok(_) => ProviderHealth {
+                ok: true,
+                detail: format!("reachable at {base}"),
+            },
             Err(e) => ProviderHealth {
                 ok: false,
                 detail: format!("unreachable at {base} ({e}) — is it running?"),
             },
         }
     } else if cfg.headers.contains_key("Authorization") {
-        ProviderHealth { ok: true, detail: "auth header configured".to_string() }
+        ProviderHealth {
+            ok: true,
+            detail: "auth header configured".to_string(),
+        }
     } else {
         match &cfg.api_key_env {
             Some(var) => match std::env::var(var) {
-                Ok(k) if !k.is_empty() => ProviderHealth { ok: true, detail: format!("key set via ${var}") },
-                _ => ProviderHealth { ok: false, detail: format!("no key — set ${var}") },
+                Ok(k) if !k.is_empty() => ProviderHealth {
+                    ok: true,
+                    detail: format!("key set via ${var}"),
+                },
+                _ => ProviderHealth {
+                    ok: false,
+                    detail: format!("no key — set ${var}"),
+                },
             },
-            None => ProviderHealth { ok: true, detail: "no key required".to_string() },
+            None => ProviderHealth {
+                ok: true,
+                detail: "no key required".to_string(),
+            },
         }
     }
 }
@@ -3722,8 +3882,15 @@ async fn cmd_doctor(config: &Config) -> Result<()> {
             default_ready = health.ok;
         }
         let icon = if health.ok { "✓" } else { "✗" };
-        let marker = if **name == default_provider { " (default)" } else { "" };
-        println!("  [{icon}] {name}{marker} — {}: {}", cfg.kind, health.detail);
+        let marker = if **name == default_provider {
+            " (default)"
+        } else {
+            ""
+        };
+        println!(
+            "  [{icon}] {name}{marker} — {}: {}",
+            cfg.kind, health.detail
+        );
     }
     println!();
 

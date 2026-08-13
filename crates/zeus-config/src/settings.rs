@@ -58,8 +58,7 @@ pub struct PermissionRule {
 }
 
 /// Fully merged agent settings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AgentSettings {
     #[serde(default)]
     pub model: ModelSettings,
@@ -102,7 +101,6 @@ pub struct AgentSettings {
     #[serde(default = "default_true")]
     pub notify_on_completion: bool,
 }
-
 
 /// One configured external MCP tool server, spawned over stdio.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -239,32 +237,104 @@ impl PermissionSettings {
                     state: PermissionState::Ask,
                 },
                 // Git — read-only tier: allow.
-                PermissionDefault { tool: "git_status".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_diff".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_blame".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_log".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_show".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_branch_list".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_remote_list".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_tag_list".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_stash_list".into(), state: PermissionState::Allow },
+                PermissionDefault {
+                    tool: "git_status".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_diff".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_blame".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_log".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_show".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_branch_list".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_remote_list".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_tag_list".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_stash_list".into(),
+                    state: PermissionState::Allow,
+                },
                 // Git — reversible write tier: allow (commit always previews the diff regardless).
-                PermissionDefault { tool: "git_add".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_commit".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_stash".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_branch".into(), state: PermissionState::Allow },
-                PermissionDefault { tool: "git_tag".into(), state: PermissionState::Allow },
+                PermissionDefault {
+                    tool: "git_add".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_commit".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_stash".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_branch".into(),
+                    state: PermissionState::Allow,
+                },
+                PermissionDefault {
+                    tool: "git_tag".into(),
+                    state: PermissionState::Allow,
+                },
                 // Git — working-tree-changing / network / history-rewriting: ask.
-                PermissionDefault { tool: "git_branch_delete".into(), state: PermissionState::Ask },
-                PermissionDefault { tool: "git_checkout".into(), state: PermissionState::Ask },
-                PermissionDefault { tool: "git_fetch".into(), state: PermissionState::Ask },
-                PermissionDefault { tool: "git_pull".into(), state: PermissionState::Ask },
-                PermissionDefault { tool: "git_push".into(), state: PermissionState::Ask },
-                PermissionDefault { tool: "git_reset".into(), state: PermissionState::Ask },
-                PermissionDefault { tool: "git_revert".into(), state: PermissionState::Ask },
-                PermissionDefault { tool: "git_cherry_pick".into(), state: PermissionState::Ask },
-                PermissionDefault { tool: "git_rebase".into(), state: PermissionState::Ask },
-                PermissionDefault { tool: "git_merge".into(), state: PermissionState::Ask },
+                PermissionDefault {
+                    tool: "git_branch_delete".into(),
+                    state: PermissionState::Ask,
+                },
+                PermissionDefault {
+                    tool: "git_checkout".into(),
+                    state: PermissionState::Ask,
+                },
+                PermissionDefault {
+                    tool: "git_fetch".into(),
+                    state: PermissionState::Ask,
+                },
+                PermissionDefault {
+                    tool: "git_pull".into(),
+                    state: PermissionState::Ask,
+                },
+                PermissionDefault {
+                    tool: "git_push".into(),
+                    state: PermissionState::Ask,
+                },
+                PermissionDefault {
+                    tool: "git_reset".into(),
+                    state: PermissionState::Ask,
+                },
+                PermissionDefault {
+                    tool: "git_revert".into(),
+                    state: PermissionState::Ask,
+                },
+                PermissionDefault {
+                    tool: "git_cherry_pick".into(),
+                    state: PermissionState::Ask,
+                },
+                PermissionDefault {
+                    tool: "git_rebase".into(),
+                    state: PermissionState::Ask,
+                },
+                PermissionDefault {
+                    tool: "git_merge".into(),
+                    state: PermissionState::Ask,
+                },
             ],
             rules: vec![
                 PermissionRule {
@@ -558,17 +628,13 @@ impl SettingsStack {
                         .into_iter()
                         .map(|(tool, state)| PermissionDefault { tool, state })
                         .collect();
-                    out.permissions
-                        .defaults
-                        .sort_by(|a, b| a.tool.cmp(&b.tool));
+                    out.permissions.defaults.sort_by(|a, b| a.tool.cmp(&b.tool));
                 }
                 if let Some(rules) = &p.rules {
                     // Append rules; later layers can override by matching tool+path+command.
                     for rule in rules {
                         if let Some(existing) = out.permissions.rules.iter_mut().find(|r| {
-                            r.tool == rule.tool
-                                && r.path == rule.path
-                                && r.command == rule.command
+                            r.tool == rule.tool && r.path == rule.path && r.command == rule.command
                         }) {
                             *existing = rule.clone();
                         } else {
@@ -795,7 +861,10 @@ provider = "openai"
     fn missing_files_are_ok() {
         let mut stack = SettingsStack::new();
         stack
-            .push_file(SettingsLayer::Global, Path::new("/nonexistent/settings.toml"))
+            .push_file(
+                SettingsLayer::Global,
+                Path::new("/nonexistent/settings.toml"),
+            )
             .unwrap();
         let resolved = stack.resolve();
         assert_eq!(resolved.model.provider, "ollama");
@@ -804,11 +873,10 @@ provider = "openai"
     #[test]
     fn builtin_denies_destructive_bash() {
         let settings = AgentSettings::default();
-        let deny_rm = settings
-            .permissions
-            .rules
-            .iter()
-            .any(|r| r.command.as_deref() == Some("rm -rf*") && r.state == PermissionState::Deny);
+        let deny_rm =
+            settings.permissions.rules.iter().any(|r| {
+                r.command.as_deref() == Some("rm -rf*") && r.state == PermissionState::Deny
+            });
         assert!(deny_rm);
     }
 }

@@ -136,10 +136,7 @@ impl ChatRequest {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancel
-            .as_ref()
-            .map(|rx| *rx.borrow())
-            .unwrap_or(false)
+        self.cancel.as_ref().map(|rx| *rx.borrow()).unwrap_or(false)
     }
 }
 

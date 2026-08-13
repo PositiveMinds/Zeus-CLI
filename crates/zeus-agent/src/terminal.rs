@@ -362,7 +362,14 @@ impl TerminalRunner {
                 builder.env("PATH", path);
             }
             if cfg!(windows) {
-                for var in ["SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "TEMP", "TMP", "USERPROFILE"] {
+                for var in [
+                    "SYSTEMROOT",
+                    "SYSTEMDRIVE",
+                    "COMSPEC",
+                    "TEMP",
+                    "TMP",
+                    "USERPROFILE",
+                ] {
                     if let Ok(v) = std::env::var(var) {
                         builder.env(var, v);
                     }
@@ -483,7 +490,14 @@ fn build_command(command: &str, opts: &TerminalOptions) -> Command {
             cmd.env("PATH", path);
         }
         if cfg!(windows) {
-            for var in ["SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "TEMP", "TMP", "USERPROFILE"] {
+            for var in [
+                "SYSTEMROOT",
+                "SYSTEMDRIVE",
+                "COMSPEC",
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+            ] {
                 if let Ok(v) = std::env::var(var) {
                     cmd.env(var, v);
                 }
@@ -533,9 +547,7 @@ pub(crate) fn kill_tree(pid: u32) {
         let _ = Command::new("kill")
             .args(["-9", &format!("-{pid}")])
             .output();
-        let _ = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .output();
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
     }
 }
 
@@ -582,7 +594,11 @@ fn own_process_group() -> u32 {
         fn getpgid(pid: i32) -> i32;
     }
     let gid = unsafe { getpgid(0) };
-    if gid <= 0 { 0 } else { gid as u32 }
+    if gid <= 0 {
+        0
+    } else {
+        gid as u32
+    }
 }
 
 #[cfg(windows)]
@@ -606,17 +622,22 @@ fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
         } else {
             b"NtResumeProcess\0"
         };
-        let suspend_proc: Symbol<NtSuspend> = ntdll.get(proc_name).map_err(std::io::Error::other)?;
+        let suspend_proc: Symbol<NtSuspend> =
+            ntdll.get(proc_name).map_err(std::io::Error::other)?;
 
         let kernel32 = Library::new("kernel32.dll").map_err(std::io::Error::other)?;
-        let open_process: Symbol<OpenProcess> =
-            kernel32.get(b"OpenProcess\0").map_err(std::io::Error::other)?;
-        let close_handle: Symbol<CloseHandle> =
-            kernel32.get(b"CloseHandle\0").map_err(std::io::Error::other)?;
+        let open_process: Symbol<OpenProcess> = kernel32
+            .get(b"OpenProcess\0")
+            .map_err(std::io::Error::other)?;
+        let close_handle: Symbol<CloseHandle> = kernel32
+            .get(b"CloseHandle\0")
+            .map_err(std::io::Error::other)?;
 
         let handle = open_process(PROCESS_SUSPEND_RESUME, 0, pid);
         if handle.is_null() {
-            return Err(std::io::Error::other("OpenProcess failed — task may have exited"));
+            return Err(std::io::Error::other(
+                "OpenProcess failed — task may have exited",
+            ));
         }
         let status = suspend_proc(handle);
         close_handle(handle);
@@ -777,7 +798,13 @@ mod tests {
         opts.timeout = Some(Duration::from_secs(3));
 
         let out = runner
-            .run(&echo_command("hi"), &gate, opts, Arc::new(AtomicBool::new(false)), approve)
+            .run(
+                &echo_command("hi"),
+                &gate,
+                opts,
+                Arc::new(AtomicBool::new(false)),
+                approve,
+            )
             .unwrap();
 
         assert!(out.used_pty, "should have actually attempted the PTY path");

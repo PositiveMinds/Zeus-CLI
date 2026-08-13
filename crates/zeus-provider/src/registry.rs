@@ -5,11 +5,11 @@ use crate::error::{ProviderError, Result};
 use crate::ollama::OllamaProvider;
 use crate::openai_compat::OpenAiCompatProvider;
 use crate::ModelProvider;
-use zeus_config::{ProviderConfig, ProvidersFile};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use tracing::info;
+use zeus_config::{ProviderConfig, ProvidersFile};
 
 /// Shared handle to a live provider.
 pub type ProviderHandle = Arc<dyn ModelProvider>;

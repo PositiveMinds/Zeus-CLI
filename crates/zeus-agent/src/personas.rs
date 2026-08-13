@@ -707,8 +707,8 @@ pub fn recommend_persona(topic: &str) -> Option<&'static Persona> {
 // this is a one-time process-lifetime load and the roster API is built around
 // `&'static Persona`.
 
-use std::sync::OnceLock;
 use serde::Deserialize;
+use std::sync::OnceLock;
 
 /// Lazily-loaded custom personas; first successful load wins (a fresh
 /// directory can't re-seed a running process — call once at startup).
@@ -798,14 +798,31 @@ pub fn recommend_reviewer(topic: &str) -> Option<&'static Persona> {
     all_personas()
         .into_iter()
         .find(|p| p.reviewer && p.matches(topic))
-        .or_else(|| all_personas().into_iter().find(|p| p.id == "architectural-reviewer"))
+        .or_else(|| {
+            all_personas()
+                .into_iter()
+                .find(|p| p.id == "architectural-reviewer")
+        })
 }
 
 /// Cheap intent guard: does this step look like software work at all?
 fn looks_like_software(topic: &str) -> bool {
     const HINTS: &[&str] = &[
-        "file", "code", "function", "module", "bug", "feature", "cli", "app",
-        "package", "dependency", "config", "build", "test", "api", "class",
+        "file",
+        "code",
+        "function",
+        "module",
+        "bug",
+        "feature",
+        "cli",
+        "app",
+        "package",
+        "dependency",
+        "config",
+        "build",
+        "test",
+        "api",
+        "class",
     ];
     let t = topic.to_lowercase();
     HINTS.iter().any(|h| t.contains(h))

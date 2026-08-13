@@ -2,11 +2,11 @@
 
 use crate::error::{FsError, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use zeus_config::{AgentSettings, PermissionState};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::{debug, info};
+use zeus_config::{AgentSettings, PermissionState};
 
 /// What the agent wants to do.
 #[derive(Debug, Clone, Default)]
@@ -190,7 +190,10 @@ impl PermissionGate {
 
         // Built-in safe default: ask.
         ResolvedPermission::Ask {
-            reason: format!("no rule for tool '{}'; asking: {}", req.tool, req.description),
+            reason: format!(
+                "no rule for tool '{}'; asking: {}",
+                req.tool, req.description
+            ),
         }
     }
 
@@ -261,10 +264,9 @@ impl PermissionGate {
                         }
                         Ok(())
                     }
-                    ApprovalDecision::Denied => Err(FsError::Denied(format!(
-                        "user denied: {}",
-                        req.description
-                    ))),
+                    ApprovalDecision::Denied => {
+                        Err(FsError::Denied(format!("user denied: {}", req.description)))
+                    }
                 }
             }
         }
