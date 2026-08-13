@@ -3529,31 +3529,39 @@ fn render_todos(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
     for item in &state.todos {
-        let box_mark = if item.done { "✓" } else { " " };
-        let box_style = if item.done {
-            Style::default()
-                .fg(theme::VOID)
-                .bg(theme::GREEN)
-                .add_modifier(Modifier::BOLD)
-        } else if item.active {
-            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        // The active item gets its own distinct marker (a filled diamond,
+        // no checkbox brackets) instead of just an empty `[ ]` in accent
+        // color — reads as "this one's happening right now" the way a
+        // spinner/asterisk bullet does, rather than blending in as just
+        // another differently-colored checkbox row.
+        let mut spans = if item.active {
+            vec![
+                Span::styled("◆ ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(item.text.clone(), theme::text().add_modifier(Modifier::BOLD)),
+            ]
         } else {
-            theme::faint()
+            let box_mark = if item.done { "✓" } else { " " };
+            let box_style = if item.done {
+                Style::default()
+                    .fg(theme::VOID)
+                    .bg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme::faint()
+            };
+            let label_style = if item.done {
+                Style::default().fg(theme::FAINT).add_modifier(Modifier::CROSSED_OUT)
+            } else {
+                theme::text()
+            };
+            vec![
+                Span::styled("[", theme::faint()),
+                Span::styled(box_mark, box_style),
+                Span::styled("]", theme::faint()),
+                Span::raw(" "),
+                Span::styled(item.text.clone(), label_style),
+            ]
         };
-        let label_style = if item.done {
-            Style::default().fg(theme::FAINT).add_modifier(Modifier::CROSSED_OUT)
-        } else if item.active {
-            Style::default().fg(accent)
-        } else {
-            theme::text()
-        };
-        let mut spans = vec![
-            Span::styled("[", theme::faint()),
-            Span::styled(box_mark, box_style),
-            Span::styled("]", theme::faint()),
-            Span::raw(" "),
-            Span::styled(item.text.clone(), label_style),
-        ];
         if let Some(d) = item.duration {
             spans.push(Span::styled(format!("  {}", fmt_duration(d)), theme::faint()));
         }
@@ -4177,10 +4185,10 @@ fn start_plan_turn(
 /// Confirmed run of a plan `/plan` just generated — drives
 /// `Agent::orchestrate`, which re-plans the same goal (cheap relative to the
 /// execution itself) and then executes step by step behind its own
-/// `plan_execute` approval prompt. `orchestrate` returns a plain summary
-/// `String` rather than a `TurnResult`; wrapped into one here so this flows
-/// through the exact same completion handling as every other turn kind,
-/// including the `PlanStepStarted`/`PlanStepDone`/`OrchestrationDone`
+/// `plan_execute` approval prompt. `orchestrate` returns a `(String,
+/// TokenUsage)` pair rather than a `TurnResult`; wrapped into one here so
+/// this flows through the exact same completion handling as every other
+/// turn kind, including the `PlanStepStarted`/`PlanStepDone`/`OrchestrationDone`
 /// events that already drive the sidebar and persona chip.
 fn start_orchestrate_turn(
     state: &mut AppState,
@@ -4216,11 +4224,11 @@ fn start_orchestrate_turn(
         let result = agent
             .orchestrate(&goal, on_event, approver)
             .await
-            .map(|summary| TurnResult {
+            .map(|(summary, usage)| TurnResult {
                 final_text: summary,
                 tool_calls: 0,
                 cancelled: false,
-                usage: TokenUsage::default(),
+                usage,
             });
         (agent, result)
     });
@@ -5755,7 +5763,17 @@ async fn run_app<B: Backend>(
                                 // consumed here) so the next bare-Enter press
                                 // can pick it up; declining by sending a real
                                 // message instead clears it in `handle_key`.
-                                if let Some(goal) = &state.pending_plan_goal {
+                                //
+                                // `result.cancelled` guards this: a `/plan`
+                                // stopped mid-research via Esc still returns
+                                // `Ok` (cancellation isn't an error), so
+                                // without this check a cancelled plan would
+                                // both claim to be "ready" and leave a stale
+                                // goal armed for some later, unrelated bare
+                                // Enter to actually execute.
+                                if result.cancelled {
+                                    state.pending_plan_goal = None;
+                                } else if let Some(goal) = &state.pending_plan_goal {
                                     state.push_info(format!(
                                         "plan ready for \"{goal}\" — press Enter now to run it, Esc to dismiss, or type a message to keep going instead"
                                     ));

@@ -708,7 +708,7 @@ fn request_likely_needs_context(request: &str) -> bool {
             on_event(AgentEvent::Compacted(result));
         }
 
-        let steps = self.plan_task(goal).await?;
+        let (steps, plan_usage) = self.plan_task(goal).await?;
         on_event(AgentEvent::PlanGenerated { steps: steps.clone() });
 
         // Research pass: read-only by force, so the plan is grounded in real
@@ -726,7 +726,8 @@ fn request_likely_needs_context(request: &str) -> bool {
             self.state.messages.remove(0);
         }
         self.set_plan_mode(was_plan);
-        let turn = turn?;
+        let mut turn = turn?;
+        add_usage(&mut turn.usage, &plan_usage);
 
         self.write_task_plan(&TaskPlan::from_steps(goal, &steps, &turn.final_text, false))?;
 
@@ -757,14 +758,16 @@ fn request_likely_needs_context(request: &str) -> bool {
         goal: &str,
         mut on_event: E,
         mut approver: A,
-    ) -> Result<String>
+    ) -> Result<(String, TokenUsage)>
     where
         E: FnMut(AgentEvent),
         A: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         let _ = self.cancel_tx.send(false);
+        let mut total_usage = TokenUsage::default();
 
-        let steps = self.plan_task(goal).await?;
+        let (steps, usage) = self.plan_task(goal).await?;
+        add_usage(&mut total_usage, &usage);
         on_event(AgentEvent::PlanGenerated { steps: steps.clone() });
 
         // Persist the drafted plan up front, then hold at the review gate:
@@ -804,7 +807,7 @@ fn request_likely_needs_context(request: &str) -> bool {
             on_event(AgentEvent::OrchestrationDone {
                 summary: summary.clone(),
             });
-            return Ok(summary);
+            return Ok((summary, total_usage));
         }
         plan.approved = true;
         self.write_task_plan(&plan)?;
@@ -860,6 +863,10 @@ fn request_likely_needs_context(request: &str) -> bool {
         let mut idx = 0usize;
         let steps_slice: Vec<PlanStep> = steps;
         while idx < steps_slice.len() {
+            if *self.cancel_rx.borrow() {
+                let summary = self.cancel_orchestration(goal, &summaries, &mut on_event)?;
+                return Ok((summary, total_usage));
+            }
             // Sweep forward over the run of consecutive read-only steps.
             let mut run_end = idx;
             while run_end < steps_slice.len() && is_read_only_step(&steps_slice[run_end]) {
@@ -886,6 +893,11 @@ fn request_likely_needs_context(request: &str) -> bool {
                 let result = self.drive_turn(&mut on_event, &mut approver).await?;
                 if persona_injected {
                     self.state.messages.remove(0);
+                }
+                add_usage(&mut total_usage, &result.usage);
+                if result.cancelled {
+                    let summary = self.cancel_orchestration(goal, &summaries, &mut on_event)?;
+                    return Ok((summary, total_usage));
                 }
                 prior_content = result.final_text.clone();
                 summaries.push(step_summary(&step, &result.final_text));
@@ -933,10 +945,24 @@ fn request_likely_needs_context(request: &str) -> bool {
                     .collect::<Vec<_>>();
                 let results = futures::future::join_all(futures).await;
 
+                let mut batch_cancelled = false;
                 for (step, res) in steps_slice[start..end].iter().zip(results) {
                     on_event(AgentEvent::PlanStepStarted { step: step.clone() });
                     match res {
-                        Ok(final_text) => {
+                        Ok((final_text, cancelled, step_usage)) => {
+                            add_usage(&mut total_usage, &step_usage);
+                            if cancelled {
+                                // Later steps in this same `join_all` batch
+                                // may have "succeeded" only because they
+                                // raced ahead before the cancel signal
+                                // landed — treat the whole batch as cut
+                                // short rather than reporting some of it
+                                // done, since there's no meaningful order
+                                // among concurrent steps to say which ones
+                                // "really" finished first.
+                                batch_cancelled = true;
+                                break;
+                            }
                             prior_content = final_text.clone();
                             summaries.push(step_summary(step, &final_text));
                             on_event(AgentEvent::PlanStepDone {
@@ -952,6 +978,10 @@ fn request_likely_needs_context(request: &str) -> bool {
                             });
                         }
                     }
+                }
+                if batch_cancelled {
+                    let summary = self.cancel_orchestration(goal, &summaries, &mut on_event)?;
+                    return Ok((summary, total_usage));
                 }
                 idx = end;
             }
@@ -970,9 +1000,14 @@ fn request_likely_needs_context(request: &str) -> bool {
         // Review the completed work: pick a matching reviewer persona and
         // give it one read-only turn over the combined result. Reviewers are
         // constrained to non-mutating tools, so this can't edit files.
-        let review_report = self
+        let (review_report, review_usage, review_cancelled) = self
             .reviewer_pass(goal, &final_summary, &mut on_event, &mut approver)
             .await?;
+        add_usage(&mut total_usage, &review_usage);
+        if review_cancelled {
+            let summary = self.cancel_orchestration(goal, &summaries, &mut on_event)?;
+            return Ok((summary, total_usage));
+        }
 
         // Lead-reviewer gate: the work ran, but it isn't DONE until the
         // human accepts the review. When a reviewer produced findings we
@@ -998,15 +1033,45 @@ fn request_likely_needs_context(request: &str) -> bool {
                 on_event(AgentEvent::OrchestrationRevision {
                     report: summary.clone(),
                 });
-                return Ok(summary);
+                return Ok((summary, total_usage));
             }
-            return self.finish_orchestration(
+            let summary = self.finish_orchestration(
                 format!("{final_summary}\n\nReview:\n{report}"),
                 &plan,
                 &mut on_event,
-            );
+            )?;
+            return Ok((summary, total_usage));
         }
-        self.finish_orchestration(final_summary, &plan, &mut on_event)
+        let summary = self.finish_orchestration(final_summary, &plan, &mut on_event)?;
+        Ok((summary, total_usage))
+    }
+
+    /// Cancelled mid-orchestration — reports actual partial progress instead
+    /// of letting the loop run to completion and `finish_orchestration` mark
+    /// every step done regardless of how far execution actually got. Unlike
+    /// `finish_orchestration`, this never touches the persisted plan's
+    /// `done` flags, since "cancelled" isn't "done".
+    fn cancel_orchestration<E>(
+        &mut self,
+        goal: &str,
+        summaries: &[String],
+        on_event: &mut E,
+    ) -> Result<String>
+    where
+        E: FnMut(AgentEvent),
+    {
+        let summary = if summaries.is_empty() {
+            format!("orchestration for '{goal}' cancelled before any step completed.")
+        } else {
+            format!(
+                "orchestration for '{goal}' cancelled after {} of the planned step(s):\n{}",
+                summaries.len(),
+                summaries.join("\n")
+            )
+        };
+        on_event(AgentEvent::Cancelled);
+        self.persist()?;
+        Ok(summary)
     }
 
     /// Stamp the completed plan: every step done, notes = the final
@@ -1176,21 +1241,24 @@ fn step_preview(step: &PlanStep) -> String {
 
 /// One read-only review pass over completed `work`, driven by a
     /// `reviewer: true` persona matched to the goal. Emits a `PlanReviewed`
-    /// event with the report. Returns the report text, or `None` when no
-    /// reviewer is available.
+    /// event with the report. Returns `(report, usage, was_cancelled)` —
+    /// `report` is `None` when no reviewer is available *or* the pass was
+    /// cancelled (an empty `final_text` is ambiguous between the two, so
+    /// callers needing to tell them apart check `was_cancelled` instead of
+    /// inferring it from `report.is_none()`).
     async fn reviewer_pass<E, A>(
         &mut self,
         goal: &str,
         work: &str,
         on_event: &mut E,
         approver: &mut A,
-    ) -> Result<Option<String>>
+    ) -> Result<(Option<String>, TokenUsage, bool)>
     where
         E: FnMut(AgentEvent),
         A: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         let Some(persona) = recommend_reviewer(goal) else {
-            return Ok(None);
+            return Ok((None, TokenUsage::default(), false));
         };
         let injected = prepend_persona_prompt(&mut self.state, persona.id);
         let review_prompt = format!(
@@ -1203,14 +1271,17 @@ fn step_preview(step: &PlanStep) -> String {
         if injected {
             self.state.messages.remove(0);
         }
+        if result.cancelled {
+            return Ok((None, result.usage, true));
+        }
         if result.final_text.is_empty() {
-            return Ok(None);
+            return Ok((None, result.usage, false));
         }
         on_event(AgentEvent::PlanReviewed {
             persona: persona.id.to_string(),
             report: result.final_text.clone(),
         });
-        Ok(Some(result.final_text))
+        Ok((Some(result.final_text), result.usage, false))
     }
 
     /// Planning pass for an orchestrated run: a tool-free call asking the
@@ -1218,7 +1289,7 @@ fn step_preview(step: &PlanStep) -> String {
     /// array of strings so it can be parsed deterministically rather than
     /// scraped from prose. Falls back to a single step (the whole goal) if
     /// the response isn't parseable.
-    async fn plan_task(&mut self, goal: &str) -> Result<Vec<PlanStep>> {
+    async fn plan_task(&mut self, goal: &str) -> Result<(Vec<PlanStep>, TokenUsage)> {
         let response = self
             .provider
             .chat(ChatRequest {
@@ -1243,6 +1314,7 @@ fn step_preview(step: &PlanStep) -> String {
             })
             .await
             .map_err(AgentError::Provider)?;
+        let usage = response.usage.clone();
 
         let text = response.message.content;
         // Tolerate both the object form `[{description, rationale}]` and the
@@ -1250,7 +1322,15 @@ fn step_preview(step: &PlanStep) -> String {
         let parsed = serde_json::from_str::<Vec<serde_json::Value>>(text.trim())
             .ok()
             .filter(|v| !v.is_empty());
-        match parsed {
+        let fallback = || {
+            vec![PlanStep {
+                id: 1,
+                description: goal.to_string(),
+                rationale: String::new(),
+                persona: recommend_persona(goal).map(|p| p.id.to_string()),
+            }]
+        };
+        let steps = match parsed {
             Some(items) => {
                 let steps: Vec<PlanStep> = items
                     .into_iter()
@@ -1275,23 +1355,11 @@ fn step_preview(step: &PlanStep) -> String {
                         })
                     })
                     .collect();
-                if !steps.is_empty() {
-                    return Ok(steps);
-                }
-                Ok(vec![PlanStep {
-                    id: 1,
-                    description: goal.to_string(),
-                    rationale: String::new(),
-                    persona: recommend_persona(goal).map(|p| p.id.to_string()),
-                }])
+                if steps.is_empty() { fallback() } else { steps }
             }
-            None => Ok(vec![PlanStep {
-                id: 1,
-                description: goal.to_string(),
-                rationale: String::new(),
-                persona: recommend_persona(goal).map(|p| p.id.to_string()),
-            }]),
-        }
+            None => fallback(),
+        };
+        Ok((steps, usage))
     }
 
     /// `delegate` tool: lets the model consult a specialist mid-turn for
@@ -1870,12 +1938,23 @@ fn step_summary(step: &PlanStep, text: &str) -> String {
 /// steps: unconnected cloned provider/cancel handle in, finished text out,
 /// nothing about `self` shared or mutated.
 /// Model knobs shared by headless plan steps.
+fn add_usage(total: &mut TokenUsage, delta: &TokenUsage) {
+    total.prompt_tokens += delta.prompt_tokens;
+    total.completion_tokens += delta.completion_tokens;
+    total.total_tokens += delta.total_tokens;
+}
+
 struct HeadlessSpec {
     model: String,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
 }
 
+/// Returns `(text, was_cancelled, usage)`. A cancellation caught before the
+/// stream even starts (the provider's own upfront check) and one caught
+/// mid-stream (`FinishReason::Cancelled`) both surface through the same
+/// `was_cancelled` flag rather than one being an `Err` and the other an
+/// `Ok` — callers only need to check one thing.
 async fn run_headless_step(
     provider: std::sync::Arc<dyn ModelProvider>,
     spec: HeadlessSpec,
@@ -1883,7 +1962,7 @@ async fn run_headless_step(
     goal: &str,
     snapshot: &str,
     cancel: tokio::sync::watch::Receiver<bool>,
-) -> Result<String> {
+) -> Result<(String, bool, TokenUsage)> {
     let system = match step.persona.as_deref().and_then(persona_by_id) {
         Some(p) => p.system_prompt(),
         None => "You are a careful, read-only analysis agent.".to_string(),
@@ -1906,16 +1985,31 @@ async fn run_headless_step(
         max_tokens: spec.max_tokens.or(Some(512)),
         cancel: Some(cancel),
     };
-    let mut stream = provider.stream(request).await.map_err(AgentError::Provider)?;
+    let mut stream = match provider.stream(request).await {
+        Ok(s) => s,
+        Err(zeus_provider::ProviderError::Cancelled) => {
+            return Ok((String::new(), true, TokenUsage::default()));
+        }
+        Err(e) => return Err(AgentError::Provider(e)),
+    };
     let mut text = String::new();
+    let mut cancelled = false;
+    let mut usage = TokenUsage::default();
     while let Some(ev) = stream.next().await {
         match ev.map_err(AgentError::Provider)? {
             StreamEvent::TextDelta { text: t } => text.push_str(&t),
             StreamEvent::ToolCallDelta { .. } => {}
-            StreamEvent::Done { .. } => {}
+            StreamEvent::Done { finish_reason, usage: u } => {
+                if finish_reason == FinishReason::Cancelled {
+                    cancelled = true;
+                }
+                usage.prompt_tokens += u.prompt_tokens;
+                usage.completion_tokens += u.completion_tokens;
+                usage.total_tokens += u.total_tokens;
+            }
         }
     }
-    Ok(text)
+    Ok((text, cancelled, usage))
 }
 
 /// The `delegate` tool's spec — built fresh (not a `const`) since the
@@ -2340,7 +2434,7 @@ mod tests {
             )),
         );
         let mut events: Vec<AgentEvent> = Vec::new();
-        let summary = agent
+        let (summary, _usage) = agent
             .orchestrate(
                 "add a test",
                 |ev| events.push(ev),
@@ -2373,7 +2467,7 @@ mod tests {
             )),
         );
         let mut events: Vec<AgentEvent> = Vec::new();
-        let summary = agent
+        let (summary, _usage) = agent
             .orchestrate("add a test", |ev| events.push(ev), approve)
             .await
             .unwrap();

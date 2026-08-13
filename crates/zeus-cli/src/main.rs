@@ -2052,11 +2052,11 @@ async fn cmd_agent(
         agent
             .orchestrate(&message, print_agent_event, approver(yes))
             .await
-            .map(|summary| TurnResult {
+            .map(|(summary, usage)| TurnResult {
                 final_text: summary,
                 tool_calls: 0,
                 cancelled: false,
-                usage: Default::default(),
+                usage,
             })
     } else if plan {
         // `--plan`: research read-only, persist .agent/tasks.json, don't

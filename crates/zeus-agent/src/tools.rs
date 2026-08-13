@@ -1418,7 +1418,6 @@ fn is_read_only_tool(name: &str) -> bool {
             | "read_image"
             | "understand_repo"
             | "memory"
-            | "code_index"
             | "code_symbols"
             | "code_defs"
             | "code_refs"
@@ -1656,7 +1655,7 @@ impl ToolManager {
             "copy" => self.do_copy(&args, approver),
             "grep" => self.do_grep(&args),
             "glob" => self.do_glob(&args),
-            "code_index" => self.do_code_index(&args),
+            "code_index" => self.do_code_index(&args, approver),
             "code_symbols" => self.do_code_symbols(&args),
             "code_defs" => self.do_code_defs(&args),
             "code_refs" => self.do_code_refs(&args),
@@ -2133,7 +2132,10 @@ impl ToolManager {
         }
     }
 
-    fn do_code_index(&self, args: &Value) -> Result<ToolResult> {
+    fn do_code_index<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
         let root = self.workspace.project_root.clone();
 
@@ -2145,6 +2147,23 @@ impl ToolManager {
                     idx.scanned_files
                 )));
             }
+        }
+        // Writes `.agent/index.json` below — needs the same gate every other
+        // mutating tool goes through. Previously had none at all, and was
+        // misclassified as read-only (letting it run even in Plan mode,
+        // which is supposed to guarantee nothing changes); see
+        // `is_read_only_tool`, where `"code_index"` has been removed.
+        if let Err(e) = self.workspace.files.gate.enforce(
+            &PermissionRequest {
+                tool: "code_index".into(),
+                path: Some(SymbolIndex::file_path(&root)),
+                command: None,
+                description: format!("build/refresh the code index at {}", SymbolIndex::file_path(&root).display()),
+                ..Default::default()
+            },
+            &mut *approver,
+        ) {
+            return Ok(ToolResult::err(e.to_string()));
         }
         match IndexEngine::new(&root).scan() {
             Ok(idx) => match idx.save(&root) {
@@ -2303,20 +2322,25 @@ impl ToolManager {
             .unwrap_or(false);
 
         if background {
-            self.workspace
-                .files
-                .gate
-                .enforce(
-                    &PermissionRequest {
-                        tool: "bash".into(),
-                        path: None,
-                        command: Some(command.to_string()),
-                        description: format!("run as background task: {command}"),
-                        ..Default::default()
-                    },
-                    &mut *approver,
-                )
-                .map_err(AgentError::Fs)?;
+            // Soft-fail like every other permission ask in this file — a
+            // denial here is a normal, model-reachable outcome (the model
+            // asked to background a command and the user said no), not a
+            // system failure. The bare `.map_err(..)?` this replaced hard-
+            // aborted the whole turn on denial, same bug class already
+            // fixed for `InvalidArguments`/`UnknownTool` at the dispatch
+            // level — this one just didn't route through that catch yet.
+            if let Err(e) = self.workspace.files.gate.enforce(
+                &PermissionRequest {
+                    tool: "bash".into(),
+                    path: None,
+                    command: Some(command.to_string()),
+                    description: format!("run as background task: {command}"),
+                    ..Default::default()
+                },
+                &mut *approver,
+            ) {
+                return Ok(ToolResult::err(e.to_string()));
+            }
             return match self.background.spawn(command, &self.workspace.project_root) {
                 Ok(id) => Ok(ToolResult::ok(format!(
                     "started background task id={id}: {command}\nUse bg_output with id={id} to check its output, bg_stop with id={id} to stop it."
