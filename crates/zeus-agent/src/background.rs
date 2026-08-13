@@ -339,20 +339,47 @@ fn id_desc(args: &[String]) -> String {
     s
 }
 
-fn is_alive(pid: u32) -> bool {    if cfg!(windows) {
-        match Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
-        {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
-            Err(_) => false,
-        }
-    } else {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+#[cfg(windows)]
+fn is_alive(pid: u32) -> bool {
+    match Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn is_alive(pid: u32) -> bool {
+    // kill -0 alone is not enough: an exited-but-unreaped child (a zombie,
+    // since the registry drops the Child handle without waiting) still
+    // answers kill -0 successfully. Only waitpid(WNOHANG) distinguishes a
+    // running child from a zombie. When our child, reap it and report dead;
+    // when the pid belongs to another process (the one-shot CLI spawns from
+    // a *different* invocation than the session that later lists/stops),
+    // waitpid returns ECHILD and we fall back to the kill -0 answer.
+    unsafe extern "C" {
+        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    }
+    const WNOHANG: i32 = 1;
+
+    let knock = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !knock {
+        return false;
+    }
+    let mut status: i32 = 0;
+    match unsafe { waitpid(pid as i32, &mut status, WNOHANG) } {
+        // Reaped a zombie -> process had exited.
+        n if n == pid as i32 => false,
+        // Still a live, running child.
+        0 => true,
+        // ECHILD (not our child) or other error: trust kill -0.
+        _ => true,
     }
 }
 

@@ -4525,7 +4525,9 @@ mod tests {
         let cmd = if cfg!(windows) {
             r#"powershell -NoProfile -Command "Write-Output 'test result: ok. 1 passed; 0 failed'""#
         } else {
-            "echo test result: ok. 1 passed; 0 failed"
+            // Quoted so the `;` survives the shell as literal text instead of
+            // splitting into a second (bogus) command.
+            "echo \"test result: ok. 1 passed; 0 failed\""
         };
         let args = serde_json::json!({ "command": cmd });
         let r = tm

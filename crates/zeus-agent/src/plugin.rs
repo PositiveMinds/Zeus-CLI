@@ -264,7 +264,11 @@ mod tests {
             .unwrap()
             .join("target")
             .join("debug");
-        target_debug.join(format!("zeus_example_plugin.{}", dylib_extension()))
+        // Cargo emits cdylibs as `[lib]<crate>.<ext>`: no prefix on Windows,
+        // `lib` prefix on Unix/macOS. The loader test reads the real built
+        // artifact, so it must match cargo's actual output filename.
+        let stem = if cfg!(windows) { "zeus_example_plugin" } else { "libzeus_example_plugin" };
+        target_debug.join(format!("{stem}.{}", dylib_extension()))
     }
 
     #[test]
