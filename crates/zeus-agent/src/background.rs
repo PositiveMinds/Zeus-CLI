@@ -338,13 +338,7 @@ fn id_desc(args: &[String]) -> String {
 
 #[cfg(windows)]
 fn is_alive(pid: u32) -> bool {
-    match Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-    {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
-        Err(_) => false,
-    }
+    crate::terminal::process_is_alive(pid)
 }
 
 #[cfg(unix)]
@@ -398,7 +392,7 @@ fn detach_into_own_session(cmd: &mut Command) {
             // The child inherited the caller's process group; setsid() makes
             // it a session leader with its own group so later -<pgid> signals
             // (suspend/resume/kill-tree) can't touch the caller.
-            if unsafe { setsid() } == -1 {
+            if setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -422,6 +416,20 @@ mod tests {
         }
     }
 
+    /// A command that sleeps far longer than any test body can run, so a
+    /// pause/resume dance (each step spawns a `tasklist`/`ps`/`kill`
+    /// subprocess) can never outlive the process it is operating on. The old
+    /// `ping -n 30` / `sleep 30` gave ~29s of headroom, which a heavily
+    /// loaded parallel CI run could burn through — the process exited before
+    /// the final resume and the test failed spuriously.
+    fn long_sleep_cmd() -> &'static str {
+        if cfg!(windows) {
+            "ping -n 600 127.0.0.1 >NUL"
+        } else {
+            "sleep 600"
+        }
+    }
+
     #[test]
     fn spawn_list_and_stop() {
         let tmp = TempDir::new().unwrap();
@@ -429,11 +437,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
 
-        let sleep_cmd = if cfg!(windows) {
-            "ping -n 30 127.0.0.1 >NUL"
-        } else {
-            "sleep 30"
-        };
+        let sleep_cmd = long_sleep_cmd();
         let id = registry.spawn(sleep_cmd, &root).unwrap();
 
         let (task, status) = registry.get(id).unwrap().unwrap();
@@ -530,11 +534,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let dir = root.join(".agent/background");
 
-        let sleep_cmd = if cfg!(windows) {
-            "ping -n 30 127.0.0.1 >NUL"
-        } else {
-            "sleep 30"
-        };
+        let sleep_cmd = long_sleep_cmd();
         let id = {
             let first = BackgroundTaskRegistry::new(dir.clone());
             first.spawn(sleep_cmd, &root).unwrap()
@@ -553,11 +553,7 @@ mod tests {
         let root = tmp.path().join("proj");
         std::fs::create_dir_all(&root).unwrap();
         let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
-        let sleep_cmd = if cfg!(windows) {
-            "ping -n 30 127.0.0.1 >NUL"
-        } else {
-            "sleep 30"
-        };
+        let sleep_cmd = long_sleep_cmd();
         let id = registry.spawn(sleep_cmd, &root).unwrap();
 
         // Cancelled paused state rejected, running accepted.
@@ -595,11 +591,7 @@ mod tests {
         let root = tmp.path().join("proj");
         std::fs::create_dir_all(&root).unwrap();
         let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
-        let sleep_cmd = if cfg!(windows) {
-            "ping -n 30 127.0.0.1 >NUL"
-        } else {
-            "sleep 30"
-        };
+        let sleep_cmd = long_sleep_cmd();
         registry.spawn(sleep_cmd, &root).unwrap();
         registry.spawn(sleep_cmd, &root).unwrap();
         assert_eq!(registry.list().unwrap().len(), 2);

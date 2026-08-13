@@ -1346,7 +1346,12 @@ async fn cmd_pull(config: &Config, source: PullCmd) -> Result<()> {
                 zeus_provider::download_hf_file(&repo, &file, &dest_dir, |downloaded, total| {
                     if let Some(total) = total {
                         if total > 0 {
-                            let pct = downloaded * 100 / total;
+                            let Some(pct) = downloaded
+                                .checked_mul(100)
+                                .and_then(|n| n.checked_div(total))
+                            else {
+                                return;
+                            };
                             if pct >= last_pct_reported + 10 || pct == 100 {
                                 last_pct_reported = pct;
                                 println!("  {pct}% ({downloaded}/{total} bytes)");

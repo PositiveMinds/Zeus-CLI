@@ -5152,10 +5152,8 @@ async fn handle_key(
                     state.cursor -= 1;
                 }
             }
-            KeyCode::Right => {
-                if state.cursor < char_count(&state.input) {
-                    state.cursor += 1;
-                }
+            KeyCode::Right if state.cursor < char_count(&state.input) => {
+                state.cursor += 1;
             }
             _ => {}
         }
@@ -5715,10 +5713,8 @@ async fn handle_key(
                 state.cursor -= 1;
             }
         }
-        KeyCode::Right => {
-            if state.cursor < char_count(&state.input) {
-                state.cursor += 1;
-            }
+        KeyCode::Right if state.cursor < char_count(&state.input) => {
+            state.cursor += 1;
         }
         KeyCode::Home => state.cursor = 0,
         KeyCode::End => state.cursor = char_count(&state.input),

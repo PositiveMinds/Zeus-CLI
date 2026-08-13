@@ -543,9 +543,10 @@ pub(crate) fn kill_tree(pid: u32) {
         // Background tasks are session leaders in their own process group
         // (see background.rs), so a negative pid kills the whole group,
         // e.g. `sh -c "docker compose up"` and its children. Falls back to
-        // a single-process kill when the pid doesn't lead a group.
+        // a single-process kill when the pid doesn't lead a group. `--` ends
+        // option parsing so the negative pid is a target, not a flag.
         let _ = Command::new("kill")
-            .args(["-9", &format!("-{pid}")])
+            .args(["-9", "--", &format!("-{pid}")])
             .output();
         let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
     }
@@ -561,6 +562,57 @@ pub(crate) fn suspend_process(pid: u32) -> std::io::Result<()> {
 /// Continue a previously-suspended process.
 pub(crate) fn resume_process(pid: u32) -> std::io::Result<()> {
     signal_process(pid, false)
+}
+
+/// Whether a process is running (not yet exited).
+///
+/// On Windows this queries the exit code directly through Win32 rather than
+/// shelling out to `tasklist` and string-matching its output — the old
+/// approach spawned a subprocess per check and was locale-sensitive (a
+/// non-English `tasklist` may not contain the bare pid). `GetExitCodeProcess`
+/// returns `STILL_ACTIVE` only while the process runs; an exited-but-unreaped
+/// process reports its real exit code instead, so this is accurate even for
+/// detached children no parent is reaping.
+#[cfg(windows)]
+pub(crate) fn process_is_alive(pid: u32) -> bool {
+    use libloading::{Library, Symbol};
+    use std::ffi::c_void;
+
+    unsafe {
+        type OpenProcess = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
+        type GetExitCodeProcess = unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
+        type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+
+        let kernel32 = match Library::new("kernel32.dll") {
+            Ok(lib) => lib,
+            Err(_) => return false,
+        };
+        let open_process: Symbol<OpenProcess> = match kernel32.get(b"OpenProcess\0") {
+            Ok(sym) => sym,
+            Err(_) => return false,
+        };
+        let get_exit_code: Symbol<GetExitCodeProcess> = match kernel32.get(b"GetExitCodeProcess\0")
+        {
+            Ok(sym) => sym,
+            Err(_) => return false,
+        };
+        let close_handle: Symbol<CloseHandle> = match kernel32.get(b"CloseHandle\0") {
+            Ok(sym) => sym,
+            Err(_) => return false,
+        };
+
+        let handle = open_process(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let queried = get_exit_code(handle, &mut exit_code) != 0;
+        close_handle(handle);
+        queried && exit_code == STILL_ACTIVE
+    }
 }
 
 #[cfg(unix)]
@@ -653,8 +705,10 @@ fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn run_signal(signal: &str, target: &str) -> std::io::Result<()> {
+    // `--` ends option parsing so a negative target (a process group like
+    // `-7`) is treated as a pid, not a flag — required by procps-ng's kill.
     let status = Command::new("kill")
-        .args([signal, target])
+        .args([signal, "--", target])
         .status()
         .map_err(std::io::Error::other)?;
     if status.success() {

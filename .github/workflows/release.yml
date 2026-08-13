@@ -88,6 +88,12 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    # Where binaries get published. Currently a separate public mirror so the
+    # source repo can stay private; override with a repo variable if the
+    # source repo itself is ever the release home (avoids hardcoding the
+    # repo name in three places below).
+    env:
+      RELEASE_REPO: ${{ vars.ZEUS_RELEASE_REPO || 'PositiveMinds/Zeus-CLI-releases' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -116,13 +122,13 @@ jobs:
           sed "s/__TAG__/$TAG/g; s/__VERSION__/$version/g" \
             .github/release-notes-template.md > release-notes.md
 
-          if gh release view "$TAG" --repo PositiveMinds/Zeus-CLI-releases >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* \
-              --repo PositiveMinds/Zeus-CLI-releases --clobber
-            gh release edit "$TAG" --repo PositiveMinds/Zeus-CLI-releases --notes-file release-notes.md
+              --repo "$RELEASE_REPO" --clobber
+            gh release edit "$TAG" --repo "$RELEASE_REPO" --notes-file release-notes.md
           else
             gh release create "$TAG" dist/* \
-              --repo PositiveMinds/Zeus-CLI-releases \
+              --repo "$RELEASE_REPO" \
               --title "$TAG" \
               --notes-file release-notes.md
           fi

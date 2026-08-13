@@ -251,7 +251,12 @@ mod tests {
     /// Workspace root (parent of crates/zeus-agent).
     fn workspace_root() -> std::path::PathBuf {
         let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        Path::new(&dir).parent().unwrap().parent().unwrap().to_path_buf()
+        Path::new(&dir)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
     }
 
     /// Path to the real compiled example plugin dylib, built as part of
@@ -287,7 +292,9 @@ mod tests {
             .args(["build", "-p", "zeus-example-plugin"])
             .current_dir(workspace_root())
             .status()
-            .unwrap_or_else(|e| panic!("failed to spawn `cargo build -p zeus-example-plugin`: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("failed to spawn `cargo build -p zeus-example-plugin`: {e}")
+            });
         assert!(
             status.success(),
             "`cargo build -p zeus-example-plugin` failed ({status})"
