@@ -321,6 +321,18 @@ ToolSpec {
             }),
         },
         ToolSpec {
+            name: "rag_search".into(),
+            description: "Keyword-based retrieval over the project's source files: chunks each file and ranks chunks against the query with BM25-style term weights (no model call, read-only, works offline). Use when you need to find code that is about a concept but may not contain the exact identifier/string you would grep for — e.g. \"where is connection retry handled\" or \"which code touches rate limiting\". Returns the top-k matching chunks with file paths. For exact-string lookup prefer grep; for symbol names use code_symbols.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The concept/terms to find code for"},
+                    "k": {"type": "integer", "description": "How many top chunks to return (default 5)"}
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolSpec {
             name: "memory".into(),
             description: "Long-term project memory under .agent/memory/: `list` shows note names + first lines; `read <name>` returns a note's full body. Used to persist decisions, conventions, and gotchas across sessions. Read before large/unknown tasks; check what the project already decided before exploring anew.".into(),
             parameters: json!({
@@ -1424,6 +1436,7 @@ fn is_read_only_tool(name: &str) -> bool {
 |             "read_document"
             | "read_image"
             | "understand_repo"
+            | "rag_search"
             | "memory"
             | "code_symbols"
             | "code_defs"
@@ -1678,6 +1691,7 @@ impl ToolManager {
             "read_document" => self.do_read_document(&args),
             "read_image" => self.do_read_image(&args),
             "understand_repo" => self.do_understand_repo(&args),
+            "rag_search" => self.do_rag_search(&args),
             "memory" => self.do_memory(&args),
             "memory_write" => self.do_memory_write(&args, approver),
             "device" => self.do_device(&args, approver),
@@ -2966,7 +2980,53 @@ impl ToolManager {
         Ok(ToolResult::ok(text))
     }
 
-    /// `memory` — list or read a long-term project memory note.
+    /// `rag_search` — keyword-based retrieval over the project's source
+    /// files. Chunks every source file (see `zeus_rag::chunker`) and ranks
+    /// the chunks against `query` with BM25-style term weighting; no model
+    /// call, no disk writes, so it is safe in Plan mode.
+    fn do_rag_search(&self, args: &Value) -> Result<ToolResult> {
+        let query = Self::opt_str_arg(args, "query")
+            .unwrap_or_default()
+            .to_string();
+        let k = args
+            .get("k")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 20) as usize;
+        if query.trim().is_empty() {
+            return Ok(ToolResult::err("query must not be empty"));
+        }
+        let root = self.workspace.project_root.clone();
+        let index = zeus_rag::RagIndex::from_project(&root, 800, 80);
+        if index.is_empty() {
+            return Ok(ToolResult::ok("no source files to search"));
+        }
+        let hits = index.search(&query, k);
+        if hits.is_empty() {
+            return Ok(ToolResult::ok(format!(
+                "no chunks matched '{query}' (searched {} chunk(s) in {} file(s)); try different wording or grep for exact strings",
+                index.len(),
+                zeus_rag::chunker::source_files(&root).len()
+            )));
+        }
+        let lines: Vec<String> = hits
+            .iter()
+            .map(|h| {
+                let path = h
+                    .chunk
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&h.chunk.path)
+                    .display();
+                format!("[{:.0}%] {}:\n{}", h.score * 100.0, path, h.chunk.text)
+            })
+            .collect();
+        Ok(ToolResult::ok(format!(
+            "top {} match(es) for '{query}':\n\n{}",
+            hits.len(),
+            lines.join("\n\n")
+        )))
+    }
     fn do_memory(&self, args: &Value) -> Result<ToolResult> {
         let action = Self::str_arg(args, "action")?.to_ascii_lowercase();
         let root = self.project_root();
@@ -4307,6 +4367,47 @@ mod tests {
             .unwrap();
         assert!(!no_topic.is_error);
         assert!(no_topic.content.contains("Rust"));
+    }
+
+    #[test]
+    fn rag_search_ranks_concept_chunks_above_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/retry.rs"),
+            "fn with_retry(action) { for attempt in 0..3 { /* reconnect */ } }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/ui.rs"),
+            "fn render_button(label) { draw(label) }",
+        )
+        .unwrap();
+        let tm = tool_manager(&root);
+
+        let r = tm
+            .dispatch_with_approver("rag_search", r#"{"query":"retry reconnect"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("retry.rs"), "{}", r.content);
+        assert!(r.content.contains("retry"), "{}", r.content);
+
+        // Empty query is a recoverable model mistake, not a hard error.
+        let empty = tm
+            .dispatch_with_approver("rag_search", r#"{"query":""}"#, approve)
+            .unwrap();
+        assert!(empty.is_error);
+        assert!(
+            empty.content.contains("must not be empty"),
+            "{}",
+            empty.content
+        );
+    }
+
+    #[test]
+    fn rag_search_is_read_only_so_plan_mode_can_use_it() {
+        assert!(is_read_only_tool("rag_search"));
     }
 
     #[test]

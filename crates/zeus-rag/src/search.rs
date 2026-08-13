@@ -93,7 +93,7 @@ impl RagIndex {
         let query_vec: Option<Vec<f32>> = self
             .vectors
             .as_ref()
-            .filter(|vs| vs.iter().any(|v| !v.is_empty()) && vs[0].len() > 0)
+            .filter(|vs| vs.iter().any(|v| !v.is_empty()) && !vs[0].is_empty())
             .map(|vs| {
                 let dim = vs[0].len();
                 let mut acc = vec![0.0f32; dim];
@@ -131,7 +131,7 @@ impl RagIndex {
                 }
                 // Keyword component: BM25 saturates; scale by inverse doc
                 // count for a rough 0..=1 normalization.
-                let keyword = (kw / n_docs).max(0.0).min(1.0);
+                let keyword = (kw / n_docs).clamp(0.0, 1.0);
                 let vector = match (query_vec.as_ref(), self.vectors.as_ref()) {
                     (Some(qv), Some(vs)) if i < vs.len() => cosine(qv, &vs[i]),
                     _ => 0.0,

@@ -86,15 +86,13 @@ pub fn chunk_text(text: &str, approx_chars: usize, overlap_chars: usize) -> Vec<
 /// text.
 fn next_break(head: &str, approx_chars: usize) -> Option<usize> {
     let mut idx = None;
-    let mut seen = 0usize;
-    for (i, c) in head.char_indices() {
+    for (seen, (i, c)) in head.char_indices().enumerate() {
         if seen >= approx_chars {
             break;
         }
         if i > 0 && c.is_whitespace() {
             idx = Some(i);
         }
-        seen += 1;
     }
     idx
 }

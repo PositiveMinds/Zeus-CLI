@@ -14,6 +14,7 @@ zeus-fs = { workspace = true }
 zeus-lang = { workspace = true }
 zeus-logging = { workspace = true }
 zeus-provider = { workspace = true }
+zeus-rag = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

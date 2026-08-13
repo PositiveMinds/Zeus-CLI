@@ -43,6 +43,7 @@ zeus-fs = { path = "crates/zeus-fs" }
 zeus-lang = { path = "crates/zeus-lang" }
 zeus-logging = { path = "crates/zeus-logging" }
 zeus-provider = { path = "crates/zeus-provider" }
+zeus-rag = { path = "crates/zeus-rag" }
 
 anyhow = "1"
 async-trait = "0.1"
