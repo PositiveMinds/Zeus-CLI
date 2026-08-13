@@ -43,5 +43,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # The plugin loader test (zeus-agent) loads a real compiled dylib from
+      # the top-level target/<profile> dir; only an explicit `cargo build`
+      # emits that artifact (cargo test only builds hashed deps/ copies).
+      - name: Build example plugin
+        run: cargo build -p zeus-example-plugin
+
       - name: Run tests
         run: cargo test --workspace

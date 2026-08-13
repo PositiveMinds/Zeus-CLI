@@ -526,6 +526,13 @@ pub(crate) fn kill_tree(pid: u32) {
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
     } else {
+        // Background tasks are session leaders in their own process group
+        // (see background.rs), so a negative pid kills the whole group,
+        // e.g. `sh -c "docker compose up"` and its children. Falls back to
+        // a single-process kill when the pid doesn't lead a group.
+        let _ = Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
+            .output();
         let _ = Command::new("kill")
             .args(["-9", &pid.to_string()])
             .output();
@@ -560,10 +567,22 @@ fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
                 .ok()
         });
     let target = match pgid {
-        Some(gid) => format!("-{gid}"),
-        None => pid.to_string(),
+        // Only signal the group when it is not the caller's own group —
+        // otherwise `kill -STOP -<own pgid>` freezes this very process.
+        Some(gid) if gid != own_process_group() => format!("-{gid}"),
+        _ => pid.to_string(),
     };
     run_signal(&format!("-{sig}"), &target)
+}
+
+#[cfg(unix)]
+fn own_process_group() -> u32 {
+    // getpgid(0) = the calling process's process group. FFI avoids a libc dep.
+    unsafe extern "C" {
+        fn getpgid(pid: i32) -> i32;
+    }
+    let gid = unsafe { getpgid(0) };
+    if gid <= 0 { 0 } else { gid as u32 }
 }
 
 #[cfg(windows)]

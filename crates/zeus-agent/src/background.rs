@@ -106,6 +106,7 @@ impl BackgroundTaskRegistry {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::from(stdout_file));
         cmd.stderr(Stdio::from(stderr_file));
+        detach_into_own_session(&mut cmd);
 
         let child = cmd
             .spawn()
@@ -161,6 +162,7 @@ impl BackgroundTaskRegistry {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::from(stdout_file));
         cmd.stderr(Stdio::from(stderr_file));
+        detach_into_own_session(&mut cmd);
 
         let child = cmd
             .spawn()
@@ -353,6 +355,35 @@ fn is_alive(pid: u32) -> bool {    if cfg!(windows) {
             .unwrap_or(false)
     }
 }
+
+/// Give a background child its own process group/session on Unix. Without
+/// this, the child (e.g. `sh -c "sleep 30"`) shares the caller's process
+/// group — and a later `kill -STOP -<pgid>` / `kill -9 -<pgid>` would hit
+/// the caller (and, in tests, the test harness) instead of just the task.
+#[cfg(unix)]
+fn detach_into_own_session(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // Raw FFI avoids a libc dependency just for setsid(2).
+    unsafe extern "C" {
+        fn setsid() -> i32;
+    }
+
+    unsafe {
+        cmd.pre_exec(|| {
+            // The child inherited the caller's process group; setsid() makes
+            // it a session leader with its own group so later -<pgid> signals
+            // (suspend/resume/kill-tree) can't touch the caller.
+            if unsafe { setsid() } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach_into_own_session(_cmd: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
