@@ -8,6 +8,7 @@
 //! capture.
 
 use crate::error::{FsError, Result};
+use crate::pathutil::resolve_in_project;
 use crate::permission::{ApprovalDecision, PermissionGate, PermissionRequest};
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -17,6 +18,12 @@ use std::time::{Duration, Instant};
 /// Cap on captured command output so a chatty `adb logcat` dump can't blow
 /// the model's context window.
 const MAX_CAPTURED_BYTES: usize = 200_000;
+
+/// Hard cap on a single `adb` op (see `run`). Real ops against an attached
+/// device complete in well under this; ops that hang — e.g. `logcat` with no
+/// device, or `connect`/`pair` to an unreachable host — are killed and
+/// surfaced as a timed-out result instead of wedging the agent turn.
+const ADB_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct DeviceOutput {
@@ -75,13 +82,64 @@ impl DeviceEngine {
         }
     }
 
-    /// Run a plain text `adb` command to completion and capture output.
+    /// Run a plain text `adb` command to completion and capture output,
+    /// killing it if it hangs. An `adb` client with no device attached can
+    /// block indefinitely on some operations (`logcat` with or without `-d`
+    /// was observed to hang forever on a device-less Windows setup), so a
+    /// bare `.output()` here would wedge the whole agent turn. Mirrors the
+    /// bounded wait already used in `exec_out_to_file`.
     fn run(&self, args: &[&str]) -> Result<DeviceOutput> {
-        let output = Command::new("adb")
+        let mut child = Command::new("adb")
             .args(args)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| FsError::Other(format!("adb {args:?} failed to spawn: {e}")))?;
-        Ok(Self::into_output(output.status, output.stdout, output.stderr))
+        let mut out_handle = child.stdout.take();
+        let mut err_handle = child.stderr.take();
+
+        let start = Instant::now();
+        let status = loop {
+            if let Some(s) = child
+                .try_wait()
+                .map_err(|e| FsError::Other(format!("adb {args:?} wait failed: {e}")))?
+            {
+                break Some(s);
+            }
+            if start.elapsed() >= ADB_COMMAND_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        if let Some(mut h) = out_handle.take() {
+            let _ = h.read_to_end(&mut out);
+        }
+        if let Some(mut h) = err_handle.take() {
+            let _ = h.read_to_end(&mut err);
+        }
+
+        match status {
+            Some(s) => Ok(Self::into_output(s, out, err)),
+            None => {
+                let stderr = if err.is_empty() {
+                    format!("adb {args:?} timed out after {}s", ADB_COMMAND_TIMEOUT.as_secs())
+                } else {
+                    String::from_utf8_lossy(&err).into_owned()
+                };
+                Ok(DeviceOutput {
+                    stdout: String::new(),
+                    stderr,
+                    exit_code: Some(1),
+                    success: false,
+                    artifact: None,
+                })
+            }
+        }
     }
 
     /// List connected devices (USB + wireless). `-l` shows model/serial.
@@ -119,8 +177,18 @@ impl DeviceEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        self.enforce(&format!("install APK on device: {apk}"), approver)?;
-        self.run(&["install", "-r", apk])
+        // Contained like every other file-touching tool — this used to pass
+        // `apk` straight to `adb install` with no containment check at all
+        // (not even a `project_root.join`), so an absolute path installed
+        // whatever APK it pointed at, anywhere on disk. Resolving also fixes
+        // a real correctness quirk as a side effect: `adb` is spawned with
+        // no explicit `current_dir`, so a relative `apk` was resolved
+        // against the zeus process's own cwd, not `project_root` — passing
+        // the canonicalized absolute path removes that ambiguity too.
+        let resolved = resolve_in_project(&self.project_root, std::path::Path::new(apk))?;
+        self.enforce(&format!("install APK on device: {}", resolved.display()), approver)?;
+        let apk_path = resolved.to_string_lossy().into_owned();
+        self.run(&["install", "-r", &apk_path])
     }
 
     /// Uninstall a package from the device.
@@ -199,7 +267,7 @@ impl DeviceEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        let path = self.artifact_path(out, "screenshot", "png");
+        let path = self.artifact_path(out, "screenshot", "png")?;
         self.enforce(&format!("capture device screenshot to {}", path.display()), approver)?;
         let mut out = self.exec_out_to_file(&["exec-out", "screencap", "-p"], &path, Duration::from_secs(20))?;
         if out.success {
@@ -220,7 +288,7 @@ impl DeviceEngine {
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         let seconds = seconds.clamp(1, 30);
-        let path = self.artifact_path(out, "screenrecord", "mp4");
+        let path = self.artifact_path(out, "screenrecord", "mp4")?;
         self.enforce(
             &format!("record device screen ({seconds}s) to {}", path.display()),
             approver,
@@ -301,16 +369,20 @@ impl DeviceEngine {
 
     /// Absolute destination for a capture artifact, relative to the project
     /// root unless an explicit path is given; defaults to a timestamped name.
-    fn artifact_path(&self, out: Option<&str>, stem: &str, ext: &str) -> PathBuf {
+    /// An explicit `out` is contained the same way every other file-touching
+    /// tool is — an auto-generated name never needs the check since it's
+    /// always a plain filename this function built itself, never derived
+    /// from untrusted model input.
+    fn artifact_path(&self, out: Option<&str>, stem: &str, ext: &str) -> Result<PathBuf> {
         match out {
-            Some(p) => self.project_root.join(p),
-            None => self.project_root.join(format!(
+            Some(p) => resolve_in_project(&self.project_root, std::path::Path::new(p)),
+            None => Ok(self.project_root.join(format!(
                 "{stem}-{}.{ext}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0)
-            )),
+            ))),
         }
     }
 
@@ -394,11 +466,8 @@ impl DeviceEngine {
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         self.enforce(&format!("send input event on device: input {event}"), approver)?;
-        let output = Command::new("adb")
-            .args(["shell", &format!("input {event}")])
-            .output()
-            .map_err(|e| FsError::Other(format!("adb shell input failed to spawn: {e}")))?;
-        Ok(Self::into_output(output.status, output.stdout, output.stderr))
+        let input_cmd = format!("input {event}");
+        self.run(&["shell", input_cmd.as_str()])
     }
 
     /// Clear the device logcat buffer (a fresh baseline before a test pass).
@@ -427,16 +496,17 @@ impl DeviceEngine {
                         .map(|d| d.as_secs())
                         .unwrap_or(0)))
             });
-        let dest = self.project_root.join(&local);
+        // Contained the same way every other file-touching tool is — a bare
+        // `project_root.join(local)` would let an absolute `local` (or a
+        // `..` traversal) override the join entirely and write the pulled
+        // content anywhere on disk instead of inside the project.
+        let dest = resolve_in_project(&self.project_root, std::path::Path::new(&local))?;
         self.enforce(
             &format!("pull {} from device to {}", remote, dest.display()),
             approver,
         )?;
-        let output = Command::new("adb")
-            .args(["pull", remote, dest.to_string_lossy().as_ref()])
-            .output()
-            .map_err(|e| FsError::Other(format!("adb pull failed to spawn: {e}")))?;
-        Ok(Self::into_output(output.status, output.stdout, output.stderr))
+        let dest_str = dest.to_string_lossy().into_owned();
+        self.run(&["pull", remote, dest_str.as_str()])
     }
 
     /// Copy a local file (relative to the project root) onto the device.
@@ -444,16 +514,17 @@ impl DeviceEngine {
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
-        let src = self.project_root.join(local);
+        // Contained the same way every other file-touching tool is — a bare
+        // `project_root.join(local)` would let an absolute `local` (e.g. a
+        // path to an SSH key) override the join entirely and push arbitrary
+        // local files to the device instead of just ones inside the project.
+        let src = resolve_in_project(&self.project_root, std::path::Path::new(local))?;
         self.enforce(
             &format!("push {} to device {}", src.display(), remote),
             approver,
         )?;
-        let output = Command::new("adb")
-            .args(["push", src.to_string_lossy().as_ref(), remote])
-            .output()
-            .map_err(|e| FsError::Other(format!("adb push failed to spawn: {e}")))?;
-        Ok(Self::into_output(output.status, output.stdout, output.stderr))
+        let src_str = src.to_string_lossy().into_owned();
+        self.run(&["push", src_str.as_str(), remote])
     }
 
     /// Run an arbitrary shell command on the device (`adb shell ...`) — the
@@ -463,11 +534,7 @@ impl DeviceEngine {
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         self.enforce(&format!("run device shell command: {command}"), approver)?;
-        let output = Command::new("adb")
-            .args(["shell", command])
-            .output()
-            .map_err(|e| FsError::Other(format!("adb shell failed to spawn: {e}")))?;
-        Ok(Self::into_output(output.status, output.stdout, output.stderr))
+        self.run(&["shell", command])
     }
 }
 
@@ -493,18 +560,22 @@ mod tests {
         let engine = engine(tmp.path());
         // adb may be absent on CI; the contract here is "clean DeviceOutput
         // or a surfaceable error" — never a panic — and that the permission
-        // gate is exercised first.
+        // gate is exercised first. `127.0.0.1:1` (nothing listens there)
+        // makes `connect`/`disconnect`/`pair` fail with an instant
+        // connection-refused rather than blocking ~21s on a blackholed
+        // private IP. Device-less `logcat` ops still legitimately hang adb,
+        // so the engine's `ADB_COMMAND_TIMEOUT` bounds each of those.
         let results = [
             engine.devices(&mut approve),
-            engine.connect("192.168.1.10:5555", &mut approve),
-            engine.disconnect("192.168.1.10:5555", &mut approve),
+            engine.connect("127.0.0.1:1", &mut approve),
+            engine.disconnect("127.0.0.1:1", &mut approve),
             engine.install("app.apk", &mut approve),
             engine.uninstall("com.example.app", &mut approve),
             engine.launch("com.example.app", None, &mut approve),
             engine.launch("com.example.app", Some(".MainActivity"), &mut approve),
             engine.logcat(None, 500, &mut approve),
             engine.shell("echo ok", &mut approve),
-            engine.pair("192.168.1.10:37000", "123456", &mut approve),
+            engine.pair("127.0.0.1:1", "123456", &mut approve),
             engine.info(&mut approve),
             engine.reverse(None, None, &mut approve),
             engine.reverse(Some(8080), None, &mut approve),
