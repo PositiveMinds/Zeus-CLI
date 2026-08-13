@@ -28,20 +28,37 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
-      # Cargo.lock is checked in, so hashFiles is stable across runs. Cache
-      # the whole target dir per OS to keep the ~59-crate dep graph from
-      # rebuilding on every CI run; a stale restore just recompiles the diff.
-      - name: Cache cargo build
+      # sccache shares compiled artifacts across CI runs via an OS-local
+      # cache, so the ~59-crate dep graph only really compiles once per OS
+      # even when Cargo.lock changes (the per-commit rebuild churn that the
+      # old full target-dir cache didn't help with). This is the main driver
+      # of the "Test" job wall-clock time.
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Configure sccache for cargo
+        shell: bash
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+
+      # Compiled artifacts come from sccache above; this cache only keeps the
+      # downloaded crate sources so a cold Cargo.lock doesn't re-download the
+      # whole registry. Deliberately NOT the target dir — sccache owns that
+      # (per-CPU fingerprints churn every commit and tarring target/ cargo-vs-
+      # sccache races to the same lock).
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-registry-
 
       # The plugin loader test (zeus-agent) loads a real compiled dylib from
       # the top-level target/<profile> dir; only an explicit `cargo build`
@@ -51,3 +68,11 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      # Style/lint are cheap to add on every matrix OS and keep a mis-format
+      # or lint from slipping through on any platform.
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings

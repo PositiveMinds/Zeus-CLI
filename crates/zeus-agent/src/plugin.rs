@@ -248,6 +248,12 @@ pub fn load_all(plugins_dir: &Path) -> Vec<LoadedPlugin> {
 mod tests {
     use super::*;
 
+    /// Workspace root (parent of crates/zeus-agent).
+    fn workspace_root() -> std::path::PathBuf {
+        let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        Path::new(&dir).parent().unwrap().parent().unwrap().to_path_buf()
+    }
+
     /// Path to the real compiled example plugin dylib, built as part of
     /// this workspace (`zeus-example-plugin`, crate-type = cdylib). This
     /// test only passes if the actual FFI boundary works — dynamic load,
@@ -255,35 +261,55 @@ mod tests {
     /// C strings, and cross-allocator-safe string freeing — not just that
     /// the loader code compiles.
     fn example_plugin_path() -> std::path::PathBuf {
-        let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        // crates/zeus-agent -> workspace root -> target/debug
-        let target_debug = Path::new(&dir)
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("target")
-            .join("debug");
+        let target_debug = workspace_root().join("target").join("debug");
         // Cargo emits cdylibs as `[lib]<crate>.<ext>`: no prefix on Windows,
         // `lib` prefix on Unix/macOS. The loader test reads the real built
         // artifact, so it must match cargo's actual output filename.
-        let stem = if cfg!(windows) { "zeus_example_plugin" } else { "libzeus_example_plugin" };
+        let stem = if cfg!(windows) {
+            "zeus_example_plugin"
+        } else {
+            "libzeus_example_plugin"
+        };
         target_debug.join(format!("{stem}.{}", dylib_extension()))
+    }
+
+    /// Make sure the example plugin cdylib exists, building it via cargo if
+    /// it doesn't — so the loader test is self-contained and never relies on
+    /// a CI step or a prior manual build. `cargo test` itself only compiles
+    /// the plugin into hashed `deps/` copies; the top-level `target/debug`
+    /// artifact requires an explicit `cargo build -p zeus-example-plugin`.
+    fn ensure_example_plugin() -> std::path::PathBuf {
+        let path = example_plugin_path();
+        if path.exists() {
+            return path;
+        }
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "zeus-example-plugin"])
+            .current_dir(workspace_root())
+            .status()
+            .unwrap_or_else(|e| panic!("failed to spawn `cargo build -p zeus-example-plugin`: {e}"));
+        assert!(
+            status.success(),
+            "`cargo build -p zeus-example-plugin` failed ({status})"
+        );
+        assert!(
+            path.exists(),
+            "`cargo build -p zeus-example-plugin` succeeded but produced no artifact at {path:?}"
+        );
+        path
     }
 
     #[test]
     fn loads_real_compiled_plugin_and_calls_its_tool() {
-        let path = example_plugin_path();
-        assert!(
-            path.exists(),
-            "example plugin not built at {path:?} — run `cargo build -p zeus-example-plugin` first"
-        );
+        let path = ensure_example_plugin();
         let plugin = LoadedPlugin::load("example", &path).unwrap();
 
         assert_eq!(plugin.tools().len(), 1);
         assert_eq!(plugin.tools()[0].name, "shout");
 
-        let result = plugin.call_tool("shout", r#"{"text":"hello plugin"}"#).unwrap();
+        let result = plugin
+            .call_tool("shout", r#"{"text":"hello plugin"}"#)
+            .unwrap();
         assert!(!result.is_error);
         assert_eq!(result.content, "HELLO PLUGIN");
 
@@ -299,10 +325,7 @@ mod tests {
 
     #[test]
     fn load_all_finds_and_loads_the_example_plugin() {
-        let src = example_plugin_path();
-        if !src.exists() {
-            return; // covered explicitly by the test above with a clear message
-        }
+        let src = ensure_example_plugin();
         let tmp = tempfile::TempDir::new().unwrap();
         let dest = tmp.path().join(format!("example.{}", dylib_extension()));
         std::fs::copy(&src, &dest).unwrap();
