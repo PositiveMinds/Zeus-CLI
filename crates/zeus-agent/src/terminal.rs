@@ -534,21 +534,158 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 
 /// Best-effort whole-process-tree kill — build tools and `docker compose`
 /// spawn children that a plain single-PID kill would leave orphaned.
+#[cfg(windows)]
 pub(crate) fn kill_tree(pid: u32) {
-    if cfg!(windows) {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-    } else {
-        // Background tasks are session leaders in their own process group
-        // (see background.rs), so a negative pid kills the whole group,
-        // e.g. `sh -c "docker compose up"` and its children. Falls back to
-        // a single-process kill when the pid doesn't lead a group. `--` ends
-        // option parsing so the negative pid is a target, not a flag.
-        let _ = Command::new("kill")
-            .args(["-9", "--", &format!("-{pid}")])
-            .output();
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    use libloading::{Library, Symbol};
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+
+    unsafe {
+        type CreateToolhelp32Snapshot = unsafe extern "system" fn(u32, u32) -> *mut c_void;
+        type Process32FirstW = unsafe extern "system" fn(*mut c_void, *mut ProcessEntry32W) -> i32;
+        type Process32NextW = unsafe extern "system" fn(*mut c_void, *mut ProcessEntry32W) -> i32;
+        type OpenProcess = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
+        type TerminateProcess = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+        type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+        const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+        const PROCESS_TERMINATE: u32 = 0x0001;
+
+        let kernel32 = match Library::new("kernel32.dll") {
+            Ok(lib) => lib,
+            Err(_) => return,
+        };
+        let create_snapshot: Symbol<CreateToolhelp32Snapshot> =
+            match kernel32.get(b"CreateToolhelp32Snapshot\0") {
+                Ok(sym) => sym,
+                Err(_) => return,
+            };
+        let first: Symbol<Process32FirstW> = match kernel32.get(b"Process32FirstW\0") {
+            Ok(sym) => sym,
+            Err(_) => return,
+        };
+        let next: Symbol<Process32NextW> = match kernel32.get(b"Process32NextW\0") {
+            Ok(sym) => sym,
+            Err(_) => return,
+        };
+        let open_process: Symbol<OpenProcess> = match kernel32.get(b"OpenProcess\0") {
+            Ok(sym) => sym,
+            Err(_) => return,
+        };
+        let terminate: Symbol<TerminateProcess> = match kernel32.get(b"TerminateProcess\0") {
+            Ok(sym) => sym,
+            Err(_) => return,
+        };
+        let close_handle: Symbol<CloseHandle> = match kernel32.get(b"CloseHandle\0") {
+            Ok(sym) => sym,
+            Err(_) => return,
+        };
+
+        // Snapshot the process table once, build pid -> children, then
+        // terminate the tree depth-first (children before parents, so
+        // nothing is left orphaned behind the task).
+        let snapshot = create_snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() {
+            // No snapshot to walk — fall back to terminating just the pid.
+            let h = open_process(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                terminate(h, 1);
+                close_handle(h);
+            }
+            return;
+        }
+
+        let mut entry = ProcessEntry32W {
+            dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+            ..Default::default()
+        };
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut ok = first(snapshot, &mut entry);
+        while ok != 0 {
+            children
+                .entry(entry.th32_parent_process_id)
+                .or_default()
+                .push(entry.th32_process_id);
+            ok = next(snapshot, &mut entry);
+        }
+        close_handle(snapshot);
+
+        let open_process = *open_process;
+        let terminate = *terminate;
+        let close_handle = *close_handle;
+        fn terminate_recursive(
+            pid: u32,
+            children: &HashMap<u32, Vec<u32>>,
+            open_process: OpenProcess,
+            terminate: TerminateProcess,
+            close_handle: CloseHandle,
+        ) {
+            if let Some(kids) = children.get(&pid) {
+                for &kid in kids {
+                    terminate_recursive(kid, children, open_process, terminate, close_handle);
+                }
+            }
+            let h = unsafe { open_process(PROCESS_TERMINATE, 0, pid) };
+            if !h.is_null() {
+                unsafe {
+                    terminate(h, 1);
+                    close_handle(h);
+                }
+            }
+        }
+        terminate_recursive(pid, &children, open_process, terminate, close_handle);
+    }
+}
+
+/// Best-effort whole-process-tree kill — build tools and `docker compose`
+/// spawn children that a plain single-PID kill would leave orphaned.
+#[cfg(not(windows))]
+pub(crate) fn kill_tree(pid: u32) {
+    // Background tasks are session leaders in their own process group
+    // (see background.rs), so a negative pid kills the whole group,
+    // e.g. `sh -c "docker compose up"` and its children. Falls back to
+    // a single-process kill when the pid doesn't lead a group. `--` ends
+    // option parsing so the negative pid is a target, not a flag.
+    let _ = Command::new("kill")
+        .args(["-9", "--", &format!("-{pid}")])
+        .output();
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+}
+
+/// Windows `PROCESSENTRY32W` snapshot entry, `#[repr(C)]` so the FFI layout
+/// matches MSVC's. `th32DefaultHeapID` is `ULONG_PTR` (pointer-width), which
+/// is exactly what Rust's `usize` gives us, including the 4 bytes of padding
+/// the C compiler inserts before it on x64 (so `th32ParentProcessID` lands at
+/// offset 32 and `szExeFile` at 44, per the verified 64-bit layout).
+#[cfg(windows)]
+#[repr(C)]
+struct ProcessEntry32W {
+    dw_size: u32,
+    cnt_usage: u32,
+    th32_process_id: u32,
+    th32_default_heap_id: usize,
+    th32_module_id: u32,
+    cnt_threads: u32,
+    th32_parent_process_id: u32,
+    pc_pri_class_base: i32,
+    dw_flags: u32,
+    sz_exe_file: [u16; 260],
+}
+
+impl Default for ProcessEntry32W {
+    fn default() -> Self {
+        Self {
+            dw_size: 0,
+            cnt_usage: 0,
+            th32_process_id: 0,
+            th32_default_heap_id: 0,
+            th32_module_id: 0,
+            cnt_threads: 0,
+            th32_parent_process_id: 0,
+            pc_pri_class_base: 0,
+            dw_flags: 0,
+            sz_exe_file: [0; 260],
+        }
     }
 }
 
@@ -868,5 +1005,109 @@ mod tests {
             out.timed_out,
             "if this fails, the try_wait() bug may be fixed — see doc comment above"
         );
+    }
+
+    /// Locks the `PROCESSENTRY32W` FFI layout to the verified 64-bit layout
+    /// (see the struct's doc comment): if a future edit drifts the padding,
+    /// `Process32FirstW` would write parent pids into the wrong slot and the
+    /// whole tree-kill would silently misbehave. Compile-time constants are
+    /// fine for tests, but these asserts run at test time for clarity.
+    #[test]
+    #[cfg(windows)]
+    fn process_entry32w_layout_is_x64_canonical() {
+        assert_eq!(std::mem::size_of::<ProcessEntry32W>(), 568);
+        assert_eq!(std::mem::offset_of!(ProcessEntry32W, th32_process_id), 8);
+        assert_eq!(
+            std::mem::offset_of!(ProcessEntry32W, th32_parent_process_id),
+            32
+        );
+        assert_eq!(std::mem::offset_of!(ProcessEntry32W, sz_exe_file), 44);
+    }
+
+    /// `kill_tree` on Windows must reap the whole tree, not just the root:
+    /// spawn a shell that launches a child, then confirm both are gone.
+    #[test]
+    #[cfg(windows)]
+    fn kill_tree_reaps_children() {
+        use std::process::Command as StdCommand;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // `cmd /c` wrapping `ping` gives us a real parent->child pair:
+        // cmd.exe (pid we hold) -> ping.exe (its child, alive ~600s).
+        let mut child = StdCommand::new("cmd")
+            .args(["/c", "ping -n 600 127.0.0.1 >NUL"])
+            .current_dir(&root)
+            .spawn()
+            .unwrap();
+        let parent_pid = child.id();
+        assert!(process_is_alive(parent_pid));
+
+        // Find ping.exe: it must be a descendant of the cmd we spawned.
+        let mut ping_pid = None;
+        for _ in 0..100 {
+            if let Some(pid) = find_child_of(parent_pid) {
+                ping_pid = Some(pid);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let ping_pid = ping_pid.expect("ping should have appeared under cmd");
+        assert!(process_is_alive(ping_pid));
+
+        kill_tree(parent_pid);
+        let _ = child.wait();
+
+        assert!(!process_is_alive(parent_pid), "root must be dead");
+        assert!(!process_is_alive(ping_pid), "child must be reaped too");
+    }
+
+    /// Direct child pids of `pid`, via the same Toolhelp snapshot the
+    /// production `kill_tree` walks — keeps the test honest about what the
+    /// snapshot actually returns (same struct, same API).
+    #[cfg(windows)]
+    fn find_child_of(pid: u32) -> Option<u32> {
+        use libloading::{Library, Symbol};
+        use std::ffi::c_void;
+
+        unsafe {
+            type CreateToolhelp32Snapshot = unsafe extern "system" fn(u32, u32) -> *mut c_void;
+            type Process32FirstW =
+                unsafe extern "system" fn(*mut c_void, *mut ProcessEntry32W) -> i32;
+            type Process32NextW =
+                unsafe extern "system" fn(*mut c_void, *mut ProcessEntry32W) -> i32;
+            type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+            const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+
+            let kernel32 = Library::new("kernel32.dll").ok()?;
+            let create_snapshot: Symbol<CreateToolhelp32Snapshot> =
+                kernel32.get(b"CreateToolhelp32Snapshot\0").ok()?;
+            let first: Symbol<Process32FirstW> = kernel32.get(b"Process32FirstW\0").ok()?;
+            let next: Symbol<Process32NextW> = kernel32.get(b"Process32NextW\0").ok()?;
+            let close_handle: Symbol<CloseHandle> = kernel32.get(b"CloseHandle\0").ok()?;
+
+            let snapshot = create_snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot.is_null() {
+                return None;
+            }
+            let mut entry = ProcessEntry32W {
+                dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+                ..Default::default()
+            };
+            let mut out = None;
+            let mut ok = first(snapshot, &mut entry);
+            while ok != 0 {
+                if entry.th32_parent_process_id == pid {
+                    out = Some(entry.th32_process_id);
+                    break;
+                }
+                ok = next(snapshot, &mut entry);
+            }
+            close_handle(snapshot);
+            out
+        }
     }
 }
