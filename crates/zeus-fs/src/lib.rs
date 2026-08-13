@@ -15,6 +15,7 @@ mod permission;
 mod platform;
 mod search;
 mod staleness;
+mod tsint;
 mod workspace;
 
 pub use checkpoint::{CheckpointStore, CheckpointSummary, FileSnapshot};

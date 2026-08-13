@@ -18,6 +18,18 @@ sha2 = "0.10"
 hex = "0.4"
 ignore = "0.4"
 regex = "1"
+tree-sitter = { workspace = true }
+tree-sitter-language = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-ruby = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-typescript = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

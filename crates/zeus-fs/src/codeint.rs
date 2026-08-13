@@ -3,18 +3,20 @@
 //! A lightweight symbol index and reference tools built on the same
 //! ripgrep-backed, database-free foundation as the rest of zeus:
 //!
-//! - [`IndexEngine::scan`] walks a project's source files with compact
-//!   per-language extractors and writes the result to the already-allocated
-//!   `.agent/index.json` (no SQL, no tree-sitter yet).
+//! - [`IndexEngine::scan`] walks a project's source files with per-language
+//!   extraction and writes the result to the already-allocated
+//!   `.agent/index.json` (no SQL).
 //! - [`SymbolIndex::query`] lets callers look symbols up by name, giving
 //!   "go to definition"-style answers.
 //! - Cross-project *references* are computed with ripgrep (the shared
 //!   [`crate::search::SearchEngine`]) so "find references"/"rename" reuse the
 //!   exact search substrate the agent already has.
 //!
-//! A later phase layers real tree-sitter parsing and an LSP manager on top of
-//! this same on-disk contract; the index format is meant to stay forward
-//! compatible with that.
+//! Extraction is layered: languages with a wired tree-sitter grammar
+//! ([`crate::tsint`]) are parsed into a real AST (accurate definitions even in
+//! nested bodies); the rest fall back to compact per-language regex
+//! extractors. Both write the same on-disk contract, so the index format stays
+//! forward-compatible.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -245,7 +247,13 @@ impl IndexEngine {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            extract_symbols(&rel, lang, &text, &mut symbols);
+            // Phase 6: real tree-sitter parsing where a grammar is wired;
+            // the regex extractors remain the fallback for other languages.
+            if let Some(ts) = crate::tsint::ts_language_for(path) {
+                crate::tsint::extract_symbols_ts(&rel, ts, &text, &mut symbols);
+            } else {
+                extract_symbols(&rel, lang, &text, &mut symbols);
+            }
         }
 
         let built_at = std::time::SystemTime::now()
