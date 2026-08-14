@@ -3792,6 +3792,7 @@ dependencies = [
  "arboard",
  "clap",
  "crossterm",
+ "dirs",
  "futures",
  "ratatui",
  "reqwest",

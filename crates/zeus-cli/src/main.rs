@@ -2493,6 +2493,7 @@ fn cmd_codeint(config: &Config, action: CodeintCmd) -> Result<()> {
 
     match action {
         CodeintCmd::Index { force } => {
+            guard_against_home_root(&root)?;
             if !force {
                 if let Ok(Some(idx)) = SymbolIndex::load(&root) {
                     println!(
@@ -2596,6 +2597,23 @@ fn cmd_codeint(config: &Config, action: CodeintCmd) -> Result<()> {
     Ok(())
 }
 
+/// Refuse to build a full index over the user's home directory. `find_project_root`
+/// falls back to (or walks up to) the home dir when a plain directory under it has
+/// no `.git`/`.agent` marker, which turns `index` into a walk of the entire home
+/// tree — effectively a hang. Fail loudly with a fix hint instead.
+fn guard_against_home_root(root: &Path) -> Result<()> {
+    if let Some(home) = dirs::home_dir() {
+        if root == home {
+            return Err(anyhow::anyhow!(
+                "refusing to index your home directory ({}): run this from a project directory \
+                 instead (or add a .git/.agent marker there to pin the project root)",
+                home.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_ragindex(config: &Config, action: RagindexCmd) -> Result<()> {
     let ws = workspace(config)?;
     let root = ws.project_root.clone();
@@ -2607,6 +2625,7 @@ async fn cmd_ragindex(config: &Config, action: RagindexCmd) -> Result<()> {
             provider,
             model,
         } => {
+            guard_against_home_root(&root)?;
             // Fast path: a fresh index that already satisfies the request.
             let mut persisted = zeus_rag::PersistedRagIndex::load(&root);
             if !force {
@@ -3426,5 +3445,50 @@ mod tests {
             }
             other => panic!("expected Read, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_parses_ragindex_subcommands() {
+        let cli = Cli::try_parse_from([
+            "zeus",
+            "ragindex",
+            "index",
+            "--force",
+            "--embed",
+            "--provider",
+            "ollama",
+            "--model",
+            "all-minilm",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Ragindex {
+                action: RagindexCmd::Index { force, embed, .. },
+            } => {
+                assert!(force);
+                assert!(embed);
+            }
+            other => panic!("expected ragindex index, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["zeus", "ragindex", "search", "retry", "-k", "3"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Ragindex {
+                action: RagindexCmd::Search { query, k },
+            } => {
+                assert_eq!(query, "retry");
+                assert_eq!(k, 3);
+            }
+            other => panic!("expected ragindex search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guard_refuses_home_root_but_allows_projects() {
+        if let Some(home) = dirs::home_dir() {
+            assert!(guard_against_home_root(&home).is_err());
+        }
+        let proj = std::path::Path::new("C:\\some\\project");
+        assert!(guard_against_home_root(proj).is_ok());
     }
 }

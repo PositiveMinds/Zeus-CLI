@@ -376,7 +376,7 @@ pub enum RagindexCmd {
     Search {
         query: String,
         /// Number of results to return.
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, short = 'k', default_value_t = 5)]
         k: usize,
     },
 }

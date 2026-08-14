@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+dirs = { workspace = true }
 futures = { workspace = true }
 zeus-agent = { workspace = true }
 zeus-config = { workspace = true }

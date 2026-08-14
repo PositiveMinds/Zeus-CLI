@@ -33,9 +33,12 @@ Launches the interactive TUI. With no provider configured yet, it opens straight
 
 Other useful commands:
 ```bash
-zeus doctor   # check every configured provider's readiness (key present, or reachable for local runners)
-zeus init     # set up this project's .agent/ state (optional — run inside a repo)
-zeus --help   # see every command
+zeus doctor     # check every configured provider's readiness (key present, or reachable for local runners)
+zeus init       # set up this project's .agent/ state (optional — run inside a repo)
+zeus codeint index    # build the symbol index (.agent/index.json), then find/defs/refs/rename
+zeus ragindex index   # build/refresh the RAG index (.agent/rag_index.json); --embed adds vectors
+zeus ragindex search "<query>"   # hybrid keyword+vector search over a fresh RAG index
+zeus --help     # see every command
 ```
 
 ## Troubleshooting
