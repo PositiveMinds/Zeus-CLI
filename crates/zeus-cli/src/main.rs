@@ -1,5 +1,6 @@
 //! zeus — database-free AI coding agent CLI.
 
+mod catalog;
 mod clipboard;
 mod decor;
 mod highlight;
@@ -465,12 +466,21 @@ pub(crate) async fn list_models_by_provider(
     names.sort();
 
     let fetches = names.into_iter().map(|name| async move {
-        let provider = zeus_provider::create_provider(name, &config.providers).ok()?;
-        let fetch = tokio::time::timeout(std::time::Duration::from_secs(3), provider.list_models());
-        match fetch.await {
-            Ok(Ok(models)) if !models.is_empty() => Some((name.clone(), models)),
-            _ => None,
-        }
+        let models = match zeus_provider::create_provider(name, &config.providers) {
+            Ok(provider) => {
+                let fetch =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), provider.list_models());
+                match fetch.await {
+                    Ok(Ok(models)) if !models.is_empty() => Some(models),
+                    // Live probe failed (no key, server down, timeout) — fall
+                    // back to the curated catalog so the provider still shows
+                    // up grouped in the picker with as many models as possible.
+                    _ => catalog::known_models(name),
+                }
+            }
+            Err(_) => catalog::known_models(name),
+        };
+        models.map(|m| (name.clone(), m))
     });
     futures::future::join_all(fetches)
         .await
