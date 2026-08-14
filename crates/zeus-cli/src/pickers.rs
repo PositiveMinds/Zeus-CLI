@@ -41,7 +41,8 @@ pub(crate) enum ProviderEntry {
         kind: String,
         /// True when the provider can be used right now (local kind, stored
         /// key, or env key present) — false means "needs a key" and Enter
-        /// jumps to `KeyEntry` instead of switching.
+        /// jumps to `KeyEntry` instead of switching. ctrl+k in the picker
+        /// opens `KeyEntry` regardless, so an existing key can be updated.
         ready: bool,
     },
 }

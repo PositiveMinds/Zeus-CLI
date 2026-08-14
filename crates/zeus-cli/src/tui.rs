@@ -382,7 +382,24 @@ async fn handle_provider_tui(
                 config.global.keys_toml.display()
             ));
         }
-        ["key"] => state.push_error("usage: /provider key <name> <KEY>"),
+        // `/provider key <name>` — no key on the line, so open the masked
+        // key-entry modal (the TUI's equivalent of the REPL's hidden-prompt
+        // form). Unlike the inline form this works for a provider that
+        // already has a key, so it doubles as the way to *change* one.
+        ["key", name] => {
+            if config.providers.get(name).is_none() {
+                state.push_error(format!("unknown provider '{name}' — see /provider"));
+                return;
+            }
+            state.input.clear();
+            state.cursor = 0;
+            state.mode = Mode::KeyEntry {
+                provider: name.to_string(),
+            };
+        }
+        ["key"] => state.push_error(
+            "usage: /provider key <name> (prompts, hidden) or /provider key <name> <KEY>",
+        ),
         [name] => match create_provider(name, &config.providers) {
             Ok(handle) => {
                 if let Some(agent) = agent_slot.as_mut() {
@@ -2552,7 +2569,7 @@ fn render_provider_picker(
     // Picking a provider that still needs a key doesn't dead-end here — it
     // opens the key-paste prompt, then automatically opens the model picker
     // for that provider once the key is saved (see `persist_key_and_switch`).
-    let footer = " ↑/↓ navigate · enter select (asks for a key if needed) · esc dismiss ";
+    let footer = " ↑/↓ navigate · enter select (asks for a key if needed) · ctrl+k set/update key · esc dismiss ";
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -3863,6 +3880,23 @@ async fn handle_key(
                 };
                 if let Some((name, ready)) = chosen {
                     apply_provider_picker_choice(name, ready, config, agent_slot, state);
+                }
+            }
+            // ctrl+k re-keys the highlighted provider — even one that's
+            // already connected — since Enter on a ready provider just
+            // switches and would otherwise leave no way to update a key.
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let name = match &state.mode {
+                    Mode::ProviderPicker { entries, selected } => match entries.get(*selected) {
+                        Some(ProviderEntry::Provider { name, .. }) => Some(name.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    state.input.clear();
+                    state.cursor = 0;
+                    state.mode = Mode::KeyEntry { provider: name };
                 }
             }
             KeyCode::Esc => {
