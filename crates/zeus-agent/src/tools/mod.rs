@@ -168,6 +168,27 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "mkdir".into(),
+            description: "Create a directory (and any missing parents) inside the project. Use to scaffold project structure (e.g. src/components, public/assets, models/) before writing files into it — `write` also creates parents automatically, but empty directories need this.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": {"type": "string"} },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: "listdir".into(),
+            description: "List a directory's immediate contents (files and subdirectories, one per line; directories show a trailing '/'). Pass recursive=true for a full tree — the fast way to analyze a project's structure before reading specific files.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "recursive": {"type": "boolean"}
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
             name: "bash".into(),
             description: "Run a shell command in the project root (foreground, bounded) and wait for it to finish. Use for builds/tests/read-only commands. For a command that doesn't exit on its own (a dev server, `docker compose up`), set background=true instead of using this in foreground mode.".into(),
             parameters: json!({
@@ -1539,6 +1560,7 @@ fn is_read_only_tool(name: &str) -> bool {
         "read"
             | "grep"
             | "glob"
+            | "listdir"
             | "web_fetch"
             | "web_search"
             |             "list_skills"
@@ -1796,6 +1818,8 @@ impl ToolManager {
             "copy" => self.do_copy(&args, approver),
             "grep" => self.do_grep(&args),
             "glob" => self.do_glob(&args),
+            "mkdir" => self.do_mkdir(&args, approver),
+            "listdir" => self.do_listdir(&args),
             "code_index" => self.do_code_index(&args, approver),
             "code_symbols" => self.do_code_symbols(&args),
             "code_defs" => self.do_code_defs(&args),
@@ -2120,6 +2144,29 @@ impl ToolManager {
         let path = Self::str_arg(args, "path")?;
         match self.workspace.files.delete(Path::new(path), &mut *approver) {
             Ok(()) => Ok(ToolResult::ok(format!("deleted {path}"))),
+            Err(e) => Ok(ToolResult::err(e.to_string())),
+        }
+    }
+
+    fn do_mkdir<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        let path = Self::str_arg(args, "path")?;
+        match self.workspace.files.mkdir(Path::new(path), &mut *approver) {
+            Ok(()) => Ok(ToolResult::ok(format!("created directory {path}"))),
+            Err(e) => Ok(ToolResult::err(e.to_string())),
+        }
+    }
+
+    fn do_listdir(&self, args: &Value) -> Result<ToolResult> {
+        let path = Self::str_arg(args, "path")?;
+        let recursive = args
+            .get("recursive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        match self.workspace.files.listdir(Path::new(path), recursive) {
+            Ok(listing) => Ok(ToolResult::ok(listing)),
             Err(e) => Ok(ToolResult::err(e.to_string())),
         }
     }
@@ -3787,6 +3834,73 @@ mod tests {
             .dispatch_with_approver("read", r#"{"path":"a.txt"}"#, approve)
             .unwrap();
         assert!(r.content.contains("hello"));
+    }
+
+    #[test]
+    fn mkdir_tool_creates_directory_scaffold() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        let r = tm
+            .dispatch_with_approver("mkdir", r#"{"path":"src/components"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert!(root.join("src/components").is_dir());
+        // Idempotent on an existing directory.
+        let again = tm
+            .dispatch_with_approver("mkdir", r#"{"path":"src/components"}"#, approve)
+            .unwrap();
+        assert!(!again.is_error, "{}", again.content);
+    }
+
+    #[test]
+    fn listdir_tool_lists_flat_and_recursive() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        tm.dispatch_with_approver("mkdir", r#"{"path":"src/nested"}"#, approve)
+            .unwrap();
+        tm.dispatch_with_approver("write", r#"{"path":"src/a.js","content":"x"}"#, approve)
+            .unwrap();
+        tm.dispatch_with_approver(
+            "write",
+            r#"{"path":"src/nested/b.js","content":"y"}"#,
+            approve,
+        )
+        .unwrap();
+        let flat = tm
+            .dispatch_with_approver("listdir", r#"{"path":"src"}"#, approve)
+            .unwrap();
+        assert!(!flat.is_error, "{}", flat.content);
+        assert!(flat.content.contains("nested/"), "{}", flat.content);
+        assert!(flat.content.contains("a.js"), "{}", flat.content);
+        assert!(!flat.content.contains("b.js"), "{}", flat.content);
+        let tree = tm
+            .dispatch_with_approver("listdir", r#"{"path":"src","recursive":true}"#, approve)
+            .unwrap();
+        assert!(tree.content.contains("nested/"), "{}", tree.content);
+        assert!(tree.content.contains("b.js"), "{}", tree.content);
+    }
+
+    #[test]
+    fn listdir_read_only_but_mkdir_gated() {
+        assert!(is_read_only_tool("listdir"));
+        assert!(!is_read_only_tool("mkdir"));
+        // In Plan mode listdir stays allowed while mkdir is blocked.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let tm = tool_manager(&root);
+        tm.set_plan_mode(true);
+        let list = tm
+            .dispatch_with_approver("listdir", r#"{"path":"src"}"#, approve)
+            .unwrap();
+        assert!(!list.is_error, "{}", list.content);
+        let blocked = tm
+            .dispatch_with_approver("mkdir", r#"{"path":"src/new"}"#, approve)
+            .unwrap();
+        assert!(blocked.is_error, "{}", blocked.content);
+        assert!(!root.join("src/new").exists());
     }
 
     #[test]

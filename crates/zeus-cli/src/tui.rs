@@ -629,6 +629,15 @@ struct AppState {
     /// last — drives the sidebar's "Files" panel. Capped so a very long
     /// session doesn't grow this unboundedly.
     files_touched: Vec<String>,
+    /// Selected transcript blocks as an inclusive `(start, end)` block-index
+    /// range — highlighted in the transcript and copied with ctrl+y. `None`
+    /// when nothing is selected. Selection is how you reach older messages:
+    /// a click sets it, shift-click or drag extends it, and ctrl+y copies
+    /// just the selected blocks (falling back to the last reply when empty).
+    selection: Option<(usize, usize)>,
+    /// The block where a mouse press started, so drag / shift-click extends
+    /// the selection from a fixed end instead of replacing it.
+    selection_anchor: Option<usize>,
 }
 
 /// Transcript search — an overlay on top of `Mode::Chat`, not a `Mode`
@@ -747,6 +756,8 @@ impl AppState {
             tool_call_meta: std::collections::HashMap::new(),
             plan_step_started: std::collections::HashMap::new(),
             files_touched: Vec::new(),
+            selection: None,
+            selection_anchor: None,
         };
         state
     }
@@ -1221,6 +1232,76 @@ fn copy_last_response(state: &mut AppState) {
     }
 }
 
+/// Copy the currently selected transcript blocks (inclusive `selection`
+/// range) as one joined text blob. Clears the selection once copied, since
+/// the highlight's job — pointing at the blocks to copy — is done.
+fn copy_selection(state: &mut AppState) {
+    let Some(text) = selection_plain_text(&state.transcript, state.selection) else {
+        return;
+    };
+    let count = text.chars().count();
+    let len = state
+        .selection
+        .map(|(a, b)| b.saturating_sub(a) + 1)
+        .unwrap_or(0);
+    match super::clipboard::copy(&text) {
+        Ok(()) => {
+            state.push_info(format!(
+                "copied {count} char(s) from {len} block(s) to clipboard"
+            ));
+            state.selection = None;
+            state.selection_anchor = None;
+        }
+        Err(e) => state.push_error(format!("copy failed: {e}")),
+    }
+}
+
+/// The text the current selection covers — the selected blocks' plain text
+/// joined with blank lines. Split out so the join/range logic is
+/// unit-testable without touching the system clipboard.
+fn selection_plain_text(
+    transcript: &[Block_],
+    selection: Option<(usize, usize)>,
+) -> Option<String> {
+    let (start, end) = selection?;
+    let blocks: Vec<&Block_> = transcript
+        .iter()
+        .take(end.saturating_add(1))
+        .skip(start)
+        .collect();
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(
+        blocks
+            .iter()
+            .map(|b| b.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
+/// Map a mouse position over the transcript back to the block under it, in
+/// the same wrapped-row space `transcript_block_rows` / `transcript_text`
+/// render and `transcript_applied_scroll` scrolls in. `None` when the click
+/// is outside the transcript pane or over the separator gap between blocks.
+fn transcript_block_at(
+    col: u16,
+    row: u16,
+    area: Option<Rect>,
+    block_rows: &[(u16, u16)],
+    scroll: u16,
+) -> Option<usize> {
+    let area = area?;
+    if col < area.x || col >= area.x + area.width || row < area.y || row >= area.y + area.height {
+        return None;
+    }
+    let clicked_row = (row - area.y) + scroll;
+    block_rows
+        .iter()
+        .position(|&(start, end)| clicked_row >= start && clicked_row < end)
+}
+
 /// One-line pitch + signup URL for the key-entry modal — the "why this
 /// provider, where do I get a key" copy a first-time user actually needs.
 /// Any provider not listed here (custom entries in `providers.toml`) still
@@ -1487,7 +1568,9 @@ fn render_hints(f: &mut Frame, area: Rect, _state: &AppState) {
     spans.push(Span::raw("    "));
     spans.extend(hint_pair("/ ctrl+p", "commands"));
     spans.push(Span::raw("    "));
-    spans.extend(hint_pair("click msg", "copy"));
+    spans.extend(hint_pair("click", "select"));
+    spans.push(Span::raw("    "));
+    spans.extend(hint_pair("ctrl+y", "copy"));
     spans.push(Span::raw("    "));
     spans.extend(hint_pair("ctrl+f", "find"));
     spans.push(Span::raw("    "));
@@ -1508,10 +1591,26 @@ fn spinner_glyph(state: &AppState) -> char {
 }
 
 fn transcript_text(state: &AppState, width: u16) -> Text<'static> {
+    let selection = state.selection;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for block in &state.transcript {
-        lines.extend(block.to_lines(width));
-        lines.push(Line::from(""));
+    for (i, block) in state.transcript.iter().enumerate() {
+        let selected = selection.is_some_and(|(a, b)| i >= a && i <= b);
+        if selected {
+            lines.extend(block.to_lines(width).into_iter().map(style_selected));
+            // Solid fill under the whole selected run so the highlight reads
+            // as one contiguous bar across block boundaries (the blank
+            // separator row between messages gets the same background). This
+            // is still exactly one row, so `transcript_block_rows`'s
+            // `wrapped + 1` math stays valid and click/scroll mapping
+            // doesn't drift when a selection is active.
+            lines.push(Line::from(vec![Span::styled(
+                " ".repeat(width as usize),
+                Style::default().bg(theme::SELECTED_BG),
+            )]));
+        } else {
+            lines.extend(block.to_lines(width));
+            lines.push(Line::from(""));
+        }
     }
     if !state.current_reply.is_empty() {
         let streaming = Block_::new(Role::Assistant, state.current_reply.clone());
@@ -1528,6 +1627,20 @@ fn transcript_text(state: &AppState, width: u16) -> Text<'static> {
     // `state.transcript.is_empty() && !state.busy` never reaches here — that
     // case renders `render_empty_state` instead of the chat column at all.
     Text::from(lines)
+}
+
+/// Re-style a transcript line so every span carries the selection
+/// background, overriding whatever card or diff tint it had (a selection has
+/// to read as one uniform bar). Foregrounds are kept so the text itself
+/// stays legible; ratatui keeps the span's background across wrapped
+/// continuation rows, so even a long line that wraps is highlighted whole.
+fn style_selected(line: Line<'static>) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|s| Span::styled(s.content, s.style.bg(theme::SELECTED_BG)))
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Wrapped-row `[start, end)` range for each transcript block, in the same
@@ -3607,10 +3720,28 @@ async fn handle_key(
 
     // A keybinding for the same thing `/copy` does — reaching for a
     // slash command just to copy the last reply is a lot of typing for
-    // something you'd want mid-conversation without breaking flow.
+    // something you'd want mid-conversation without breaking flow. When a
+    // selection is active it copies exactly those blocks instead, which is
+    // how you copy anything older than the last reply.
     if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        copy_last_response(state);
+        if state.selection.is_some() {
+            copy_selection(state);
+        } else {
+            copy_last_response(state);
+        }
         return Ok(());
+    }
+
+    // Esc in a plain chat clears any active transcript selection, mirroring
+    // how Esc dismisses the pickers. It stays a no-op otherwise, so the key
+    // still does nothing alarming mid-conversation.
+    if key.code == KeyCode::Esc
+        && matches!(state.mode, Mode::Chat)
+        && (state.selection.is_some() || state.selection_anchor.is_some())
+    {
+        state.selection = None;
+        state.selection_anchor = None;
+        state.push_info("cleared selection");
     }
 
     // Command palette — matches the reference product's own `ctrl+p`
@@ -4187,7 +4318,13 @@ async fn handle_key(
                             }
                         }
                     }
-                    "copy" => copy_last_response(state),
+                    "copy" => {
+                        if state.selection.is_some() {
+                            copy_selection(state);
+                        } else {
+                            copy_last_response(state);
+                        }
+                    }
                     _ => {
                         let expanded = expand_slash_command(config, trimmed.clone());
                         if expanded != trimmed {
@@ -4361,9 +4498,13 @@ async fn handle_mouse(
             }
         }
 
-        // Transcript: click any message to copy its full text to the
-        // clipboard — previously `/copy`/ctrl+y could only ever grab the
-        // single most recent reply, with no way to reach back further.
+        // Transcript: left-click SELECTS a block (highlighted, then copied
+        // explicitly with ctrl+y) instead of copying it instantly — a click
+        // on a folded tool result still expands it. Shift-click or drag
+        // extends the selection from the click anchor; clicking empty space
+        // clears it. This replaces the old "click copies the last thing"
+        // shortcut, which could never reach past the single most recent
+        // block; selection reaches any block and copying is deliberate.
         if matches!(state.mode, Mode::Chat) {
             if let Some(area) = state.transcript_area {
                 if col >= area.x
@@ -4371,34 +4512,34 @@ async fn handle_mouse(
                     && row >= area.y
                     && row < area.y + area.height
                 {
-                    let clicked_row = (row - area.y) + state.transcript_applied_scroll;
-                    let hit = state
-                        .transcript_block_rows
-                        .iter()
-                        .position(|&(start, end)| clicked_row >= start && clicked_row < end);
-                    if let Some(idx) = hit {
-                        if let Some(block) = state.transcript.get(idx) {
-                            // A folded tool result expands on its first
-                            // click (revealing what `MAX_TOOL_LINES`
-                            // hid) — copying it can wait for a second
-                            // click once there's something worth copying
-                            // to see, rather than silently doing both
-                            // and burying the "it expanded" feedback.
-                            if block.is_foldable() {
-                                block.toggle_expanded();
-                                return;
+                    match transcript_block_at(
+                        col,
+                        row,
+                        state.transcript_area,
+                        &state.transcript_block_rows,
+                        state.transcript_applied_scroll,
+                    ) {
+                        Some(idx) => {
+                            if let Some(block) = state.transcript.get(idx) {
+                                if block.is_foldable() {
+                                    block.toggle_expanded();
+                                }
                             }
-                            let text = block.plain_text();
-                            match super::clipboard::copy(&text) {
-                                Ok(()) => state.push_info(format!(
-                                    "copied {} char(s) to clipboard",
-                                    text.chars().count()
-                                )),
-                                Err(e) => state.push_error(format!("copy failed: {e}")),
+                            if ev.modifiers.contains(KeyModifiers::SHIFT) {
+                                let anchor = state.selection_anchor.unwrap_or(idx);
+                                state.selection_anchor = Some(anchor);
+                                state.selection = Some((anchor.min(idx), anchor.max(idx)));
+                            } else {
+                                state.selection_anchor = Some(idx);
+                                state.selection = Some((idx, idx));
                             }
                         }
-                        return;
+                        None => {
+                            state.selection = None;
+                            state.selection_anchor = None;
+                        }
                     }
+                    return;
                 }
             }
         }
@@ -4411,6 +4552,32 @@ async fn handle_mouse(
                     state.toggle_todo(idx as usize);
                 }
                 return;
+            }
+        }
+    }
+
+    // Drag the left button over the transcript to extend the selection from
+    // the click anchor. The `Down` press above set the anchor; every drag
+    // motion re-targets the far end so the highlight grows/shrinks live.
+    if let MouseEventKind::Drag(MouseButton::Left) = ev.kind {
+        if matches!(state.mode, Mode::Chat) {
+            if let (Some(area), Some(anchor)) = (state.transcript_area, state.selection_anchor) {
+                if ev.column >= area.x
+                    && ev.column < area.x + area.width
+                    && ev.row >= area.y
+                    && ev.row < area.y + area.height
+                {
+                    if let Some(idx) = transcript_block_at(
+                        ev.column,
+                        ev.row,
+                        Some(area),
+                        &state.transcript_block_rows,
+                        state.transcript_applied_scroll,
+                    ) {
+                        state.selection = Some((anchor.min(idx), anchor.max(idx)));
+                        return;
+                    }
+                }
             }
         }
     }
@@ -4953,5 +5120,48 @@ mod tests {
         assert!(filter_commands("model", &known).is_empty());
         assert!(filter_commands("/nope", &known).is_empty());
         assert!(filter_commands("/mode with spaces", &known).is_empty());
+    }
+
+    #[test]
+    fn selection_plain_text_joins_selected_blocks() {
+        let transcript: Vec<Block_> = vec![
+            Block_::new(Role::User, "first question".into()),
+            Block_::new(Role::Assistant, "first answer".into()),
+            Block_::new(Role::User, "second question".into()),
+            Block_::new(Role::Assistant, "second answer".into()),
+        ];
+        assert_eq!(
+            selection_plain_text(&transcript, Some((1, 2))).unwrap(),
+            "first answer\n\nsecond question"
+        );
+        assert_eq!(
+            selection_plain_text(&transcript, Some((3, 3))).unwrap(),
+            "second answer"
+        );
+        // A range past the end clips instead of panicking.
+        assert_eq!(
+            selection_plain_text(&transcript, Some((2, 99))).unwrap(),
+            "second question\n\nsecond answer"
+        );
+        assert_eq!(selection_plain_text(&transcript, None), None);
+        // Empty range (start beyond transcript) yields nothing.
+        assert_eq!(selection_plain_text(&transcript, Some((10, 12))), None);
+    }
+
+    #[test]
+    fn transcript_block_at_maps_wrapped_rows_to_blocks() {
+        let area = Some(Rect::new(0, 0, 80, 24));
+        // Block 0 spans rows 0..2, block 1 spans rows 3..6 (wrapped).
+        let rows = vec![(0u16, 2u16), (3u16, 6u16)];
+        assert_eq!(transcript_block_at(10, 1, area, &rows, 0), Some(0));
+        assert_eq!(transcript_block_at(10, 4, area, &rows, 0), Some(1));
+        // The blank separator row between blocks hits nothing.
+        assert_eq!(transcript_block_at(10, 2, area, &rows, 0), None);
+        // Outside the pane: no block.
+        assert_eq!(transcript_block_at(10, 30, area, &rows, 0), None);
+        // Scrolled by 2 rows shifts the mapping accordingly.
+        assert_eq!(transcript_block_at(10, 1, area, &rows, 2), Some(1));
+        // Without a computed area there is nothing to hit.
+        assert_eq!(transcript_block_at(10, 1, None, &rows, 0), None);
     }
 }

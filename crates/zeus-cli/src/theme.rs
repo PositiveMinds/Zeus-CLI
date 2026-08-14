@@ -26,6 +26,10 @@ pub const MODAL_BG: Color = Color::Rgb(0x00, 0x00, 0x00);
 /// warm bar instead of `PANEL2` + colored text, matching the reference
 /// product's own selection style.
 pub const MODAL_SELECTED_BG: Color = Color::Rgb(0xd9, 0x8a, 0x4f);
+/// Transcript text-selection highlight — the same warm bar the popup rows
+/// use, so "selected" reads consistently across the app whether you're
+/// picking a model or copying messages with ctrl+y.
+pub const SELECTED_BG: Color = Color::Rgb(0xd9, 0x8a, 0x4f);
 /// Tool-call card background (`Block_::tool_card_lines`) — deliberately
 /// much lighter than `PANEL2`/`ELEVATED`, which read as barely-there
 /// against the transcript's `VOID` background once real syntax-

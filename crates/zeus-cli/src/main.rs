@@ -2756,44 +2756,85 @@ fn cmd_project(config: &Config, action: ProjectCmd) -> Result<()> {
     let ws = workspace(config)?;
     let root = ws.project_root.clone();
     match action {
-        ProjectCmd::Detect => match zeus_lang::detect_project(&root) {
-            Some(lang) => {
-                println!("{}", zeus_lang::spec(lang).display_name);
-                Ok(())
+        ProjectCmd::Detect => {
+            let fw = zeus_lang::Framework::detect_framework(&root);
+            match zeus_lang::detect_project(&root) {
+                Some(lang) => {
+                    println!("language: {}", zeus_lang::spec(lang).display_name);
+                    if let Some(fw) = fw {
+                        println!(
+                            "framework: {} (base {})",
+                            zeus_lang::framework_spec(fw).display_name,
+                            zeus_lang::spec(zeus_lang::framework_spec(fw).base).display_name
+                        );
+                    }
+                    Ok(())
+                }
+                None => {
+                    if let Some(fw) = fw {
+                        println!("framework: {}", zeus_lang::framework_spec(fw).display_name);
+                        return Ok(());
+                    }
+                    bail!(
+                        "could not detect a supported language or framework for {} — run `zeus project commands --help` to list them",
+                        root.display()
+                    )
+                }
             }
-            None => bail!(
-                "could not detect a supported language for {} — run `zeus project commands --help` to list them",
-                root.display()
-            ),
-        },
+        }
         ProjectCmd::Commands { lang } => {
             let lang = match lang {
-                Some(name) => zeus_lang::Language::from_name(&name).ok_or_else(|| {
-                    anyhow::anyhow!("unknown language '{name}' — try a name like rust, ts, go, c#")
-                })?,
+                Some(name) => {
+                    if let Some(lang) = zeus_lang::Language::from_name(&name) {
+                        lang
+                    } else if let Some(fw) = zeus_lang::Framework::from_name(&name) {
+                        zeus_lang::framework_spec(fw).base
+                    } else {
+                        bail!("unknown language or framework '{name}' — try a name like rust, ts, go, c#, react, django")
+                    }
+                }
                 None => zeus_lang::detect_project(&root).ok_or_else(|| {
-                    anyhow::anyhow!("cannot detect language for {}; pass a language name", root.display())
+                    anyhow::anyhow!(
+                        "cannot detect language for {}; pass a language name",
+                        root.display()
+                    )
                 })?,
             };
             print_lang_commands(lang, &root);
             Ok(())
         }
         ProjectCmd::Scaffold { lang, name } => {
-            let lang = zeus_lang::Language::from_name(&lang).ok_or_else(|| {
-                anyhow::anyhow!("unknown language '{lang}' — try `zeus project scaffold --list` for choices")
-            })?;
-            let target = std::env::current_dir().context("current dir")?.join(&name);
+            let target = root.join(&name);
             if target.exists() {
-                bail!("{} already exists — pick a different name", target.display());
+                bail!(
+                    "{} already exists — pick a different name",
+                    target.display()
+                );
             }
-            let written = zeus_lang::scaffold_project(lang, &name, &target).context("scaffold")?;
+            let written = if let Some(fw) = zeus_lang::Framework::from_name(&lang) {
+                zeus_lang::scaffold_framework(fw, &name, &target)
+                    .context("scaffold")?
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            } else {
+                let lang = zeus_lang::Language::from_name(&lang).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown language or framework '{lang}' — try `zeus project scaffold --list` for choices"
+                    )
+                })?;
+                zeus_lang::scaffold_project(lang, &name, &target)
+                    .context("scaffold")?
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            };
             println!(
-                "scaffolded {} project '{name}' into {}:",
-                zeus_lang::spec(lang).display_name,
+                "scaffolded {lang} project '{name}' into {}:",
                 target.display()
             );
             for p in &written {
-                println!("  created {}", p.display());
+                println!("  created {p}");
             }
             Ok(())
         }

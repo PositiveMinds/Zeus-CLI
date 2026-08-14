@@ -97,7 +97,7 @@ pub fn load_or_analyze(root: &Path) -> RepoFingerprint {
     }
 
     let fp = crate::analyze::analyze_repo(root);
-    persist(&dir, &fp, sig.as_deref());
+    persist(root, &fp, sig.as_deref());
     fp
 }
 
@@ -325,6 +325,32 @@ mod tests {
         assert!(
             ctx.contains("auth"),
             "expected memory in context, got: {ctx}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn load_or_analyze_writes_fingerprint_to_root_agent_dir() {
+        // Regression: `load_or_analyze` used to hand `persist` the agent dir
+        // (`<root>/.agent`) instead of the project root, and `persist` joins
+        // `.agent` itself — producing a nested `<root>/.agent/.agent/` with
+        // the fingerprint stranded inside it. The fingerprint must land at
+        // `<root>/.agent/project.json`, never nested.
+        let tmp = std::env::temp_dir().join(format!("mp-agdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let fp = load_or_analyze(&tmp);
+        assert!(fp.source_count > 0);
+        assert!(
+            tmp.join(".agent/project.json").is_file(),
+            "fingerprint must be at <root>/.agent/project.json"
+        );
+        assert!(
+            !tmp.join(".agent/.agent").exists(),
+            "fingerprint must not be nested under .agent/.agent"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

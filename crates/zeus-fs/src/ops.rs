@@ -643,6 +643,139 @@ impl FileEngine {
         let p = self.resolve(user_path)?;
         Ok(path_kind(&p))
     }
+
+    /// Create a directory (and any missing parents) inside the project.
+    /// Permission-gated like the other mutating ops, and idempotent: an
+    /// existing directory is a no-op success, while a path occupied by a
+    /// file is an error. Scaffolding a project needs empty directories
+    /// (`assets/`, `public/`, …) that `write` can't create on its own.
+    pub fn mkdir<F>(&self, user_path: &Path, approver: F) -> Result<()>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        let path = self.resolve(user_path)?;
+        if path.exists() {
+            if path.is_dir() {
+                return Ok(());
+            }
+            return Err(FsError::io(
+                &path,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "a file already exists at this path",
+                ),
+            ));
+        }
+
+        let mut approver = approver;
+        self.gate.enforce(
+            &PermissionRequest {
+                tool: "mkdir".into(),
+                path: Some(path.clone()),
+                command: None,
+                description: format!(
+                    "create directory {}",
+                    display_rel(&self.project_root, &path)
+                ),
+                preview: None,
+                ..Default::default()
+            },
+            &mut approver,
+        )?;
+
+        std::fs::create_dir_all(&path).map_err(|e| FsError::io(&path, e))?;
+        info!(path = %path.display(), "mkdir ok");
+        Ok(())
+    }
+
+    /// List a directory's immediate contents (or, when `recursive`, a tree)
+    /// as text. Read-only, so no approval gate. Directories are shown with a
+    /// trailing `/` and sorted first; hidden files (dot-prefixed) come last,
+    /// mirroring the `ls` convention a coding agent's model expects.
+    pub fn listdir(&self, user_path: &Path, recursive: bool) -> Result<String> {
+        let path = self.resolve(user_path)?;
+        if !path.exists() {
+            return Err(FsError::NotFound(path));
+        }
+        if !path.is_dir() {
+            return Err(FsError::io(
+                &path,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a directory"),
+            ));
+        }
+        if recursive {
+            return self.listdir_tree(&path);
+        }
+        let mut entries: Vec<(bool, String)> = Vec::new();
+        let rd = std::fs::read_dir(&path).map_err(|e| FsError::io(&path, e))?;
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Ok(ft) = entry.file_type() {
+                entries.push((ft.is_dir(), name));
+            }
+        }
+        entries.sort_by(|a, b| {
+            // Directories first, then files; within a kind, alphabetical.
+            (b.0, a.1.to_lowercase()).cmp(&(a.0, b.1.to_lowercase()))
+        });
+        Ok(entries
+            .into_iter()
+            .map(
+                |(is_dir, name)| {
+                    if is_dir {
+                        format!("{name}/")
+                    } else {
+                        name
+                    }
+                },
+            )
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn listdir_tree(&self, path: &Path) -> Result<String> {
+        const MAX_ENTRIES: usize = 500;
+        let mut out = String::new();
+        let mut count = 0usize;
+        self.walk_tree(path, 0, &mut out, &mut count, MAX_ENTRIES)?;
+        if count >= MAX_ENTRIES {
+            out.push_str("\n… (listing truncated)");
+        }
+        Ok(out)
+    }
+
+    fn walk_tree(
+        &self,
+        path: &Path,
+        depth: usize,
+        out: &mut String,
+        count: &mut usize,
+        max: usize,
+    ) -> Result<()> {
+        let indent = "  ".repeat(depth);
+        let rd = std::fs::read_dir(path).map_err(|e| FsError::io(path, e))?;
+        let mut entries: Vec<(bool, String)> = Vec::new();
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Ok(ft) = entry.file_type() {
+                entries.push((ft.is_dir(), name));
+            }
+        }
+        entries.sort_by(|a, b| (b.0, a.1.to_lowercase()).cmp(&(a.0, b.1.to_lowercase())));
+        for (is_dir, name) in entries {
+            if *count >= max {
+                return Ok(());
+            }
+            *count += 1;
+            if is_dir {
+                out.push_str(&format!("{indent}{name}/\n"));
+                self.walk_tree(&path.join(&name), depth + 1, out, count, max)?;
+            } else {
+                out.push_str(&format!("{indent}{name}\n"));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn apply_edit_file(path: &Path, old: &str, new: &str, replace_all: bool) -> Result<usize> {
@@ -995,5 +1128,69 @@ mod tests {
             std::fs::read_to_string(dst.join("nested/b.txt")).unwrap(),
             "b"
         );
+    }
+
+    #[test]
+    fn mkdir_creates_directory_and_parents() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let eng = engine(&root);
+        eng.mkdir(Path::new("src/components"), approve).unwrap();
+        assert!(root.join("src/components").is_dir());
+        // Idempotent: recreating an existing directory is a no-op success.
+        eng.mkdir(Path::new("src/components"), approve).unwrap();
+        assert!(root.join("src/components").is_dir());
+        // Deep scaffold with several levels at once.
+        eng.mkdir(Path::new("public/assets/img"), approve).unwrap();
+        assert!(root.join("public/assets/img").is_dir());
+    }
+
+    #[test]
+    fn mkdir_rejects_path_occupied_by_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "x").unwrap();
+        let eng = engine(&root);
+        assert!(eng.mkdir(Path::new("file.txt"), approve).is_err());
+    }
+
+    #[test]
+    fn listdir_lists_sorted_dirs_first() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("readme.md"), "# hi").unwrap();
+        let eng = engine(&root);
+        let flat = eng.listdir(Path::new("."), false).unwrap();
+        let lines: Vec<&str> = flat.lines().collect();
+        // Dirs first (trailing `/`), then files, each alphabetical. The
+        // `engine()` helper's checkpoint store also creates `.agent/`, so
+        // assert ordering/membership rather than an exact listing.
+        let pos = |needle: &str| lines.iter().position(|l| *l == needle).unwrap();
+        assert!(pos("assets/") < pos("src/"), "listing was:\n{flat}");
+        assert!(pos("src/") < pos("readme.md"), "listing was:\n{flat}");
+        assert!(lines.contains(&".agent/"), "listing was:\n{flat}");
+        // Recursive tree nests children and skips the root itself.
+        let tree = eng.listdir(Path::new("."), true).unwrap();
+        assert!(tree.contains("assets/"));
+        assert!(
+            tree.contains("src/\n  deep/\n  main.rs"),
+            "tree was:\n{tree}"
+        );
+    }
+
+    #[test]
+    fn listdir_errors_on_missing_or_file_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "x").unwrap();
+        let eng = engine(&root);
+        assert!(eng.listdir(Path::new("nope"), false).is_err());
+        assert!(eng.listdir(Path::new("file.txt"), false).is_err());
     }
 }
