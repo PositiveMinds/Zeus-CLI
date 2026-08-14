@@ -711,15 +711,19 @@ async fn cmd_pull(config: &Config, source: PullCmd) -> Result<()> {
 async fn cmd_serve(config: &Config, model: Option<String>) -> Result<()> {
     let requested = model.unwrap_or_else(|| config.settings.model.model.clone());
     let entry = if requested.contains('/') {
-        // Treat as a `repo/file` GGUF download.
-        let split = requested.splitn(2, '/').collect::<Vec<_>>();
-        if split.len() != 2 || split[0].is_empty() || split[1].is_empty() {
+        // Treat as a `repo/file` GGUF download. HF repo IDs themselves are
+        // `org/model`, so split on the LAST slash — `org/model/file.gguf`
+        // must yield repo=`org/model`, file=`file.gguf`.
+        let Some((repo, file)) = requested.rsplit_once('/') else {
+            bail!("usage: zeus serve <model-name>  or  zeus serve <repo>/<file.gguf>");
+        };
+        if repo.is_empty() || file.is_empty() {
             bail!("usage: zeus serve <model-name>  or  zeus serve <repo>/<file.gguf>");
         }
         zeus_config::LocalModelEntry {
             name: requested.clone(),
-            repo: split[0].to_string(),
-            file: split[1].to_string(),
+            repo: repo.to_string(),
+            file: file.to_string(),
         }
     } else {
         match zeus_provider::resolve_local_model(&config.settings.llamacpp, &requested) {
