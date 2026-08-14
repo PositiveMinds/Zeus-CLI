@@ -1,7 +1,8 @@
 //! RAG for zeus: chunk project files, optionally embed each chunk with a
 //! provider's embedding model, and run hybrid (keyword + vector) search over
-//! the in-memory index. No SQL, no server, no durable store — the index is
-//! rebuilt from the filesystem on demand.
+//! the index. No SQL, no server — the index is a plain, inspectable JSON
+//! snapshot (`.agent/rag_index.json`, see [`PersistedRagIndex`]) rebuilt
+//! incrementally when files change, and searched in memory on demand.
 //!
 //! ```
 //! use zeus_rag::{RagIndex, chunker::Chunk};
