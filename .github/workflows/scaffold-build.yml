@@ -1,0 +1,44 @@
+name: scaffold-build
+
+# Prove every zeus scaffold actually compiles on a fresh Ubuntu runner by
+# scaffolding each language/framework and running its real build toolchain.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  scaffold-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build zeus
+        run: cargo build --release -p zeus-cli
+
+      - name: Scaffold + build every language
+        run: |
+          chmod +x scripts/verify-scaffolds.sh
+          ./scripts/verify-scaffolds.sh ./target/release/zeus

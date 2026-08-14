@@ -1140,6 +1140,31 @@ fn build_project_survey(config: &Config) -> Option<String> {
         format!("workspace name: {name}"),
         format!("project root: {}", root.display()),
     ];
+    // Detected dev stack from the language/framework tables. These are the
+    // exact commands `verify`/`test` would run — prefer them over guessing.
+    if let Some(lang) = zeus_lang::detect_project(root) {
+        let s = zeus_lang::spec(lang);
+        let fmt = |args: &[&'static str]| {
+            if args.is_empty() {
+                "(none)".to_string()
+            } else {
+                args.join(" ")
+            }
+        };
+        lines.push(format!("detected language: {}", s.display_name));
+        lines.push(format!("  build:  {}", fmt(s.build)));
+        lines.push(format!("  test:   {}", fmt(s.test)));
+        lines.push(format!("  lint:   {}", fmt(s.lint)));
+        lines.push(format!("  format: {}", fmt(s.format)));
+    }
+    if let Some(fw) = zeus_lang::Framework::detect_framework(root) {
+        let fs = zeus_lang::framework_spec(fw);
+        lines.push(format!(
+            "detected framework: {} (base {})",
+            fs.display_name,
+            zeus_lang::spec(fs.base).display_name
+        ));
+    }
     if !top_files.is_empty() {
         top_files.sort();
         lines.push(format!("top-level files: {}", top_files.join(", ")));
@@ -2803,27 +2828,38 @@ fn cmd_project(config: &Config, action: ProjectCmd) -> Result<()> {
             print_lang_commands(lang, &root);
             Ok(())
         }
-        ProjectCmd::Scaffold { lang, name } => {
-            let target = root.join(&name);
+        ProjectCmd::Scaffold { list, lang, name } => {
+            if list {
+                print_scaffold_choices();
+                return Ok(());
+            }
+            let (Some(lang), Some(name)) = (lang, name) else {
+                bail!(
+                    "scaffold needs a language and a project name — try `zeus project scaffold --list` to see choices"
+                );
+            };
+            let lang = lang.as_str();
+            let name = name.as_str();
+            let target = root.join(name);
             if target.exists() {
                 bail!(
                     "{} already exists — pick a different name",
                     target.display()
                 );
             }
-            let written = if let Some(fw) = zeus_lang::Framework::from_name(&lang) {
-                zeus_lang::scaffold_framework(fw, &name, &target)
+            let written = if let Some(fw) = zeus_lang::Framework::from_name(lang) {
+                zeus_lang::scaffold_framework(fw, name, &target)
                     .context("scaffold")?
                     .iter()
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect::<Vec<_>>()
             } else {
-                let lang = zeus_lang::Language::from_name(&lang).ok_or_else(|| {
+                let lang = zeus_lang::Language::from_name(lang).ok_or_else(|| {
                     anyhow::anyhow!(
                         "unknown language or framework '{lang}' — try `zeus project scaffold --list` for choices"
                     )
                 })?;
-                zeus_lang::scaffold_project(lang, &name, &target)
+                zeus_lang::scaffold_project(lang, name, &target)
                     .context("scaffold")?
                     .iter()
                     .map(|p| p.to_string_lossy().into_owned())
@@ -2920,6 +2956,26 @@ fn run_argv(args: &[String], root: &Path) -> Result<()> {
         bail!("{prog} exited with {}", status.code().unwrap_or(-1));
     }
     Ok(())
+}
+
+/// Print every scaffoldable language and framework with the exact name to
+/// pass to `zeus project scaffold`.
+fn print_scaffold_choices() {
+    println!("languages:");
+    for lang in zeus_lang::available_scaffold_languages() {
+        let key = format!("{lang:?}").to_ascii_lowercase();
+        println!("  {key:<14} {}", zeus_lang::spec(lang).display_name);
+    }
+    println!("frameworks:");
+    for fw in zeus_lang::Framework::ALL {
+        let key = format!("{fw:?}").to_ascii_lowercase();
+        let s = zeus_lang::framework_spec(*fw);
+        println!(
+            "  {key:<14} {} (base {})",
+            s.display_name,
+            zeus_lang::spec(s.base).display_name
+        );
+    }
 }
 
 fn print_lang_commands(lang: zeus_lang::Language, root: &Path) {

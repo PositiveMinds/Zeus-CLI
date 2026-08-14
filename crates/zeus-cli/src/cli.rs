@@ -292,11 +292,14 @@ pub enum ProjectCmd {
     },
     /// Scaffold a minimal, buildable project skeleton.
     Scaffold {
-        /// Language (or file extension) to scaffold — e.g. "rust", "ts",
-        /// "go", "c#".
-        lang: String,
+        /// Language or framework to scaffold — e.g. "rust", "ts", "go",
+        /// "c#", "react", "django".
+        lang: Option<String>,
         /// Project / module name (used for package names, classes, etc.).
-        name: String,
+        name: Option<String>,
+        /// List every scaffoldable language and framework, then exit.
+        #[arg(long)]
+        list: bool,
     },
     /// Format a single source file (per-language formatter) — or the whole
     /// project with no path. Requires the language's formatter on PATH.

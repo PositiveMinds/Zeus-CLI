@@ -101,14 +101,14 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit".into(),
-            description: "Targeted string replace in a file (must be read first).".into(),
+            description: "Targeted string replace in a file — you MUST read the file first. `old_string` must match the file's text exactly; include enough surrounding context (unique lines) so it matches once. Multiple matches are rejected unless `replace_all` is set — if you get an 'ambiguous' error, re-read the file and widen `old_string` with neighboring lines. The change goes through the approval prompt as a diff you can apply or reject. Stale files (changed on disk since your last read) are refused — re-read and retry.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "old_string": {"type": "string"},
+                    "old_string": {"type": "string", "description": "Exact text to replace; must match uniquely (or set replace_all)"},
                     "new_string": {"type": "string"},
-                    "replace_all": {"type": "boolean"}
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of erroring on multiple matches"}
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
@@ -250,6 +250,18 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Explicit test command to run instead of auto-detection"},
+                    "timeout_secs": {"type": "integer"}
+                }
+            }),
+        },
+        ToolSpec {
+            name: "verify".into(),
+            description: "Verify the project compiles/builds (and tests pass) using the build and test commands detected for the project's language (cargo build, go build, npm run build, dotnet build, tsc, ...). Runs build then test by default; `steps` narrows to just \"build\" or \"test\", and an explicit `command` overrides detection entirely. A nonzero exit means verification failed â€” read the stderr below it. Bounded by timeout_secs (default 600). Use this after writing or editing code to prove it still compiles.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Explicit command to run instead of the detected build/test"},
+                    "steps": {"type": "string", "enum": ["build", "test", "all"], "description": "Which steps to run (default all)"},
                     "timeout_secs": {"type": "integer"}
                 }
             }),
@@ -1827,6 +1839,7 @@ impl ToolManager {
             "code_rename" => self.do_code_rename(&args),
             "bash" => self.do_bash(&args, approver),
             "test" => self.do_test(&args, approver),
+            "verify" => self.do_verify(&args, approver),
             "browser" => self.do_browser(&args),
             "web_fetch" => self.do_web_fetch(&args),
             "web_search" => self.do_web_search(&args),
@@ -2598,6 +2611,112 @@ impl ToolManager {
                 }
             }
             Err(e) => Ok(ToolResult::err(e.to_string())),
+        }
+    }
+
+    /// Run the project's detected build/test commands (from the zeus-lang
+    /// spec) to prove the code compiles and tests pass. An explicit
+    /// `command` overrides detection; `steps` picks build/test/all.
+    fn do_verify<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
+    where
+        F: FnMut(&PermissionRequest) -> ApprovalDecision,
+    {
+        let root = self.workspace.project_root.clone();
+        let spec = zeus_lang::detect_project(&root).map(zeus_lang::spec);
+        let lang_name = spec
+            .map(|s| s.display_name.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let join_cmds = |args: &[&'static str]| args.join(" ");
+        let build_cmd = spec.map(|s| join_cmds(s.build)).filter(|c| !c.is_empty());
+        let test_cmd = spec.map(|s| join_cmds(s.test)).filter(|c| !c.is_empty());
+
+        let explicit = match Self::str_arg(args, "command") {
+            Ok(c) if !c.trim().is_empty() => Some(c.trim().to_string()),
+            _ => None,
+        };
+        let steps = Self::str_arg(args, "steps")
+            .unwrap_or("all")
+            .to_ascii_lowercase();
+        let timeout = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(600));
+
+        let mut to_run: Vec<String> = Vec::new();
+        if let Some(c) = &explicit {
+            to_run.push(c.clone());
+        } else {
+            match steps.as_str() {
+                "build" => match &build_cmd {
+                    Some(c) => to_run.push(c.clone()),
+                    None => return Ok(ToolResult::err(format!(
+                        "no build command configured for {lang_name} — pass an explicit `command`"
+                    ))),
+                },
+                "test" => match &test_cmd {
+                    Some(c) => to_run.push(c.clone()),
+                    None => return Ok(ToolResult::err(format!(
+                        "no test command configured for {lang_name} — pass an explicit `command`"
+                    ))),
+                },
+                _ => {
+                    if let Some(c) = &build_cmd {
+                        to_run.push(c.clone());
+                    }
+                    if let Some(c) = &test_cmd {
+                        to_run.push(c.clone());
+                    }
+                    if to_run.is_empty() {
+                        return Ok(ToolResult::err(format!(
+                            "couldn't detect any build or test command for this project \
+                             (language: {lang_name}). Pass an explicit `command`."
+                        )));
+                    }
+                }
+            }
+        }
+
+        let mut report = String::new();
+        let mut all_ok = true;
+        for command in to_run {
+            let opts = TerminalOptions {
+                cwd: root.clone(),
+                timeout: Some(timeout),
+                sandbox: Sandbox::RestrictedFs,
+                profile: CommandProfile::Foreground,
+                use_pty: false,
+            };
+            match self.terminal.run(
+                &command,
+                &self.workspace.files.gate,
+                opts,
+                self.cancel.clone(),
+                &mut *approver,
+            ) {
+                Ok(out) => {
+                    let ok = out.exit_code == Some(0) && !out.cancelled && !out.timed_out;
+                    all_ok &= ok;
+                    report.push_str(&format!(
+                        "> {command}\nexit={:?} cancelled={} timed_out={}\n--- stdout ---\n{}--- stderr ---\n{}{}\n",
+                        out.exit_code,
+                        out.cancelled,
+                        out.timed_out,
+                        out.stdout,
+                        out.stderr,
+                        if out.truncated { "\n(output truncated)" } else { "" }
+                    ));
+                }
+                Err(e) => {
+                    all_ok = false;
+                    report.push_str(&format!("> {command}\nfailed to run: {e}\n"));
+                }
+            }
+        }
+        if all_ok {
+            Ok(ToolResult::ok(report))
+        } else {
+            Ok(ToolResult::err(report))
         }
     }
 
