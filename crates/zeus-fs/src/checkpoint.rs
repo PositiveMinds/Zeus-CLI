@@ -234,68 +234,15 @@ impl CheckpointStore {
 }
 
 fn base64_encode(data: &[u8]) -> String {
-    // Minimal base64 without extra crate.
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(T[((n >> 18) & 63) as usize] as char);
-        out.push(T[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(T[((n >> 6) & 63) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(T[(n & 63) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 fn base64_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
-    fn val(c: u8) -> std::result::Result<u8, String> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(format!("invalid base64 char {}", c as char)),
-        }
-    }
-    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if !bytes.len().is_multiple_of(4) {
-        return Err("invalid base64 length".into());
-    }
-    let mut out = Vec::new();
-    for chunk in bytes.chunks(4) {
-        let n = ((val(chunk[0])? as u32) << 18)
-            | ((val(chunk[1])? as u32) << 12)
-            | ((if chunk[2] == b'=' {
-                0
-            } else {
-                val(chunk[2])? as u32
-            }) << 6)
-            | (if chunk[3] == b'=' {
-                0
-            } else {
-                val(chunk[3])? as u32
-            });
-        out.push(((n >> 16) & 0xff) as u8);
-        if chunk[2] != b'=' {
-            out.push(((n >> 8) & 0xff) as u8);
-        }
-        if chunk[3] != b'=' {
-            out.push((n & 0xff) as u8);
-        }
-    }
-    Ok(out)
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! The Agent Loop: message history â‡„ tool calls â‡„ tool results, cancellable.
+//! The Agent Loop: message history ⇄ tool calls ⇄ tool results, cancellable.
 //!
 //! Cycle (matches the blueprint's "The Agent Loop" section):
 //! 1. Append user message.
@@ -32,7 +32,7 @@ pub struct AgentOptions {
     /// Safety valve against a runaway tool-call loop.
     pub max_tool_iterations: usize,
     pub temperature: Option<f32>,
-    /// Caps how many tokens a single reply may generate â€” bounds worst-case
+    /// Caps how many tokens a single reply may generate — bounds worst-case
     /// latency (a model that rambles on with no natural stop point,
     /// especially slow CPU-bound local inference, otherwise generates for as
     /// long as its context window allows). `None` leaves it uncapped.
@@ -40,7 +40,7 @@ pub struct AgentOptions {
     /// How many independent *read-only* plan steps may run concurrently.
     /// File-mutating steps always run sequentially (they touch the shared
     /// workspace, and we don't want concurrent editors stepping on each
-    /// other). `1` disables parallelism entirely â€” the prior sequential
+    /// other). `1` disables parallelism entirely — the prior sequential
     /// behaviour. Amounts to "bounded safe parallelism".
     pub max_parallel_read_steps: usize,
     /// Where to persist the structured plan (`.agent/tasks.json`). When
@@ -265,7 +265,7 @@ impl Agent {
     }
 
     /// Handle for an external caller (UI, signal handler) to cancel the
-    /// in-flight turn â€” aborts both the provider stream and any running tool
+    /// in-flight turn — aborts both the provider stream and any running tool
     /// call (the `bash` tool checks the same flag via its own cancel token;
     /// callers wanting that to propagate should share one `AtomicBool`/watch
     /// pair between this and the `ToolManager`'s terminal cancel token).
@@ -296,7 +296,7 @@ impl Agent {
         self.tools.workspace()
     }
 
-    /// Models the current provider actually has available â€” backs a
+    /// Models the current provider actually has available — backs a
     /// `/model` picker UI (list + select) rather than requiring the user to
     /// already know an exact model name to type.
     pub async fn list_models(&self) -> Result<Vec<zeus_provider::ModelInfo>> {
@@ -306,7 +306,7 @@ impl Agent {
             .map_err(AgentError::Provider)
     }
 
-    /// Plan mode: read-only research/proposal, no mutating tool calls â€”
+    /// Plan mode: read-only research/proposal, no mutating tool calls —
     /// enforced centrally in the `ToolManager`, not per-tool, so switching
     /// modes can't be bypassed by a tool configured Allow in settings.
     pub fn set_plan_mode(&self, enabled: bool) {
@@ -331,7 +331,7 @@ impl Agent {
     }
 
     /// Toggle automatic per-turn compaction (`/autocompact on|off`). When
-    /// disabled, the context is left to grow until the user runs `/compact` â€”
+    /// disabled, the context is left to grow until the user runs `/compact` —
     /// useful on long, chatty sessions where you'd rather not lose earlier
     /// detail. Explicit `/compact` always works regardless of this.
     pub fn set_auto_compact(&self, enabled: bool) {
@@ -344,14 +344,14 @@ impl Agent {
     }
 
     /// Switch which model future turns use, keeping the same conversation
-    /// history and session â€” same provider only (switching providers mid-
+    /// history and session — same provider only (switching providers mid-
     /// session would mean rebuilding the whole tool/workspace stack, out of
     /// scope for a `/model` switch).
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.options.model = model.into();
     }
 
-    /// Swap which provider future turns use â€” the tool/workspace/session
+    /// Swap which provider future turns use — the tool/workspace/session
     /// stack is untouched, so conversation history carries over exactly
     /// like a same-provider `/model` switch does. Callers should also call
     /// `set_model` with a model that actually exists on the new provider.
@@ -828,7 +828,7 @@ impl Agent {
     /// Orchestrated `/plan` run: ask a planning-only call (no tools) to
     /// break the goal into an ordered list of subtasks, then execute each
     /// subtask as its own full tool-using turn, carrying forward a summary
-    /// of what earlier steps did. Sequential by design â€” steps like "run the
+    /// of what earlier steps did. Sequential by design — steps like "run the
     /// tests" after "edit the file" depend on order, and concurrent tool-
     /// using agents against the same working directory race file writes.
     ///
@@ -949,7 +949,7 @@ impl Agent {
         let mut prior_content = String::new();
 
         // Safe, bounded parallelism: consecutive *read-only* steps (personas
-        // that only inspect) may run as independent headless provider calls â€”
+        // that only inspect) may run as independent headless provider calls —
         // they never mutate the shared workspace or conversation, so there's
         // no edit race. File-mutating steps stay on the sequential `drive_turn`
         // loop below. `max_parallel_read_steps` caps how many run at once;
@@ -970,7 +970,7 @@ impl Agent {
             let read_run = if run_end > idx && parallel > 1 {
                 (idx, run_end)
             } else {
-                // Not a run (or parallelism off) â€” fall through to sequential.
+                // Not a run (or parallelism off) — fall through to sequential.
                 (0, 0)
             };
 
@@ -1364,7 +1364,7 @@ impl Agent {
         let review_prompt = format!(
             "Review the work produced for this goal, then report concrete findings and \
              any required fixes.\n\nGoal: {goal}\n\nWork produced:\n{work}\n\n\
-             Review only â€” do not edit files. End with a concise verdict."
+             Review only — do not edit files. End with a concise verdict."
         );
         self.state.messages.push(Message::user(review_prompt));
         let result = self.drive_turn(&mut *on_event, &mut *approver).await?;
@@ -1742,7 +1742,7 @@ impl Agent {
 
             if calls.is_empty() {
                 // Small local models occasionally emit a bare, meaningless
-                // reply (empty, or just stray JSON punctuation like "{}") â€”
+                // reply (empty, or just stray JSON punctuation like "{}") —
                 // observed with a large tool list confusing a 3B model into
                 // an aborted function-call-shaped attempt that never became
                 // an actual tool call. Rather than silently showing that
@@ -1756,7 +1756,7 @@ impl Agent {
                             .all(|c| c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']')));
                 let mut final_text = text;
                 if is_degenerate {
-                    let note = "\n\n(that came back empty/malformed instead of a real answer â€” \
+                    let note = "\n\n(that came back empty/malformed instead of a real answer — \
                         small local models sometimes struggle with a large tool list. Try \
                         rephrasing, or switch models with /model.)";
                     on_event(AgentEvent::TextDelta(note.to_string()));
@@ -1780,7 +1780,7 @@ impl Agent {
             }
 
             // Assistant message carrying the requested tool calls, then one
-            // tool-result message per call â€” appended immediately after, so
+            // tool-result message per call — appended immediately after, so
             // the pairing invariant `ContextManager` relies on always holds.
             let tool_calls: Vec<ToolCall> = call_order
                 .iter()
@@ -1872,16 +1872,16 @@ impl Agent {
             self.persist()?;
         }
 
-        // Not a system failure â€” the model (often a small/local one) just
+        // Not a system failure — the model (often a small/local one) just
         // didn't converge to a final answer within the iteration budget,
         // e.g. by repeating the same tool call. This used to be a hard
         // `Err`, which crashed the entire REPL session on a single
-        // unlucky turn instead of just failing that turn â€” fixed to behave
+        // unlucky turn instead of just failing that turn — fixed to behave
         // like a normal (if apologetic) reply instead, through the same
         // TextDelta/Done event path a real answer would use, so no caller
         // needs special-case handling.
         let fallback_text = format!(
-            "(no final answer after {} tool call(s) across {} iterations â€” the model may be stuck, \
+            "(no final answer after {} tool call(s) across {} iterations — the model may be stuck, \
              e.g. repeating the same tool call. Try rephrasing, or breaking the request into \
              smaller steps.)",
             total_tool_calls, self.options.max_tool_iterations
@@ -1910,7 +1910,7 @@ impl Agent {
     }
 
     /// Force a compaction pass right now, bypassing the usual threshold
-    /// check â€” for a user-initiated `/compact` rather than the automatic
+    /// check — for a user-initiated `/compact` rather than the automatic
     /// per-turn check. Still respects `keep_recent_messages`/the
     /// tool-call-pairing invariant; only the "is it even near the window"
     /// gate is skipped.
@@ -2023,7 +2023,7 @@ fn prepend_persona_prompt(state: &mut super::session::ConversationState, id: &st
     true
 }
 
-/// Whether a planned step is safe to run as a headless concurrent turn â€”
+/// Whether a planned step is safe to run as a headless concurrent turn —
 /// i.e. its persona only inspects the workspace (no write/edit/bash tools)
 /// and never mutates shared state. Steps with no persona are treated as
 /// potentially mutating and stay sequential.
@@ -2052,7 +2052,7 @@ fn orchestration_step_prompt(goal: &str, summaries: &[String], step: &PlanStep) 
 /// One line for the final combined summary.
 fn step_summary(step: &PlanStep, text: &str) -> String {
     format!(
-        "{}. {} â€” {}",
+        "{}. {} — {}",
         step.id,
         step.description,
         text.chars().take(200).collect::<String>()

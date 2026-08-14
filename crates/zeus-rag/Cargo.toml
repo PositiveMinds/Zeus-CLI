@@ -3,7 +3,7 @@ name = "zeus-rag"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RAG for zeus: chunk+embed project files and run semantic search over a prebuilt vector index"
+description = "RAG for zeus: chunk project files and run hybrid keyword/vector search over an in-memory index"
 
 [dependencies]
 zeus-provider = { workspace = true }

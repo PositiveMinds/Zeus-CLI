@@ -202,7 +202,10 @@ async fn error_for_status(resp: reqwest::Response) -> Result<reqwest::Response> 
     }
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-    Err(ProviderError::Api(format!("ollama {status}: {text}")))
+    Err(ProviderError::Http {
+        status: status.as_u16(),
+        message: format!("ollama {status}: {text}"),
+    })
 }
 
 fn tool_calls_from(msg: &OllamaMessage, id_offset: usize) -> Vec<ToolCall> {
@@ -471,5 +474,258 @@ impl ModelProvider for OllamaProvider {
 
     fn supports_prompt_cache(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::process::{Child, Command};
+    use std::time::Duration;
+
+    /// A tiny real HTTP server (Python) implementing enough of Ollama's
+    /// `/api/tags`, `/api/chat` (streaming + non-streaming NDJSON), `/api/embed`,
+    /// and `/api/pull` dialect to exercise the real client end to end.
+    fn server_script() -> &'static str {
+        r#"
+import sys, json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(sys.argv[1])
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def _read_json(self):
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length)
+        return json.loads(body) if body else {}
+
+    def _send_json(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/api/tags":
+            self._send_json(200, {"models": [
+                {"name": "test-model", "details": {"context_length": 8192}},
+                {"name": "other-model"},
+            ]})
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path == "/api/chat":
+            body = self._read_json()
+            model = body.get("model", "")
+            if body.get("stream"):
+                self._stream_chat(model)
+            else:
+                self._chat(model)
+        elif self.path == "/api/embed":
+            body = self._read_json()
+            inputs = body.get("input", [])
+            self._send_json(200, {"embeddings": [[0.1, 0.2, 0.3] for _ in inputs]})
+        elif self.path == "/api/pull":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            for line in ["pulling manifest", "verifying sha256:abc", "success"]:
+                self.wfile.write(json.dumps({"status": line}).encode("utf-8") + b"\n")
+            self.wfile.flush()
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def _chat(self, model):
+        if model == "missing-model":
+            self._send_json(404, {"error": "model not found"})
+        elif model == "tool-model":
+            resp = {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "shout", "arguments": {"text": "hi"}}}],
+                },
+                "prompt_eval_count": 10,
+                "eval_count": 5,
+            }
+        else:
+            resp = {
+                "message": {"role": "assistant", "content": "hello from ollama"},
+                "prompt_eval_count": 10,
+                "eval_count": 5,
+            }
+        self._send_json(200, resp)
+
+    def _stream_chat(self, model):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+        chunks = [
+            {"message": {"role": "assistant", "content": "hello "}, "done": False},
+            {"message": {"role": "assistant", "content": "world"}, "done": False},
+            {"message": {"role": "assistant", "content": ""}, "done": True,
+             "prompt_eval_count": 10, "eval_count": 5},
+        ]
+        for c in chunks:
+            self.wfile.write(json.dumps(c).encode("utf-8") + b"\n")
+        self.wfile.flush()
+
+server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+server.serve_forever()
+"#
+    }
+
+    fn python_cmd() -> &'static str {
+        if cfg!(windows) {
+            "python"
+        } else {
+            "python3"
+        }
+    }
+
+    struct TestServer {
+        child: Child,
+        base_url: String,
+    }
+
+    impl TestServer {
+        fn start(port: u16) -> Self {
+            let tmp = std::env::temp_dir().join(format!("zeus_ollama_test_server_{port}.py"));
+            std::fs::write(&tmp, server_script()).unwrap();
+            let child = Command::new(python_cmd())
+                .arg(&tmp)
+                .arg(port.to_string())
+                .spawn()
+                .expect("failed to spawn test server");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("test server on port {port} did not become ready in time");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Self {
+                child,
+                base_url: format!("http://127.0.0.1:{port}"),
+            }
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_models_works() {
+        let server = TestServer::start(18101);
+        let provider = OllamaProvider::new("test", &server.base_url);
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "test-model");
+        assert_eq!(models[0].context_window, Some(8192));
+    }
+
+    #[tokio::test]
+    async fn chat_returns_plain_text() {
+        let server = TestServer::start(18102);
+        let provider = OllamaProvider::new("test", &server.base_url);
+        let resp = provider
+            .chat(ChatRequest::new("text-model", vec![Message::user("hi")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.message.content, "hello from ollama");
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+        assert_eq!(resp.usage.prompt_tokens, 10);
+        assert_eq!(resp.usage.completion_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn chat_returns_tool_call() {
+        let server = TestServer::start(18103);
+        let provider = OllamaProvider::new("test", &server.base_url);
+        let resp = provider
+            .chat(ChatRequest::new("tool-model", vec![Message::user("hi")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(resp.message.tool_calls.len(), 1);
+        assert_eq!(resp.message.tool_calls[0].name, "shout");
+        assert_eq!(resp.message.tool_calls[0].arguments, r#"{"text":"hi"}"#);
+    }
+
+    #[tokio::test]
+    async fn stream_yields_text_deltas() {
+        let server = TestServer::start(18104);
+        let provider = OllamaProvider::new("test", &server.base_url);
+        let mut stream = provider
+            .stream(ChatRequest::new("text-model", vec![Message::user("hi")]))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        let mut finish = None;
+        while let Some(ev) = stream.next().await {
+            match ev.unwrap() {
+                StreamEvent::TextDelta { text: t } => text.push_str(&t),
+                StreamEvent::Done { finish_reason, .. } => finish = Some(finish_reason),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "hello world");
+        assert_eq!(finish, Some(FinishReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn embeddings_work() {
+        let server = TestServer::start(18105);
+        let provider = OllamaProvider::new("test", &server.base_url);
+        let resp = provider
+            .embeddings(EmbeddingRequest {
+                model: "test-model".into(),
+                input: vec!["a".into(), "b".into()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.vectors.len(), 2);
+        assert_eq!(resp.vectors[0], vec![0.1, 0.2, 0.3]);
+    }
+
+    #[tokio::test]
+    async fn pull_streams_progress_lines() {
+        let server = TestServer::start(18106);
+        let provider = OllamaProvider::new("test", &server.base_url);
+        let mut seen = Vec::new();
+        provider
+            .pull("my-model", |s| seen.push(s.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            seen,
+            vec!["pulling manifest", "verifying sha256:abc", "success"]
+        );
+    }
+
+    #[tokio::test]
+    async fn error_for_status_exposes_http_status() {
+        let server = TestServer::start(18107);
+        let provider = OllamaProvider::new("test", &server.base_url);
+        // POST to an unknown path → 404, surfaced as ProviderError::Http.
+        let resp = provider
+            .chat(ChatRequest::new("missing-model", vec![Message::user("hi")]))
+            .await
+            .unwrap_err();
+        assert_eq!(resp.http_status(), Some(404));
     }
 }

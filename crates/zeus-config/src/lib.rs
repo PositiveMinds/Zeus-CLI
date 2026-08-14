@@ -18,7 +18,7 @@ pub use providers::{ProviderConfig, ProvidersFile};
 pub use settings::{
     set_accent_color, set_notify_on_completion, set_reduced_motion, AgentSettings,
     LlamaCppSettings, LocalModelEntry, McpServerConfig, PermissionDefault, PermissionRule,
-    PermissionState, SettingsLayer, SettingsStack,
+    PermissionSettings, PermissionState, SettingsLayer, SettingsStack,
 };
 
 use std::path::{Path, PathBuf};

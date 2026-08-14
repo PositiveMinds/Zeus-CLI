@@ -34,5 +34,3 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 
 [dev-dependencies]
 tempfile = { workspace = true }
-assert_cmd = "2"
-predicates = "3"

@@ -188,7 +188,10 @@ async fn error_for_status(resp: reqwest::Response) -> Result<reqwest::Response> 
     }
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-    Err(ProviderError::Api(format!("{status}: {text}")))
+    Err(ProviderError::Http {
+        status: status.as_u16(),
+        message: text,
+    })
 }
 
 // --- Non-streaming response shape ---

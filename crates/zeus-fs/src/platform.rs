@@ -1847,3 +1847,134 @@ impl PlatformEngine {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::{ApprovalDecision, PermissionRequest};
+    use tempfile::TempDir;
+    use zeus_config::{AgentSettings, PermissionDefault, PermissionSettings, PermissionState};
+
+    fn approve(_: &PermissionRequest) -> ApprovalDecision {
+        ApprovalDecision::Approved
+    }
+    fn deny(_: &PermissionRequest) -> ApprovalDecision {
+        ApprovalDecision::Denied
+    }
+
+    fn engine(root: &std::path::Path) -> PlatformEngine {
+        PlatformEngine::new(
+            root.to_path_buf(),
+            PermissionGate::new(AgentSettings::default(), root.to_path_buf()),
+        )
+    }
+
+    fn engine_with(settings: AgentSettings, root: &std::path::Path) -> PlatformEngine {
+        PlatformEngine::new(
+            root.to_path_buf(),
+            PermissionGate::new(settings, root.to_path_buf()),
+        )
+    }
+
+    /// A tool denied by configuration must be rejected by the gate *before*
+    /// any subprocess is spawned — deny beats both default-ask and the
+    /// per-op approver.
+    #[test]
+    fn denied_platform_tool_is_rejected_before_spawning() {
+        let tmp = TempDir::new().unwrap();
+        let settings = AgentSettings {
+            permissions: PermissionSettings {
+                defaults: vec![PermissionDefault {
+                    tool: "gh_issue_create".into(),
+                    state: PermissionState::Deny,
+                }],
+                rules: Vec::new(),
+                allow_session_auto_approve: false,
+            },
+            ..AgentSettings::default()
+        };
+        let engine = engine_with(settings, tmp.path());
+        // `gh` is not needed — the gate must deny before require_bin/run_bin.
+        let err = engine
+            .gh_issue_create("title", None, None, &mut approve)
+            .unwrap_err();
+        assert!(matches!(err, FsError::Denied(_)));
+    }
+
+    /// Mutating ops route through the approver (Ask by default); a deny
+    /// approver aborts the op.
+    #[test]
+    fn mutating_op_is_aborted_when_approver_denies() {
+        let tmp = TempDir::new().unwrap();
+        let engine = engine(tmp.path());
+        // Default settings have no rule for gh ops → Ask → approver deny.
+        let err = engine
+            .gh_issue_create("title", None, None, &mut deny)
+            .unwrap_err();
+        assert!(matches!(err, FsError::Denied(_)) || matches!(err, FsError::NeedsApproval(_)));
+    }
+
+    /// Read-only ops pass through `enforce_strict` without an approver.
+    #[test]
+    fn read_only_ops_resolve_without_panicking() {
+        let tmp = TempDir::new().unwrap();
+        let engine = engine(tmp.path());
+        // gh may be absent (CI) or unauthenticated; the contract is a clean
+        // PlatformOutput or a surfaceable error — never a panic.
+        let out = engine.gh_issue_list("open", 10, None);
+        assert!(out.is_ok() || out.is_err());
+    }
+
+    /// run_bin surfaces spawn failures (missing binary) as errors.
+    #[test]
+    fn run_bin_reports_missing_binary() {
+        let tmp = TempDir::new().unwrap();
+        let engine = engine(tmp.path());
+        let err = engine
+            .run_bin("zeus-no-such-cli-xyz", &["--version".into()])
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("failed to spawn") || msg.contains("zeus-no-such-cli-xyz"));
+    }
+
+    /// run_bin captures stdout / exit status for a real binary (git is
+    /// guaranteed present wherever the workspace tests run, same assumption
+    /// git.rs makes).
+    #[test]
+    fn run_bin_captures_real_output() {
+        let tmp = TempDir::new().unwrap();
+        let engine = engine(tmp.path());
+        let out = engine
+            .run_bin("git", &["--version".into()])
+            .expect("git --version should run");
+        assert!(out.success);
+        assert!(out.stdout.contains("git version"));
+    }
+
+    /// available() is false for a missing binary, true for git.
+    #[test]
+    fn availability_detection() {
+        let tmp = TempDir::new().unwrap();
+        let engine = engine(tmp.path());
+        assert!(!engine.available("zeus-no-such-cli-xyz"));
+        assert!(engine.available("git"));
+    }
+
+    /// require_bin produces a helpful, actionable error for missing CLIs.
+    #[test]
+    fn require_bin_reports_install_hint() {
+        let tmp = TempDir::new().unwrap();
+        let engine = engine(tmp.path());
+        let err = engine
+            .require_bin(
+                "zeus-no-such-cli-xyz",
+                "some_op",
+                "Install it and run `foo auth login`.",
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("some_op"));
+        assert!(msg.contains("zeus-no-such-cli-xyz"));
+        assert!(msg.contains("foo auth login"));
+    }
+}

@@ -97,9 +97,10 @@ fn next_break(head: &str, approx_chars: usize) -> Option<usize> {
     idx
 }
 
-/// Iterate the source files under `root`, yielding `(path, text)` pairs.
-/// Hidden/skip dirs and oversized/binary-looking files are pruned.
-pub fn source_files(root: &Path) -> Vec<(PathBuf, String)> {
+/// Walk `root` and return the paths of every file that qualifies for
+/// indexing (same pruning as before: hidden/skip dirs, oversized and
+/// empty files, `.lock`/`.min.js`/`.map`).
+fn walk_pruned(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(root) else {
         return out;
@@ -111,7 +112,7 @@ pub fn source_files(root: &Path) -> Vec<(PathBuf, String)> {
             if SKIP_DIRS.contains(&name.as_str()) || name.starts_with('.') {
                 continue;
             }
-            out.extend(source_files(&path));
+            out.extend(walk_pruned(&path));
         } else if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             let Ok(meta) = entry.metadata() else { continue };
             if meta.len() > MAX_FILE_BYTES || meta.len() == 0 {
@@ -121,11 +122,41 @@ pub fn source_files(root: &Path) -> Vec<(PathBuf, String)> {
             if matches!(ext, Some("lock") | Some("min.js") | Some("map")) {
                 continue;
             }
-            match std::fs::read_to_string(&path) {
-                Ok(text) => out.push((path, text)),
-                Err(_) => continue, // opaque/binary content
-            }
+            out.push(path);
         }
+    }
+    out
+}
+
+/// Iterate the source files under `root`, yielding `(path, text)` pairs.
+/// Hidden/skip dirs and oversized/binary-looking files are pruned.
+pub fn source_files(root: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for path in walk_pruned(root) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => out.push((path, text)),
+            Err(_) => continue, // opaque/binary content
+        }
+    }
+    out
+}
+
+/// Metadata-only walk, same pruning as `source_files` but without reading
+/// file contents — used for cheap staleness checks of a persisted index.
+/// Returns `(path, len, mtime_secs)` per file.
+pub fn source_file_stats(root: &Path) -> Vec<(PathBuf, u64, u64)> {
+    let mut out = Vec::new();
+    for path in walk_pruned(root) {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push((path, meta.len(), mtime));
     }
     out
 }
@@ -174,5 +205,24 @@ mod tests {
         let files = source_files(dir.path());
         assert_eq!(files.len(), 1);
         assert!(files[0].0.ends_with("lib.rs"));
+    }
+
+    #[test]
+    fn source_file_stats_matches_source_files_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/util.rs"), "pub fn g() {}\n").unwrap();
+        let files = source_files(dir.path());
+        let stats = source_file_stats(dir.path());
+        let mut paths: Vec<_> = files.iter().map(|(p, _)| p).collect();
+        let mut stat_paths: Vec<_> = stats.iter().map(|(p, _, _)| p).collect();
+        paths.sort();
+        stat_paths.sort();
+        assert_eq!(paths, stat_paths);
+        // mtime and len are populated for existing files.
+        for (_, len, _) in &stats {
+            assert!(*len > 0);
+        }
     }
 }

@@ -27,6 +27,10 @@ pub enum ProviderError {
     #[error("HTTP / transport error: {0}")]
     Transport(String),
 
+    /// A non-success HTTP response from a provider endpoint.
+    #[error("API error (HTTP {status}): {message}")]
+    Http { status: u16, message: String },
+
     #[error("API error: {0}")]
     Api(String),
 
@@ -35,4 +39,15 @@ pub enum ProviderError {
 
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl ProviderError {
+    /// The HTTP status code behind the error, if it came from a provider
+    /// endpoint (used by retry / user-facing diagnostics).
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            ProviderError::Http { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
 }
