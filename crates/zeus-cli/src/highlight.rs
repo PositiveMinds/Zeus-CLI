@@ -526,8 +526,14 @@ pub fn diff_lines(text: &str, plain_style: Style, width: usize) -> Vec<Vec<Span<
         .collect()
 }
 
-/// ANSI-escape a unified diff for the plain REPL / non-TUI output.
+/// ANSI-escape a unified diff for the plain REPL / non-TUI output. Honors the
+/// same fancy-output gate as the rest of the REPL styling (`styled`): when
+/// stdout is piped/redirected or `NO_COLOR` is set, the diff is returned
+/// plain so no escape codes leak into scripts or log files.
 pub fn ansi_diff(text: &str) -> String {
+    if !crate::ui::supports_fancy_output() {
+        return text.to_string();
+    }
     let mut out = String::new();
     for l in text.lines() {
         let tag = l.chars().next().unwrap_or(' ');
