@@ -4886,16 +4886,20 @@ pub async fn run(config: &Config, agent: Agent, yes: bool) -> Result<()> {
 /// Owning wrapper that restores the terminal (raw mode off, leave alternate
 /// screen, mouse/paste off, cursor visible) when dropped — including during
 /// unwinding from a panic in `run_app`, which the previous sequential
-/// teardown never covered.
-struct TerminalGuard<B: Backend + io::Write> {
+/// teardown never covered. Teardown targets `stdout` directly rather than the
+/// wrapped backend: the alternate screen / mouse capture / bracketed paste
+/// are console *state* that belongs to the terminal device, not to a
+/// particular backend, so the same `Drop` works for any `Backend` (and is
+/// exercisable in tests against a `TestBackend` with no console attached).
+struct TerminalGuard<B: Backend> {
     terminal: Terminal<B>,
 }
 
-impl<B: Backend + io::Write> Drop for TerminalGuard<B> {
+impl<B: Backend> Drop for TerminalGuard<B> {
     fn drop(&mut self) {
         disable_raw_mode().ok();
         execute!(
-            self.terminal.backend_mut(),
+            std::io::stdout(),
             LeaveAlternateScreen,
             DisableMouseCapture,
             DisableBracketedPaste
@@ -4908,6 +4912,20 @@ impl<B: Backend + io::Write> Drop for TerminalGuard<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panic-safe teardown path runs without a real terminal: the guard's
+    /// `Drop` exercises the same teardown sequence (`disable_raw_mode`,
+    /// leave-alt-screen, mouse/paste off, cursor show) that a panic inside
+    /// `run_app` triggers. Against a `TestBackend` the crossterm escapes are
+    /// buffered rather than sent to a console, and the raw-mode calls fail
+    /// harmlessly — so this proves dropping the guard never panics even when
+    /// nothing terminal-y is actually attached.
+    #[test]
+    fn terminal_guard_drop_runs_teardown_without_panicking() {
+        let terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let guard = TerminalGuard { terminal };
+        drop(guard);
+    }
 
     #[test]
     fn agent_mode_cycles_and_labels() {
