@@ -987,7 +987,7 @@ async fn build_agent_with_provider(
     // for a repo up front.
     if state.messages.is_empty() {
         state.messages.push(system_prompt(config));
-        if let Some(survey) = build_project_survey(config) {
+        if let Some(survey) = build_project_survey(config.project_root.as_deref()) {
             state.messages.push(Message::system(survey));
         }
     }
@@ -1054,8 +1054,8 @@ fn system_prompt(_config: &Config) -> Message {
 /// actually walked from disk and explicitly labeled as such. Kept deliberately
 /// small and capped: on a huge tree it enumerates only the top level plus a
 /// depth-limited walk, and never reads file bodies.
-fn build_project_survey(config: &Config) -> Option<String> {
-    let root = config.project_root.as_ref()?;
+fn build_project_survey(project_root: Option<&Path>) -> Option<String> {
+    let root = project_root?;
     let name = root
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -3601,5 +3601,29 @@ mod tests {
         }
         let proj = std::path::Path::new("C:\\some\\project");
         assert!(guard_against_home_root(proj).is_ok());
+    }
+
+    #[test]
+    fn project_survey_injects_detected_stack_and_command_lines() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("webapp");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "webapp", "version": "0.1.0", "scripts": { "build": "tsc" } }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/main.ts"), "export const hello = () => 1;\n").unwrap();
+
+        let survey = build_project_survey(Some(&root)).unwrap();
+        assert!(survey.contains("workspace name: webapp"), "{survey}");
+        assert!(survey.contains("detected language: TypeScript"), "{survey}");
+        // The injected commands must be the ones `verify`/`test` would run,
+        // so the agent trusts them instead of guessing.
+        assert!(survey.contains("build:  tsc -p ."), "{survey}");
+        assert!(survey.contains("test:   npm test"), "{survey}");
+        assert!(survey.contains("entries scanned"), "{survey}");
+
+        assert!(build_project_survey(None).is_none());
     }
 }

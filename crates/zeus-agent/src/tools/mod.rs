@@ -1,6 +1,6 @@
 //! Tool registry: bridges Phase 2 file operations + search + Phase 3
 //! terminal execution into named tools the agent loop dispatches by name
-//! with JSON-object arguments â€” this is the bridge layer the blueprint's
+//! with JSON-object arguments — this is the bridge layer the blueprint's
 //! Agent Loop calls "Tool Manager".
 
 use crate::background::BackgroundTaskRegistry;
@@ -51,13 +51,13 @@ impl ToolResult {
 }
 
 /// Tool specs advertised to the model. Kept in sync with `ToolManager`'s
-/// `dispatch_with_approver` match arms below â€” every name here must have a
+/// `dispatch_with_approver` match arms below — every name here must have a
 /// handler, and vice versa.
 pub fn builtin_tool_specs() -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             name: "todowrite".into(),
-            description: "Replace your own progress checklist for this session with the given list â€” call this whenever you break a request into multiple steps, and again every time a step's status changes. You own this list entirely: pass the FULL list every time (not a diff), including items already completed. Mark exactly one item in_progress at a time (the one you're actively working on), never more; mark an item completed only once you've actually verified it, not just attempted it. Skip this tool for a single trivial action.".into(),
+            description: "Replace your own progress checklist for this session with the given list — call this whenever you break a request into multiple steps, and again every time a step's status changes. You own this list entirely: pass the FULL list every time (not a diff), including items already completed. Mark exactly one item in_progress at a time (the one you're actively working on), never more; mark an item completed only once you've actually verified it, not just attempted it. Skip this tool for a single trivial action.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -78,7 +78,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read".into(),
-            description: "Read a project file (line-numbered output). The result is prefixed with the exact line window shown (e.g. lines 1-500 of 3200) â€” if it says the file continues, pass offset=<next line> to keep reading; never treat a partial read as the whole file.".into(),
+            description: "Read a project file (line-numbered output). The result is prefixed with the exact line window shown (e.g. lines 1-500 of 3200) — if it says the file continues, pass offset=<next line> to keep reading; never treat a partial read as the whole file.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -87,6 +87,22 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                     "limit": {"type": "integer"}
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: "read_multiple".into(),
+            description: "Read several project files in one call. `paths` is a JSON array of strings (up to 20, each read with its own `limit`, default 1500 lines). Each file is returned as a separate block headed with `=== path ===`; a missing file yields a `--- path: <error> ---` block instead of failing the whole call. Use when you need several related files (a module, its types, its tests) at once — one round-trip instead of N reads.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 20
+                    },
+                    "limit": {"type": "integer"}
+                },
+                "required": ["paths"]
             }),
         },
         ToolSpec {
@@ -245,7 +261,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         // --- Verification: tests + visual (browser) ---
         ToolSpec {
             name: "test".into(),
-            description: "Run the project's test suite. Auto-detects the test runner from the repo (cargo test / npm|pnpm|yarn test / python -m pytest / go test / make test); pass an explicit `command` to override when a targeted run is needed (single test, extra flags). Bounded by timeout_secs (default 300). Returns the exit code plus a parsed pass/fail summary â€” treat a nonzero exit as a failing suite and read the stderr below it.".into(),
+            description: "Run the project's test suite. Auto-detects the test runner from the repo (cargo test / npm|pnpm|yarn test / python -m pytest / go test / make test); pass an explicit `command` to override when a targeted run is needed (single test, extra flags). Bounded by timeout_secs (default 300). Returns the exit code plus a parsed pass/fail summary — treat a nonzero exit as a failing suite and read the stderr below it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -256,7 +272,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "verify".into(),
-            description: "Verify the project compiles/builds (and tests pass) using the build and test commands detected for the project's language (cargo build, go build, npm run build, dotnet build, tsc, ...). Runs build then test by default; `steps` narrows to just \"build\" or \"test\", and an explicit `command` overrides detection entirely. A nonzero exit means verification failed â€” read the stderr below it. Bounded by timeout_secs (default 600). Use this after writing or editing code to prove it still compiles.".into(),
+            description: "Verify the project compiles/builds (and tests pass) using the build and test commands detected for the project's language (cargo build, go build, npm run build, dotnet build, tsc, ...). Runs build then test by default; `steps` narrows to just \"build\" or \"test\", and an explicit `command` overrides detection entirely. A nonzero exit means verification failed — read the stderr below it. Bounded by timeout_secs (default 600). Use this after writing or editing code to prove it still compiles.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -268,7 +284,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "browser".into(),
-            description: "Open a URL in the user's default web browser so the running app can be visually inspected. Use AFTER starting a dev server (bash background=true + bg_output). Accepts http(s):// URLs and localhost:port-style addresses (http:// scheme is added automatically for bare host:port). The human looks at the page â€” tell them what to check and ask what they see.".into(),
+            description: "Open a URL in the user's default web browser so the running app can be visually inspected. Use AFTER starting a dev server (bash background=true + bg_output). Accepts http(s):// URLs and localhost:port-style addresses (http:// scheme is added automatically for bare host:port). The human looks at the page — tell them what to check and ask what they see.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": { "url": {"type": "string"} },
@@ -277,7 +293,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "web_fetch".into(),
-            description: "Fetch a URL over HTTP(S) and return its content as text. Use to scrape docs, read an API/endpoint response, download raw source, or inspect a web page the model needs to act on (the browser tool just opens it for a human â€” web_fetch returns the actual content here). max_chars caps the returned body (default 20000); selective=true strips HTML to approximate markdown text instead of returning raw HTML. Errors on non-2xx status and on obviously non-text content. Requires network access.".into(),
+            description: "Fetch a URL over HTTP(S) and return its content as text. Use to scrape docs, read an API/endpoint response, download raw source, or inspect a web page the model needs to act on (the browser tool just opens it for a human — web_fetch returns the actual content here). max_chars caps the returned body (default 20000); selective=true strips HTML to approximate markdown text instead of returning raw HTML. Errors on non-2xx status and on obviously non-text content. Requires network access.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -302,7 +318,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_skills".into(),
-            description: "List available skills (project `<project>/.agent/skills`, user `~/.zeus/skills`, and built-ins). Skills are just-in-time expertise packages â€” SKILL.md directories with instructions and bundled resources. Returns <tier> name â€” description plus tags. Call read_skill before acting on a skill you intend to use.".into(),
+            description: "List available skills (project `<project>/.agent/skills`, user `~/.zeus/skills`, and built-ins). Skills are just-in-time expertise packages — SKILL.md directories with instructions and bundled resources. Returns <tier> name — description plus tags. Call read_skill before acting on a skill you intend to use.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -312,7 +328,7 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         },
 ToolSpec {
             name: "read_skill".into(),
-            description: "Load a skill's full SKILL.md instructions into context by name. Use when a listed skill is relevant to the current task â€” it returns markdown instructions plus any bundled resource file names (which can then be read directly from the skill directory via the read tool). The skill's instructions may change HOW you approach the task, so read the full body, not just the description.".into(),
+            description: "Load a skill's full SKILL.md instructions into context by name. Use when a listed skill is relevant to the current task — it returns markdown instructions plus any bundled resource file names (which can then be read directly from the skill directory via the read tool). The skill's instructions may change HOW you approach the task, so read the full body, not just the description.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -325,7 +341,7 @@ ToolSpec {
         },
 ToolSpec {
             name: "read_document".into(),
-            description: "Extract text from binary/office documents for the model to act on: PDF, DOCX, XLSX (each worksheet as a row grid), PPTX (slides). Also handles plain-text formats via the read tool. max_chars caps returned text (default 20000). Use instead of read for .pdf/.docx/.pptx/.xlsx files â€” read would return binary garbage for those. Returns unsupported/missing files as errors. For scanned/image PDFs (no text layer) it errors and you should use read_image + the ui-design skill.".into(),
+            description: "Extract text from binary/office documents for the model to act on: PDF, DOCX, XLSX (each worksheet as a row grid), PPTX (slides). Also handles plain-text formats via the read tool. max_chars caps returned text (default 20000). Use instead of read for .pdf/.docx/.pptx/.xlsx files — read would return binary garbage for those. Returns unsupported/missing files as errors. For scanned/image PDFs (no text layer) it errors and you should use read_image + the ui-design skill.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -337,7 +353,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "read_image".into(),
-            description: "Read a local image file so a vision-capable model can SEE it (the binary image data is attached to the message). Supports PNG, JPEG, GIF, WEBP, BMP. Use for screenshots, UI mockups/design images, diagrams, scanned docs â€” anything you must inspect visually or recreate/design from. The companion text result states the resolved path and dimensions hint if known. For scanned PDFs (no text layer) pair with the ui-design + document-reading skills.".into(),
+            description: "Read a local image file so a vision-capable model can SEE it (the binary image data is attached to the message). Supports PNG, JPEG, GIF, WEBP, BMP. Use for screenshots, UI mockups/design images, diagrams, scanned docs — anything you must inspect visually or recreate/design from. The companion text result states the resolved path and dimensions hint if known. For scanned PDFs (no text layer) pair with the ui-design + document-reading skills.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -348,7 +364,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "understand_repo".into(),
-            description: "Repository understanding: returns a deterministic snapshot of the project (language stack, frameworks, package manager, database, entry points, build/test commands, git status) plus â€” when a `topic` is given (e.g. \"authentication\") â€” a list of existing files/modules whose names relate to that topic. Read this or a targeted grep BEFORE writing new code, so you reuse existing modules instead of duplicating them.".into(),
+            description: "Repository understanding: returns a deterministic snapshot of the project (language stack, frameworks, package manager, database, entry points, build/test commands, git status) plus — when a `topic` is given (e.g. \"authentication\") — a list of existing files/modules whose names relate to that topic. Read this or a targeted grep BEFORE writing new code, so you reuse existing modules instead of duplicating them.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -358,7 +374,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "rag_search".into(),
-            description: "Keyword-based retrieval over the project's source files: chunks each file and ranks chunks against the query with BM25-style term weights (no model call, read-only, works offline). Use when you need to find code that is about a concept but may not contain the exact identifier/string you would grep for â€” e.g. \"where is connection retry handled\" or \"which code touches rate limiting\". Returns the top-k matching chunks with file paths. For exact-string lookup prefer grep; for symbol names use code_symbols.".into(),
+            description: "Keyword-based retrieval over the project's source files: chunks each file and ranks chunks against the query with BM25-style term weights (no model call, read-only, works offline). Use when you need to find code that is about a concept but may not contain the exact identifier/string you would grep for — e.g. \"where is connection retry handled\" or \"which code touches rate limiting\". Returns the top-k matching chunks with file paths. For exact-string lookup prefer grep; for symbol names use code_symbols.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -405,7 +421,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "device".into(),
-            description: "Test on an Android device via adb â€” over USB debugging or wireless (adb connect). Actions: devices (list USB+wireless), connect <host:port> (wireless debug), disconnect <host:port>, install <apk_path>, uninstall <package>, launch <package> [activity] (start the app), screenshot [out] (PNG into the project), screenrecord [out] [seconds] (MP4 screen capture, 1-30s, default 10), logcat [filter] [max_lines] (bounded crash/console dump), logcat_clear (reset the buffer), shell <command> (arbitrary device shell â€” the escape hatch), pair <host_port> <code> (wireless pairing), info (model / Android version / SDK), reverse [local_port] [device_port] (expose a host port on the device â€” needed for app/webview debugging), forward [local_port] [device_port] (expose a device port on the host), input <event> (UI automation: tap/swipe/keyevent/type), pull <remote> [out] (copy a file off the device), push <out> <remote> (copy a file onto the device). Requires the Android platform-tools `adb` on PATH and a device authorized for debugging.".into(),
+            description: "Test on an Android device via adb — over USB debugging or wireless (adb connect). Actions: devices (list USB+wireless), connect <host:port> (wireless debug), disconnect <host:port>, install <apk_path>, uninstall <package>, launch <package> [activity] (start the app), screenshot [out] (PNG into the project), screenrecord [out] [seconds] (MP4 screen capture, 1-30s, default 10), logcat [filter] [max_lines] (bounded crash/console dump), logcat_clear (reset the buffer), shell <command> (arbitrary device shell — the escape hatch), pair <host_port> <code> (wireless pairing), info (model / Android version / SDK), reverse [local_port] [device_port] (expose a host port on the device — needed for app/webview debugging), forward [local_port] [device_port] (expose a device port on the host), input <event> (UI automation: tap/swipe/keyevent/type), pull <remote> [out] (copy a file off the device), push <out> <remote> (copy a file onto the device). Requires the Android platform-tools `adb` on PATH and a device authorized for debugging.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -465,7 +481,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "git_show".into(),
-            description: "git show <commit-or-ref> â€” full diff/details for one commit.".into(),
+            description: "git show <commit-or-ref> — full diff/details for one commit.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": { "target": {"type": "string"} },
@@ -577,7 +593,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "git_push".into(),
-            description: "git push. force=true is denied by a built-in safety rule regardless of approval â€” force-pushing needs an explicit, narrower rule in project settings.".into(),
+            description: "git push. force=true is denied by a built-in safety rule regardless of approval — force-pushing needs an explicit, narrower rule in project settings.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -590,7 +606,7 @@ ToolSpec {
         // --- Git: history-rewriting / conflict-prone ---
         ToolSpec {
             name: "git_reset".into(),
-            description: "git reset. mode=\"hard\" is denied by a built-in safety rule regardless of approval (it discards working-tree changes) â€” use \"soft\" or \"mixed\" instead.".into(),
+            description: "git reset. mode=\"hard\" is denied by a built-in safety rule regardless of approval (it discards working-tree changes) — use \"soft\" or \"mixed\" instead.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -602,7 +618,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "git_revert".into(),
-            description: "Create a new commit that undoes the given commit (safer than reset â€” doesn't rewrite history).".into(),
+            description: "Create a new commit that undoes the given commit (safer than reset — doesn't rewrite history).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": { "target": {"type": "string"} },
@@ -620,7 +636,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "git_rebase".into(),
-            description: "Rebase the current branch onto another (rewrites history â€” use with care).".into(),
+            description: "Rebase the current branch onto another (rewrites history — use with care).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": { "onto": {"type": "string"} },
@@ -629,7 +645,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "git_merge".into(),
-            description: "Merge a branch into the current one. On conflict, the raw git output (naming the conflicting files) is returned â€” read those files to see the conflict markers.".into(),
+            description: "Merge a branch into the current one. On conflict, the raw git output (naming the conflicting files) is returned — read those files to see the conflict markers.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": { "branch": {"type": "string"} },
@@ -677,7 +693,7 @@ ToolSpec {
         },
         ToolSpec {
             name: "code_rename".into(),
-            description: "Propose a reference-update plan for renaming symbol `old` to `new` (word-boundary). Reports each file and the affected lines. It never writes â€” applying the edits is left to a separate review step.".into(),
+            description: "Propose a reference-update plan for renaming symbol `old` to `new` (word-boundary). Reports each file and the affected lines. It never writes — applying the edits is left to a separate review step.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -695,7 +711,7 @@ ToolSpec {
 /// The single source of truth for platform-CLI tool names. `dispatch_inner`
 /// routes any name in this list to `do_platform`, and the test suite asserts
 /// this list matches both `platform_tool_specs()` and the `do_platform`
-/// match arms â€” so adding a platform tool in one place without the others
+/// match arms — so adding a platform tool in one place without the others
 /// is a test failure, not a silent drift.
 pub const PLATFORM_TOOLS: &[&str] = &[
     "gh_issue_list",
@@ -1563,13 +1579,14 @@ pub struct ToolManager {
 }
 
 /// Tools that only observe state (files, git history, background task
-/// status) â€” safe to run in Plan mode. Everything else (writes, git
+/// status) — safe to run in Plan mode. Everything else (writes, git
 /// mutations, `bash`, MCP/plugin calls, whose side effects zeus can't
 /// characterize generically) is blocked while Plan mode is active.
 fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
         "read"
+            | "read_multiple"
             | "grep"
             | "glob"
             | "listdir"
@@ -1597,7 +1614,7 @@ fn is_read_only_tool(name: &str) -> bool {
             | "git_remote_list"
             | "git_tag_list"
             | "git_stash_list"
-            // Pure bookkeeping, no filesystem/process side effects â€” safe
+            // Pure bookkeeping, no filesystem/process side effects — safe
             // to let a read-only Plan-mode turn use for progress tracking
             // too, same as the reference product's own `todowrite` tool.
             | "todowrite"
@@ -1709,7 +1726,7 @@ impl ToolManager {
     /// Built-in tool specs plus one per tool exposed by each connected MCP
     /// server (name-prefixed `mcp__<server>__<tool>`) and each loaded native
     /// plugin (`plugin__<plugin>__<tool>`). This is what the agent loop
-    /// should advertise to the model â€” not `builtin_tool_specs()` alone.
+    /// should advertise to the model — not `builtin_tool_specs()` alone.
     pub fn all_tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs = builtin_tool_specs();
         for client in &self.mcp_clients {
@@ -1733,7 +1750,7 @@ impl ToolManager {
         specs
     }
 
-    /// Read-only subset of `all_tool_specs` â€” used for a `delegate`d
+    /// Read-only subset of `all_tool_specs` — used for a `delegate`d
     /// specialist consultation, which is deliberately restricted to
     /// inspecting the workspace and never mutating it regardless of what
     /// that persona's own tool allow-list would otherwise permit: the
@@ -1750,7 +1767,7 @@ impl ToolManager {
     /// "ask" prompts are routed through `approver`. Wrapped by the
     /// `pre-tool-use` hook (can block or rewrite the arguments) and the
     /// `post-tool-use` hook (its output, if any, is appended to the result
-    /// so the model actually sees it â€” see the Hooks design note on
+    /// so the model actually sees it — see the Hooks design note on
     /// diagnostics/test hooks).
     pub fn dispatch_with_approver<F>(
         &self,
@@ -1763,7 +1780,7 @@ impl ToolManager {
     {
         if self.plan_mode() && !is_read_only_tool(name) {
             return Ok(ToolResult::err(format!(
-                "blocked: Plan mode is active (read-only) â€” '{name}' would change something. \
+                "blocked: Plan mode is active (read-only) — '{name}' would change something. \
                  Press Tab to switch to Build mode to make changes."
             )));
         }
@@ -1786,7 +1803,7 @@ impl ToolManager {
         let result = match self.dispatch_inner(name, arguments, &mut approver) {
             Ok(r) => r,
             // The model called a tool with bad/missing arguments, or a
-            // name that doesn't exist â€” its own mistake, and a recoverable
+            // name that doesn't exist — its own mistake, and a recoverable
             // one: report it back as a normal (failed) tool result so the
             // model sees exactly what went wrong and can retry with
             // corrected arguments in the same turn, rather than one bad
@@ -1823,6 +1840,7 @@ impl ToolManager {
         match name {
             "todowrite" => self.do_todowrite(&args),
             "read" => self.do_read(&args),
+            "read_multiple" => self.do_read_multiple(&args),
             "write" => self.do_write(&args, approver),
             "edit" => self.do_edit(&args, approver),
             "delete" => self.do_delete(&args, approver),
@@ -1884,7 +1902,7 @@ impl ToolManager {
             "git_rebase" => self.do_git_rebase(&args, approver),
             "git_merge" => self.do_git_merge(&args, approver),
             // Platform-CLI integrations route through a single dispatch entry
-            // keyed off the shared `PLATFORM_TOOLS` registry (see above) â€”
+            // keyed off the shared `PLATFORM_TOOLS` registry (see above) —
             // names are asserted to match the spec list and the `do_platform`
             // match arms by the test suite.
             name if PLATFORM_TOOLS.contains(&name) => self.do_platform(name, &args, approver),
@@ -1901,7 +1919,7 @@ impl ToolManager {
     }
 
     /// Dispatch `plugin__tool` (the part after the `plugin__` prefix) to the
-    /// matching loaded native plugin. Permission-gated like MCP calls â€” a
+    /// matching loaded native plugin. Permission-gated like MCP calls — a
     /// native plugin call is at least as consequential as an external
     /// server call (more so: it runs in-process, see the trust-boundary
     /// warning in `plugin.rs`), so it gets no less scrutiny.
@@ -1951,7 +1969,7 @@ impl ToolManager {
     }
 
     /// Dispatch `server__tool` (the part after the `mcp__` prefix) to the
-    /// matching connected client. Permission-gated the same way as `bash` â€”
+    /// matching connected client. Permission-gated the same way as `bash` —
     /// external, server-defined actions get their own tool-name category, so
     /// they default to "ask" via the generic no-rule fallback (same as any
     /// tool with no tailored default) rather than silently inheriting
@@ -2033,7 +2051,7 @@ impl ToolManager {
 
     /// The actual checklist state update happens one layer up, in
     /// `Agent::drive_turn` (it inspects this call's arguments after
-    /// dispatch and emits `AgentEvent::TodosUpdated`) â€” `ToolManager` has
+    /// dispatch and emits `AgentEvent::TodosUpdated`) — `ToolManager` has
     /// no channel back to the UI, only validates the shape here and echoes
     /// a summary the model can see in its own tool-result.
     fn do_todowrite(&self, args: &Value) -> Result<ToolResult> {
@@ -2076,7 +2094,7 @@ impl ToolManager {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
         // Default-bounded read so an unguarded look at a huge generated file
-        // can't fill the context â€” and the header below always states the
+        // can't fill the context — and the header below always states the
         // visible window, so a partial read is never mistaken for the file.
         let eff_limit = limit.unwrap_or(1500);
         let start = offset.unwrap_or(0);
@@ -2091,7 +2109,7 @@ impl ToolManager {
                 let visible_end = (start + eff_limit).min(r.total_lines);
                 let header = if visible_end < r.total_lines {
                     format!(
-                        "[read {path}: lines {}-{} of {} â€” NOT the whole file; pass offset={visible_end} to continue]\n",
+                        "[read {path}: lines {}-{} of {} — NOT the whole file; pass offset={visible_end} to continue]\n",
                         r.start_line, visible_end, r.total_lines
                     )
                 } else {
@@ -2104,6 +2122,68 @@ impl ToolManager {
             }
             Err(e) => Ok(ToolResult::err(e.to_string())),
         }
+    }
+
+    /// Batch read: several paths in one call, each block bounded like `read`.
+    /// A single missing/unreadable path is reported inline as an error block
+    /// rather than failing the whole call, so the model can read a module
+    /// plus its tests in one round-trip even when one file has moved.
+    fn do_read_multiple(&self, args: &Value) -> Result<ToolResult> {
+        let paths: Vec<String> = args
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            return Ok(ToolResult::err(
+                "read_multiple needs a `paths` array of file paths".to_string(),
+            ));
+        }
+        const MAX_FILES: usize = 20;
+        if paths.len() > MAX_FILES {
+            return Ok(ToolResult::err(format!(
+                "read_multiple accepts at most {MAX_FILES} paths, got {}",
+                paths.len()
+            )));
+        }
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(1500);
+        let mut blocks = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let eff_limit = limit.max(1);
+            match self.workspace.files.read(
+                Path::new(path),
+                ReadOptions {
+                    offset: None,
+                    limit: Some(eff_limit),
+                },
+            ) {
+                Ok(r) => {
+                    let visible_end = eff_limit.min(r.total_lines);
+                    let marker = if visible_end < r.total_lines {
+                        format!(
+                            " (lines {}-{} of {}, pass read offset={visible_end} for more)",
+                            r.start_line, visible_end, r.total_lines
+                        )
+                    } else {
+                        format!(
+                            " (lines {}-{} of {})",
+                            r.start_line, visible_end, r.total_lines
+                        )
+                    };
+                    blocks.push(format!("=== {path}{marker} ===\n{}", r.content));
+                }
+                Err(e) => blocks.push(format!("--- {path}: {e} ---")),
+            }
+        }
+        Ok(ToolResult::ok(blocks.join("\n")))
     }
 
     fn do_write<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
@@ -2248,7 +2328,7 @@ impl ToolManager {
                     .join("\n");
                 if capped {
                     text.push_str(&format!(
-                        "\n[truncated: hit the {max_matches}-match cap â€” MORE matches exist. Refine the pattern/glob or raise max before concluding anything is exhaustive.]"
+                        "\n[truncated: hit the {max_matches}-match cap — MORE matches exist. Refine the pattern/glob or raise max before concluding anything is exhaustive.]"
                     ));
                 }
                 Ok(ToolResult::ok(if text.is_empty() {
@@ -2274,7 +2354,7 @@ impl ToolManager {
                     .join("\n");
                 if capped {
                     text.push_str(&format!(
-                        "\n[truncated: hit the {max}-file cap â€” more files match. Narrow the pattern or raise max before treating this as the full list.]"
+                        "\n[truncated: hit the {max}-file cap — more files match. Narrow the pattern or raise max before treating this as the full list.]"
                     ));
                 }
                 Ok(ToolResult::ok(if text.is_empty() {
@@ -2303,7 +2383,7 @@ impl ToolManager {
                 )));
             }
         }
-        // Writes `.agent/index.json` below â€” needs the same gate every other
+        // Writes `.agent/index.json` below — needs the same gate every other
         // mutating tool goes through. Previously had none at all, and was
         // misclassified as read-only (letting it run even in Plan mode,
         // which is supposed to guarantee nothing changes); see
@@ -2413,7 +2493,7 @@ impl ToolManager {
                     .join("\n");
                 if capped {
                     text.push_str(&format!(
-                        "\n[truncated: hit the {max}-reference cap â€” MORE references may exist. Raise max or refine before treating this as exhaustive.]"
+                        "\n[truncated: hit the {max}-reference cap — MORE references may exist. Raise max or refine before treating this as exhaustive.]"
                     ));
                 }
                 Ok(ToolResult::ok(if text.is_empty() {
@@ -2465,7 +2545,7 @@ impl ToolManager {
                 shown.join(", ") + suffix
             ));
         }
-        out.push_str("Plan only â€” review and apply the edits yourself before they take effect.");
+        out.push_str("Plan only — review and apply the edits yourself before they take effect.");
         Ok(ToolResult::ok(out))
     }
 
@@ -2480,13 +2560,13 @@ impl ToolManager {
             .unwrap_or(false);
 
         if background {
-            // Soft-fail like every other permission ask in this file â€” a
+            // Soft-fail like every other permission ask in this file — a
             // denial here is a normal, model-reachable outcome (the model
             // asked to background a command and the user said no), not a
             // system failure. The bare `.map_err(..)?` this replaced hard-
             // aborted the whole turn on denial, same bug class already
             // fixed for `InvalidArguments`/`UnknownTool` at the dispatch
-            // level â€” this one just didn't route through that catch yet.
+            // level — this one just didn't route through that catch yet.
             if let Err(e) = self.workspace.files.gate.enforce(
                 &PermissionRequest {
                     tool: "bash".into(),
@@ -2517,7 +2597,7 @@ impl ToolManager {
             timeout,
             sandbox: Sandbox::RestrictedFs,
             profile: CommandProfile::Foreground,
-            // See TerminalOptions::new's doc comment â€” PTY exit-detection is
+            // See TerminalOptions::new's doc comment — PTY exit-detection is
             // unreliable on this setup, so the model-facing tool stays on
             // the well-proven piped path until that's root-caused.
             use_pty: false,
@@ -2650,15 +2730,19 @@ impl ToolManager {
             match steps.as_str() {
                 "build" => match &build_cmd {
                     Some(c) => to_run.push(c.clone()),
-                    None => return Ok(ToolResult::err(format!(
+                    None => {
+                        return Ok(ToolResult::err(format!(
                         "no build command configured for {lang_name} — pass an explicit `command`"
-                    ))),
+                    )))
+                    }
                 },
                 "test" => match &test_cmd {
                     Some(c) => to_run.push(c.clone()),
-                    None => return Ok(ToolResult::err(format!(
+                    None => {
+                        return Ok(ToolResult::err(format!(
                         "no test command configured for {lang_name} — pass an explicit `command`"
-                    ))),
+                    )))
+                    }
                 },
                 _ => {
                     if let Some(c) = &build_cmd {
@@ -2722,14 +2806,14 @@ impl ToolManager {
 
     /// Open a URL in the default browser for visual verification of a
     /// running app. Launch-and-forget: spawns the platform opener and
-    /// returns immediately â€” the browser window stays open on the user's
+    /// returns immediately — the browser window stays open on the user's
     /// machine while the agent keeps talking to them about what they see.
     fn do_browser(&self, args: &Value) -> Result<ToolResult> {
         let url = Self::str_arg(args, "url")?;
         let url = url.trim();
         match open_browser_url(url) {
             Ok(()) => Ok(ToolResult::ok(format!(
-                "opened {url} in the default browser â€” the user is looking at it now. Readable Chrome DevTools-level DOM/inspection is not available from here; tell the user what to verify (layout, console errors, requests) and ask what they observe."
+                "opened {url} in the default browser — the user is looking at it now. Readable Chrome DevTools-level DOM/inspection is not available from here; tell the user what to verify (layout, console errors, requests) and ask what they observe."
             ))),
             Err(e) => Ok(ToolResult::err(format!(
                 "couldn't open {url}: {e}. On non-GUI/headless machines there may be no browser to launch."
@@ -2737,7 +2821,7 @@ impl ToolManager {
         }
     }
 
-    /// Fetch a URL over HTTP(S) and return its content to the model â€” the
+    /// Fetch a URL over HTTP(S) and return its content to the model — the
     /// actual web-scrape counterpart to `browser` (which only opens a page).
     /// Follows redirects, caps the body, and strips HTML to approximate text
     /// by default so the model gets readable content rather than raw markup.
@@ -2746,7 +2830,7 @@ impl ToolManager {
         let url = url.trim();
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Ok(ToolResult::err(format!(
-                "'{url}' isn't an http(s) URL â€” web_fetch needs an absolute http:// or https:// address"
+                "'{url}' isn't an http(s) URL — web_fetch needs an absolute http:// or https:// address"
             )));
         }
         let max_chars = args
@@ -2784,7 +2868,7 @@ impl ToolManager {
         let status = resp.status();
         if !status.is_success() {
             return Ok(ToolResult::err(format!(
-                "HTTP {status} for {url} â€” fetch only returns 2xx content"
+                "HTTP {status} for {url} — fetch only returns 2xx content"
             )));
         }
         let content_type = resp
@@ -2819,7 +2903,7 @@ impl ToolManager {
         Ok(ToolResult::ok(format!("# web_fetch {url}\n{content}")))
     }
 
-    /// `web_search` â€” query a public web search endpoint and return the top
+    /// `web_search` — query a public web search endpoint and return the top
     /// result titles/URLs/snippets. Uses DuckDuckGo's keyless HTML search
     /// (fast, no account/API key), so it works out of the box; the model
     /// should `web_fetch` the most promising result for full content.
@@ -2947,7 +3031,7 @@ impl ToolManager {
         by_name.into_values().collect()
     }
 
-    /// `list_skills` â€” the model's browseable catalog of available skills.
+    /// `list_skills` — the model's browseable catalog of available skills.
     fn do_list_skills(&self, args: &Value) -> Result<ToolResult> {
         let search = Self::opt_str_arg(args, "search")
             .map(|s| s.to_lowercase())
@@ -2972,7 +3056,7 @@ impl ToolManager {
                 format!(" [{}]", skill.tags.join(", "))
             };
             lines.push(format!(
-                "[{tier}] {name} â€” {desc}{tags}",
+                "[{tier}] {name} — {desc}{tags}",
                 name = skill.name,
                 desc = if skill.description.is_empty() {
                     "(no description)"
@@ -2994,7 +3078,7 @@ impl ToolManager {
         }
     }
 
-    /// `read_skill` â€” load a skill's SKILL.md body (+ bundled resources),
+    /// `read_skill` — load a skill's SKILL.md body (+ bundled resources),
     /// and optionally its `depends_on` chain so one call can compose a whole
     /// workflow (e.g. database â†’ backend â†’ frontend â†’ security â†’ testing).
     fn do_read_skill(&self, args: &Value) -> Result<ToolResult> {
@@ -3089,7 +3173,7 @@ impl ToolManager {
         Ok(ToolResult::ok(out))
     }
 
-    /// `read_document` â€” extract text from office/binaries so the model can
+    /// `read_document` — extract text from office/binaries so the model can
     /// read specs, reports, spreadsheets and slide decks.
     fn do_read_document(&self, args: &Value) -> Result<ToolResult> {
         let path = Self::str_arg(args, "path")?;
@@ -3103,12 +3187,8 @@ impl ToolManager {
         };
         match crate::docread::extract(&resolved, max_chars) {
             Ok(doc) => {
-                let mut text = format!(
-                    "# {} â€” {}\n\n{}",
-                    resolved.display(),
-                    doc.summary,
-                    doc.text
-                );
+                let mut text =
+                    format!("# {} — {}\n\n{}", resolved.display(), doc.summary, doc.text);
                 if text.chars().count() > max_chars {
                     text = text.chars().take(max_chars).collect::<String>();
                     text.push_str("\nâ€¦(truncated by tool cap)");
@@ -3122,7 +3202,7 @@ impl ToolManager {
         }
     }
 
-    /// `read_image` â€” expose a local image's bytes to a vision-capable model.
+    /// `read_image` — expose a local image's bytes to a vision-capable model.
     /// The binary data rides along on the ToolResult so the agent loop can
     /// attach it as a multimodal image part on the next request.
     fn do_read_image(&self, args: &Value) -> Result<ToolResult> {
@@ -3159,7 +3239,7 @@ impl ToolManager {
         let kb = bytes.len() as f64 / 1024.0;
         Ok(ToolResult {
             content: format!(
-                "Read image {} ({mime}, {kb:.0} KiB). The image data itself is attached to this message â€” describe what you see and use it as the design source.",
+                "Read image {} ({mime}, {kb:.0} KiB). The image data itself is attached to this message — describe what you see and use it as the design source.",
                 resolved.display(),
             ),
             is_error: false,
@@ -3167,7 +3247,7 @@ impl ToolManager {
         })
     }
 
-    /// `understand_repo` â€” deterministic project understanding + (optionally)
+    /// `understand_repo` — deterministic project understanding + (optionally)
     /// existing files relevant to a subject. No model call; the fingerprint
     /// is cached on the agent and shared so repeated calls are cheap.
     fn do_understand_repo(&self, args: &Value) -> Result<ToolResult> {
@@ -3188,7 +3268,7 @@ impl ToolManager {
         Ok(ToolResult::ok(text))
     }
 
-    /// `rag_search` â€” keyword-based retrieval over the project's source
+    /// `rag_search` — keyword-based retrieval over the project's source
     /// files. Reuses the persisted index at `.agent/rag_index.json` when it
     /// is still fresh; otherwise chunks every source file (see
     /// `zeus_rag::chunker`) in memory and ranks the chunks against `query`
@@ -3241,7 +3321,7 @@ impl ToolManager {
         )))
     }
 
-    /// `rag_index` â€” persist the RAG chunk index to `.agent/rag_index.json`
+    /// `rag_index` — persist the RAG chunk index to `.agent/rag_index.json`
     /// so subsequent `rag_search` calls reuse it instead of re-chunking the
     /// whole project. Writes below `.agent/`, so it goes through the same
     /// permission gate as every other mutating tool (and is deliberately NOT
@@ -3402,7 +3482,7 @@ impl ToolManager {
         }
     }
 
-    /// `memory_write` â€” persist a long-term project memory note.
+    /// `memory_write` — persist a long-term project memory note.
     fn do_memory_write<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
@@ -3431,7 +3511,7 @@ impl ToolManager {
         }
     }
 
-    /// Drive an attached Android device/emulator through `adb` â€” USB or
+    /// Drive an attached Android device/emulator through `adb` — USB or
     /// wireless. Individual operations (list/connect/install/launch/logcat/
     /// screenshot/shell) are implemented in `DeviceEngine`; this layer parses
     /// the tool arguments and formats the result for the model.
@@ -3465,7 +3545,7 @@ impl ToolManager {
                 | "push"
         ) {
             return Ok(ToolResult::err(format!(
-                "unknown device action '{action}' â€” use one of: devices, connect, disconnect, install, uninstall, launch, screenshot, screenrecord, logcat, logcat_clear, shell, pair, info, reverse, forward, input, pull, push"
+                "unknown device action '{action}' — use one of: devices, connect, disconnect, install, uninstall, launch, screenshot, screenrecord, logcat, logcat_clear, shell, pair, info, reverse, forward, input, pull, push"
             )));
         }
 
@@ -3606,7 +3686,7 @@ impl ToolManager {
 }
 
 /// Render a `GitOutput` (or the permission/spawn error that prevented one)
-/// as a `ToolResult` â€” a non-zero exit is a soft error visible to the model
+/// as a `ToolResult` — a non-zero exit is a soft error visible to the model
 /// (so it can read `git`'s own message and react), not a hard `Err` that
 /// would abort the tool-call cycle. Matches the same convention already
 /// used for `bash` and every other tool here.
@@ -3629,7 +3709,7 @@ fn git_result(result: zeus_fs::Result<GitOutput>) -> Result<ToolResult> {
 
 /// Same convention as `git_result`/`platform_result` for the adb-backed
 /// device engine. `DeviceOutput.success` is false when the command exits
-/// nonzero OR the capture itself failed (no device, timeout) â€” in both cases
+/// nonzero OR the capture itself failed (no device, timeout) — in both cases
 /// zeus must present it as an error so the model can react, not shrug.
 fn device_result(out: zeus_fs::DeviceOutput) -> ToolResult {
     let artifact = out
@@ -3727,9 +3807,7 @@ fn open_browser_url(url: &str) -> std::io::Result<()> {
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!(
-                "'{url}' isn't a usable web URL â€” expect something like http://localhost:5173"
-            ),
+            format!("'{url}' isn't a usable web URL — expect something like http://localhost:5173"),
         ));
     }
 
@@ -3956,6 +4034,51 @@ mod tests {
     }
 
     #[test]
+    fn read_multiple_reads_batch_and_reports_missing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.txt"), "beta\n").unwrap();
+        let tm = tool_manager(&root);
+        let r = tm
+            .dispatch_with_approver(
+                "read_multiple",
+                r#"{"paths":["a.txt","b.txt","missing.txt"]}"#,
+                approve,
+            )
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        // Both present files returned as headed blocks.
+        assert!(r.content.contains("=== a.txt"), "{}", r.content);
+        assert!(r.content.contains("=== b.txt"), "{}", r.content);
+        assert!(r.content.contains("alpha"), "{}", r.content);
+        assert!(r.content.contains("beta"), "{}", r.content);
+        // Missing file is an inline error block, not a whole-call failure.
+        assert!(r.content.contains("--- missing.txt"), "{}", r.content);
+    }
+
+    #[test]
+    fn read_multiple_errors_on_empty_or_oversized_batch() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        let empty = tm
+            .dispatch_with_approver("read_multiple", r#"{"paths":[]}"#, approve)
+            .unwrap();
+        assert!(empty.is_error, "{}", empty.content);
+        let many = format!(
+            r#"{{"paths":{}}}"#,
+            serde_json::to_string(&vec!["x"; 21]).unwrap()
+        );
+        let oversized = tm
+            .dispatch_with_approver("read_multiple", &many, approve)
+            .unwrap();
+        assert!(oversized.is_error, "{}", oversized.content);
+        assert!(oversized.content.contains("20"), "{}", oversized.content);
+    }
+
+    #[test]
     fn mkdir_tool_creates_directory_scaffold() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("proj");
@@ -4023,6 +4146,50 @@ mod tests {
     }
 
     #[test]
+    fn verify_runs_explicit_command_and_reports_exit_code() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        // Explicit command that succeeds -> not an error.
+        let ok = tm
+            .dispatch_with_approver("verify", r#"{"command":"exit 0"}"#, approve)
+            .unwrap();
+        assert!(!ok.is_error, "{}", ok.content);
+        assert!(ok.content.contains("exit=Some(0)"), "{}", ok.content);
+        // Explicit command that fails -> surfaced as a failed ToolResult.
+        let fail = tm
+            .dispatch_with_approver("verify", r#"{"command":"exit 1"}"#, approve)
+            .unwrap();
+        assert!(fail.is_error, "{}", fail.content);
+        assert!(fail.content.contains("exit=Some(1)"), "{}", fail.content);
+    }
+
+    #[test]
+    fn verify_without_detection_and_without_command_errors() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let tm = tool_manager(&root);
+        // No language detected, no explicit command -> helpful error, not a crash.
+        let r = tm.dispatch_with_approver("verify", "{}", approve).unwrap();
+        assert!(r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("couldn't detect") || r.content.contains("no build command"),
+            "{}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn verify_not_in_read_only_tool_list() {
+        // verify spawns build processes like bash/test — must not run in
+        // read-only Plan mode.
+        assert!(!is_read_only_tool("verify"));
+        assert!(!is_read_only_tool("test"));
+        assert!(!is_read_only_tool("bash"));
+    }
+
+    #[test]
     fn plan_mode_blocks_mutating_tools_but_allows_read_only() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("proj");
@@ -4060,7 +4227,7 @@ mod tests {
     #[test]
     fn unknown_tool_errors() {
         // Calling an unknown tool is the model's own mistake, and
-        // recoverable â€” it comes back as a failed `ToolResult` (so the
+        // recoverable — it comes back as a failed `ToolResult` (so the
         // model sees the mistake and can retry) rather than a hard `Err`
         // that would kill the whole turn with no chance to self-correct.
         let tmp = TempDir::new().unwrap();
@@ -4112,7 +4279,7 @@ mod tests {
         let root = tmp.path().join("proj");
         let tm = tool_manager(&root);
         // build-app composes project-orientation, database, api, frontend,
-        // security, qa-testing, documentation â€” a single read_skill call
+        // security, qa-testing, documentation — a single read_skill call
         // loads the whole chain.
         let r = tm
             .dispatch_with_approver(
@@ -4482,7 +4649,7 @@ mod tests {
             .unwrap();
         assert!(r.is_error);
         assert!(r.content.contains("non-empty"));
-        // Missing `query` is the model's own mistake, and recoverable â€”
+        // Missing `query` is the model's own mistake, and recoverable —
         // it comes back as a failed `ToolResult` (so the model sees the
         // mistake and can retry) rather than a hard dispatch error that
         // would kill the whole turn with no chance to self-correct.
@@ -4745,7 +4912,7 @@ mod tests {
             // `dispatch_with_approver` now soft-fails both InvalidArguments
             // and UnknownTool into `Ok(ToolResult::err(...))` instead of
             // returning `Err`, so `Err(AgentError::UnknownTool(_))` can no
-            // longer surface here at all â€” checking for it (the old form of
+            // longer surface here at all — checking for it (the old form of
             // this test) would pass unconditionally regardless of whether a
             // spec has a real handler. Check the error text `dispatch_inner`
             // actually produces for an unmatched name instead: missing
@@ -4783,8 +4950,8 @@ mod tests {
 
         let tm = tool_manager(&root);
 
-        // Real file, staged and committed through the tool dispatch layer â€”
-        // not calling GitEngine directly â€” proving hooks/permission
+        // Real file, staged and committed through the tool dispatch layer —
+        // not calling GitEngine directly — proving hooks/permission
         // wrapping and JSON argument parsing all work together, not just
         // the underlying engine in isolation.
         std::fs::write(root.join("a.txt"), "hello").unwrap();
@@ -4807,7 +4974,7 @@ mod tests {
             .unwrap();
         assert!(!status.is_error);
 
-        // Force-push must be denied even though the approver would allow â€”
+        // Force-push must be denied even though the approver would allow —
         // proves the built-in rule reaches all the way through the tool
         // dispatch layer, not just the GitEngine unit tests.
         let force_push = tm
@@ -4904,7 +5071,7 @@ mod tests {
         let tm = tool_manager(&root);
 
         // A path-ish target isn't a web URL and must not be handed as-is to
-        // the opener (argument-injection guard â€” never spawn in this test).
+        // the opener (argument-injection guard — never spawn in this test).
         let bad = tm
             .dispatch_with_approver("browser", r#"{"url":"C:/Windows/System32"}"#, approve)
             .unwrap();
@@ -4922,7 +5089,7 @@ mod tests {
 
     /// The `PLATFORM_TOOLS` registry is the single source of truth: every
     /// spec advertised to the model must be in it (dispatchable), and
-    /// everything in it must be advertised â€” so adding a platform tool in
+    /// everything in it must be advertised — so adding a platform tool in
     /// one table but not the other is a test failure, not silent drift.
     #[test]
     fn platform_tools_registry_matches_specs_and_dispatch() {
@@ -4938,7 +5105,7 @@ mod tests {
         assert_eq!(
             spec_sorted, registry_sorted,
             "PLATFORM_TOOLS registry and platform_tool_specs() disagree on the \
-             platform tool list â€” keep them identical"
+             platform tool list — keep them identical"
         );
 
         // Every registered name must actually be handled by `do_platform`'s
@@ -4950,7 +5117,7 @@ mod tests {
         for name in &registry {
             let tm = tool_manager(std::path::Path::new("/does/not/matter"));
             let r = tm.dispatch_with_approver(name, "{}", approve).unwrap();
-            // A real platform call will fail on a missing CLI/auth â€” that's
+            // A real platform call will fail on a missing CLI/auth — that's
             // fine. What must never happen is UnknownTool (no handler).
             assert!(
                 !r.content.contains("unknown tool"),

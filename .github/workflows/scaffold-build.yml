@@ -8,6 +8,17 @@ on:
   pull_request:
 
 jobs:
+  lint-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse workflow + script CI
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 -c "import glob, yaml; [yaml.safe_load(open(f)) for f in glob.glob('.github/workflows/*.yml')]; print('workflow yaml ok')"
+          bash -n scripts/verify-scaffolds.sh
+          echo "script syntax ok"
+
   scaffold-build:
     runs-on: ubuntu-latest
     steps:

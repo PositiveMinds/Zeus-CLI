@@ -358,9 +358,7 @@ impl TerminalRunner {
         builder.cwd(&opts.cwd);
         if opts.sandbox == Sandbox::RestrictedFs {
             builder.env_clear();
-            if let Ok(path) = std::env::var("PATH") {
-                builder.env("PATH", path);
-            }
+            builder.env("PATH", sandboxed_path());
             if cfg!(windows) {
                 for var in [
                     "SYSTEMROOT",
@@ -486,9 +484,7 @@ fn build_command(command: &str, opts: &TerminalOptions) -> Command {
     };
     if opts.sandbox == Sandbox::RestrictedFs {
         cmd.env_clear();
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
-        }
+        cmd.env("PATH", sandboxed_path());
         if cfg!(windows) {
             for var in [
                 "SYSTEMROOT",
@@ -505,6 +501,60 @@ fn build_command(command: &str, opts: &TerminalOptions) -> Command {
         }
     }
     cmd
+}
+
+/// The PATH the agent's sandboxed terminal should see: the parent PATH plus
+/// the common user-local toolchain dirs (rustup's `~/.cargo/bin`, `~/go/bin`,
+/// dotnet global tools, winget shims), appended when present on disk.
+/// Installers often forget to register these on the system PATH; without this
+/// the agent's `verify`/`bash` can't find cargo/go/dotnet even though they're
+/// installed.
+fn sandboxed_path() -> String {
+    let original = std::env::var("PATH").unwrap_or_default();
+    let home = std::env::var("USERPROFILE")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from));
+    match home {
+        Some(h) => augment_path(&original, &h),
+        None => original,
+    }
+}
+
+/// Append `home`-relative toolchain dirs to an existing PATH string when they
+/// exist on disk and aren't already listed. Existing entries keep their order
+/// and precedence; appends only add what would otherwise be missing.
+fn augment_path(original: &str, home: &std::path::Path) -> String {
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(original).collect();
+    let present: std::collections::HashSet<String> = dirs
+        .iter()
+        .map(|p| p.to_string_lossy().to_ascii_lowercase())
+        .collect();
+    let mut appended: Vec<PathBuf> = Vec::new();
+    for rel in [
+        ".cargo/bin",
+        "go/bin",
+        ".dotnet/tools",
+        "AppData/Local/Microsoft/WinGet/Links",
+        "AppData/Roaming/npm",
+        ".local/bin",
+    ] {
+        let dir = home.join(rel);
+        if dir.is_dir() {
+            let key = dir.to_string_lossy().to_ascii_lowercase();
+            if !present.contains(&key) {
+                appended.push(dir);
+            }
+        }
+    }
+    if appended.is_empty() {
+        return original.to_string();
+    }
+    dirs.extend(appended);
+    std::env::join_paths(dirs)
+        .unwrap_or_else(|_| std::ffi::OsStr::new(original).to_os_string())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn spawn_reader<R: std::io::Read + Send + 'static>(
@@ -891,6 +941,36 @@ mod tests {
 
     fn echo_command(msg: &str) -> String {
         format!("echo {msg}")
+    }
+
+    #[test]
+    fn augment_path_appends_existing_user_toolchain_dirs() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cargo/bin")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("go/bin")).unwrap();
+        let original = "C:\\Windows;C:\\System32";
+        let out = augment_path(original, tmp.path());
+        assert!(out.contains(".cargo"), "{out}");
+        assert!(out.contains("go"), "{out}");
+        // Original entries keep their position and precedence.
+        assert!(out.starts_with("C:\\Windows"), "{out}");
+    }
+
+    #[test]
+    fn augment_path_skips_missing_dirs_and_dedupes() {
+        let tmp = TempDir::new().unwrap();
+        // No toolchain dirs exist under the fake home -> unchanged.
+        let original = "C:\\Windows;C:\\System32";
+        assert_eq!(augment_path(original, tmp.path()), original);
+        // Already-listed dirs are not duplicated.
+        let home_with_cargo = tmp.path().join("home");
+        std::fs::create_dir_all(home_with_cargo.join(".cargo/bin")).unwrap();
+        let already = format!(
+            "{};C:\\Windows",
+            home_with_cargo.join(".cargo/bin").display()
+        );
+        let out = augment_path(&already, &home_with_cargo);
+        assert_eq!(out.matches(".cargo").count(), 1, "{out}");
     }
 
     #[test]
