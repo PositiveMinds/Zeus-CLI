@@ -13,9 +13,11 @@
 //! rendering or key handling) and handed back once the turn completes.
 //! Permission prompts from inside that task are bridged back to this render
 //! loop as a modal: the tool-dispatch code's synchronous approver closure
-//! blocks on a `std::sync::mpsc` reply channel until a keypress here answers
-//! it — an intentional, bounded exception to "never block an async task",
-//! justified because waiting on a human is inherently slow anyway.
+//! waits on a `tokio::sync::oneshot` reply channel until a keypress here
+//! answers it, wrapped in `tokio::task::block_in_place` so the wait never
+//! pins a runtime worker thread — waiting on a human is inherently slow, so
+//! this bounded bridge is the deliberate exception to "never block an async
+//! task".
 
 use crate::{
     build_agent_repl_with, build_agent_repl_with_session, expand_slash_command,
@@ -67,10 +69,44 @@ use pickers::*;
 mod favorites;
 use favorites::*;
 
-/// A pending permission ask, bridged out of the spawned turn task.
+/// A pending permission ask, bridged out of the spawned turn task. The reply
+/// is a oneshot so a modal ask can be answered at most once; dropping the
+/// sender (turn cancelled, app closing) resolves the waiting approver as a
+/// deny.
 struct ApprovalRequestMsg {
     request: PermissionRequest,
-    reply: std::sync::mpsc::Sender<ApprovalDecision>,
+    reply: tokio::sync::oneshot::Sender<ApprovalDecision>,
+}
+
+/// Bridge one permission ask from the synchronous tool-dispatch approver into
+/// the render loop as a modal, then wait for the answer.
+///
+/// The tool-dispatch chain through `zeus-agent`/`zeus-fs` is synchronous
+/// (`FnMut(&PermissionRequest) -> ApprovalDecision`), so the wait can't be a
+/// polled async await. It happens on a *blocked worker thread* instead — but
+/// `tokio::task::block_in_place` hands that worker back to the runtime, so
+/// the render loop and key handling keep running while we wait rather than
+/// every approval pinning a worker hostage. Only safe on the multi-thread
+/// runtime `main.rs` builds; `--yes` short-circuits before any ask.
+fn build_approver(
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    yes: bool,
+) -> impl FnMut(&PermissionRequest) -> ApprovalDecision + Send {
+    let tx_approval = ui_tx.clone();
+    move |req: &PermissionRequest| -> ApprovalDecision {
+        if yes {
+            return ApprovalDecision::Approved;
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
+            request: req.clone(),
+            reply: reply_tx,
+        }));
+        match tokio::task::block_in_place(|| reply_rx.blocking_recv()) {
+            Ok(decision) => decision,
+            Err(_) => ApprovalDecision::Denied,
+        }
+    }
 }
 
 enum UiEvent {
@@ -3031,17 +3067,7 @@ fn start_turn(
         let on_event = move |ev: AgentEvent| {
             let _ = tx_events.send(UiEvent::Agent(ev));
         };
-        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
-            if yes {
-                return ApprovalDecision::Approved;
-            }
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
-                request: req.clone(),
-                reply: reply_tx,
-            }));
-            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
-        };
+        let approver = build_approver(&tx_approval, yes);
         let result = agent.run_turn(&message, on_event, approver).await;
         (agent, result)
     });
@@ -3076,17 +3102,7 @@ fn start_plan_turn(
         let on_event = move |ev: AgentEvent| {
             let _ = tx_events.send(UiEvent::Agent(ev));
         };
-        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
-            if yes {
-                return ApprovalDecision::Approved;
-            }
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
-                request: req.clone(),
-                reply: reply_tx,
-            }));
-            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
-        };
+        let approver = build_approver(&tx_approval, yes);
         let result = agent.plan_turn(&message, on_event, approver).await;
         (agent, result)
     });
@@ -3121,17 +3137,7 @@ fn start_orchestrate_turn(
         let on_event = move |ev: AgentEvent| {
             let _ = tx_events.send(UiEvent::Agent(ev));
         };
-        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
-            if yes {
-                return ApprovalDecision::Approved;
-            }
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
-                request: req.clone(),
-                reply: reply_tx,
-            }));
-            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
-        };
+        let approver = build_approver(&tx_approval, yes);
         let result = agent
             .orchestrate(&goal, on_event, approver)
             .await
@@ -3167,17 +3173,7 @@ fn start_understand_turn(
         let on_event = move |ev: AgentEvent| {
             let _ = tx_events.send(UiEvent::Agent(ev));
         };
-        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
-            if yes {
-                return ApprovalDecision::Approved;
-            }
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
-                request: req.clone(),
-                reply: reply_tx,
-            }));
-            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
-        };
+        let approver = build_approver(&tx_approval, yes);
         let result = agent.understand_topic(&topic, on_event, approver).await;
         (agent, result)
     });
@@ -3205,17 +3201,7 @@ fn start_orient_turn(
         let on_event = move |ev: AgentEvent| {
             let _ = tx_events.send(UiEvent::Agent(ev));
         };
-        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
-            if yes {
-                return ApprovalDecision::Approved;
-            }
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
-                request: req.clone(),
-                reply: reply_tx,
-            }));
-            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
-        };
+        let approver = build_approver(&tx_approval, yes);
         let result = agent.orient_turn(on_event, approver).await;
         (agent, result)
     });
@@ -3242,17 +3228,7 @@ fn start_review_turn(
         let on_event = move |ev: AgentEvent| {
             let _ = tx_events.send(UiEvent::Agent(ev));
         };
-        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
-            if yes {
-                return ApprovalDecision::Approved;
-            }
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
-                request: req.clone(),
-                reply: reply_tx,
-            }));
-            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
-        };
+        let approver = build_approver(&tx_approval, yes);
         let result = agent.review_turn(on_event, approver).await;
         (agent, result)
     });
@@ -3279,17 +3255,7 @@ fn start_suggest_turn(
         let on_event = move |ev: AgentEvent| {
             let _ = tx_events.send(UiEvent::Agent(ev));
         };
-        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
-            if yes {
-                return ApprovalDecision::Approved;
-            }
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
-                request: req.clone(),
-                reply: reply_tx,
-            }));
-            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
-        };
+        let approver = build_approver(&tx_approval, yes);
         let result = agent.suggest_turn(on_event, approver).await;
         (agent, result)
     });
@@ -3319,17 +3285,7 @@ fn start_workflow_turn(
         let on_event = move |ev: AgentEvent| {
             let _ = tx_events.send(UiEvent::Agent(ev));
         };
-        let approver = move |req: &PermissionRequest| -> ApprovalDecision {
-            if yes {
-                return ApprovalDecision::Approved;
-            }
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx_approval.send(UiEvent::Approval(ApprovalRequestMsg {
-                request: req.clone(),
-                reply: reply_tx,
-            }));
-            reply_rx.recv().unwrap_or(ApprovalDecision::Denied)
-        };
+        let approver = build_approver(&tx_approval, yes);
         let result = agent
             .run_workflow(&goal, &workflow, on_event, approver)
             .await
@@ -3342,6 +3298,27 @@ fn start_workflow_turn(
         (agent, result)
     });
     *turn_handle = Some(handle);
+}
+
+/// Recompute the model picker's selection after the search string changed:
+/// the current `selected` index may now point at a header row or past the
+/// end of the filtered list, so jump back to the first model row. A no-op
+/// if the picker isn't open — callers run it right after mutating the
+/// search, when `Mode::ModelPicker` is guaranteed by the surrounding guard.
+fn model_picker_nudge_to_first(state: &mut AppState) {
+    if let Mode::ModelPicker { entries, selected } = &mut state.mode {
+        let filtered = model_picker_filtered(entries, &state.model_picker_search);
+        *selected = first_selectable_picker(&filtered);
+    }
+}
+
+/// Move the model picker's selection one step in `dir` (`1`/`-1`), skipping
+/// headers and wrapping, without ever panicking if the mode changed.
+fn model_picker_nudge(state: &mut AppState, dir: isize) {
+    if let Mode::ModelPicker { entries, selected } = &mut state.mode {
+        let filtered = model_picker_filtered(entries, &state.model_picker_search);
+        *selected = picker_move(&filtered, *selected, dir);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3482,42 +3459,31 @@ async fn handle_key(
             return Ok(());
         }
         if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            let Mode::ModelPicker { entries, selected } = &state.mode else {
-                unreachable!()
-            };
-            let filtered = model_picker_filtered(entries, &state.model_picker_search);
-            if let Some(PickerEntry::Model { provider, model }) = filtered.get(*selected) {
-                let (provider, model_id) = (provider.clone(), model.id.clone());
-                state.toggle_favorite_model(&provider, &model_id, config);
+            if let Mode::ModelPicker { entries, selected } = &state.mode {
+                let filtered = model_picker_filtered(entries, &state.model_picker_search);
+                if let Some(PickerEntry::Model { provider, model }) = filtered.get(*selected) {
+                    let (provider, model_id) = (provider.clone(), model.id.clone());
+                    state.toggle_favorite_model(&provider, &model_id, config);
+                }
             }
             return Ok(());
         }
         match key.code {
-            KeyCode::Up => {
-                let Mode::ModelPicker { entries, selected } = &mut state.mode else {
-                    unreachable!()
-                };
-                let filtered = model_picker_filtered(entries, &state.model_picker_search);
-                *selected = picker_move(&filtered, *selected, -1);
-            }
-            KeyCode::Down => {
-                let Mode::ModelPicker { entries, selected } = &mut state.mode else {
-                    unreachable!()
-                };
-                let filtered = model_picker_filtered(entries, &state.model_picker_search);
-                *selected = picker_move(&filtered, *selected, 1);
-            }
+            KeyCode::Up => model_picker_nudge(state, -1),
+            KeyCode::Down => model_picker_nudge(state, 1),
             KeyCode::Enter => {
-                let Mode::ModelPicker { entries, selected } = &state.mode else {
-                    unreachable!()
-                };
-                let filtered = model_picker_filtered(entries, &state.model_picker_search);
-                let chosen = match filtered.get(*selected) {
-                    Some(PickerEntry::Model { provider, model }) => {
-                        Some((provider.clone(), model.id.clone()))
+                let chosen = match &state.mode {
+                    Mode::ModelPicker { entries, selected } => {
+                        let filtered = model_picker_filtered(entries, &state.model_picker_search);
+                        match filtered.get(*selected) {
+                            Some(PickerEntry::Model { provider, model }) => {
+                                Some((provider.clone(), model.id.clone()))
+                            }
+                            // A header row isn't a choice — leave the picker open
+                            // rather than silently closing it on a stray Enter.
+                            _ => None,
+                        }
                     }
-                    // A header row isn't a choice — leave the picker open
-                    // rather than silently closing it on a stray Enter.
                     _ => None,
                 };
                 if let Some((provider, model_id)) = chosen {
@@ -3530,19 +3496,11 @@ async fn handle_key(
             }
             KeyCode::Backspace => {
                 state.model_picker_search.pop();
-                let Mode::ModelPicker { entries, selected } = &mut state.mode else {
-                    unreachable!()
-                };
-                let filtered = model_picker_filtered(entries, &state.model_picker_search);
-                *selected = first_selectable_picker(&filtered);
+                model_picker_nudge_to_first(state);
             }
             KeyCode::Char(c) => {
                 state.model_picker_search.push(c);
-                let Mode::ModelPicker { entries, selected } = &mut state.mode else {
-                    unreachable!()
-                };
-                let filtered = model_picker_filtered(entries, &state.model_picker_search);
-                *selected = first_selectable_picker(&filtered);
+                model_picker_nudge_to_first(state);
             }
             _ => {}
         }
@@ -3552,29 +3510,29 @@ async fn handle_key(
     if let Mode::ProviderPicker { .. } = &state.mode {
         match key.code {
             KeyCode::Up => {
-                let Mode::ProviderPicker { entries, selected } = &mut state.mode else {
-                    unreachable!()
-                };
-                *selected = provider_picker_move(entries, *selected, -1);
+                if let Mode::ProviderPicker { entries, selected } = &mut state.mode {
+                    *selected = provider_picker_move(entries, *selected, -1);
+                }
             }
             KeyCode::Down => {
-                let Mode::ProviderPicker { entries, selected } = &mut state.mode else {
-                    unreachable!()
-                };
-                *selected = provider_picker_move(entries, *selected, 1);
+                if let Mode::ProviderPicker { entries, selected } = &mut state.mode {
+                    *selected = provider_picker_move(entries, *selected, 1);
+                }
             }
             KeyCode::Enter => {
-                let Mode::ProviderPicker { entries, selected } = &state.mode else {
-                    unreachable!()
+                let chosen = match &state.mode {
+                    Mode::ProviderPicker { entries, selected } => match entries.get(*selected) {
+                        Some(ProviderEntry::Provider { name, ready, .. }) => {
+                            Some((name.clone(), *ready))
+                        }
+                        // A header row isn't a choice — leave the picker open
+                        // rather than silently closing it on a stray Enter.
+                        _ => None,
+                    },
+                    _ => None,
                 };
-                match entries.get(*selected) {
-                    Some(ProviderEntry::Provider { name, ready, .. }) => {
-                        let (name, ready) = (name.clone(), *ready);
-                        apply_provider_picker_choice(name, ready, config, agent_slot, state);
-                    }
-                    // A header row isn't a choice — leave the picker open
-                    // rather than silently closing it on a stray Enter.
-                    Some(ProviderEntry::Header(_)) | None => {}
+                if let Some((name, ready)) = chosen {
+                    apply_provider_picker_choice(name, ready, config, agent_slot, state);
                 }
             }
             KeyCode::Esc => {
@@ -3588,10 +3546,11 @@ async fn handle_key(
     if let Mode::KeyEntry { .. } = &state.mode {
         match key.code {
             KeyCode::Enter => {
-                let Mode::KeyEntry { provider } = std::mem::replace(&mut state.mode, Mode::Chat)
-                else {
-                    unreachable!()
+                let provider = match &state.mode {
+                    Mode::KeyEntry { provider } => provider.clone(),
+                    _ => return Ok(()),
                 };
+                state.mode = Mode::Chat;
                 let key = std::mem::take(&mut state.input);
                 state.cursor = 0;
                 let key = key.trim().to_string();
@@ -4519,12 +4478,19 @@ async fn handle_mouse(
                         && ev.row < area.y + area.height
                     {
                         let row = (ev.row - area.y) as usize;
-                        let Mode::ModelPicker { entries, .. } = &state.mode else {
-                            unreachable!()
+                        let chosen = if let Mode::ModelPicker { entries, .. } = &state.mode {
+                            let filtered =
+                                model_picker_filtered(entries, &state.model_picker_search);
+                            filtered.get(row).and_then(|e| match e {
+                                PickerEntry::Model { provider, model } => {
+                                    Some((provider.clone(), model.id.clone()))
+                                }
+                                _ => None,
+                            })
+                        } else {
+                            None
                         };
-                        let filtered = model_picker_filtered(entries, &state.model_picker_search);
-                        if let Some(PickerEntry::Model { provider, model }) = filtered.get(row) {
-                            let (provider, model_id) = (provider.clone(), model.id.clone());
+                        if let Some((provider, model_id)) = chosen {
                             apply_model_choice_or_key_entry(
                                 provider, model_id, config, agent_slot, state,
                             );
@@ -4532,18 +4498,16 @@ async fn handle_mouse(
                     }
                 }
                 MouseEventKind::ScrollUp => {
-                    let Mode::ModelPicker { entries, selected } = &mut state.mode else {
-                        unreachable!()
-                    };
-                    let filtered = model_picker_filtered(entries, &state.model_picker_search);
-                    *selected = picker_move(&filtered, *selected, -1);
+                    if let Mode::ModelPicker { entries, selected } = &mut state.mode {
+                        let filtered = model_picker_filtered(entries, &state.model_picker_search);
+                        *selected = picker_move(&filtered, *selected, -1);
+                    }
                 }
                 MouseEventKind::ScrollDown => {
-                    let Mode::ModelPicker { entries, selected } = &mut state.mode else {
-                        unreachable!()
-                    };
-                    let filtered = model_picker_filtered(entries, &state.model_picker_search);
-                    *selected = picker_move(&filtered, *selected, 1);
+                    if let Mode::ModelPicker { entries, selected } = &mut state.mode {
+                        let filtered = model_picker_filtered(entries, &state.model_picker_search);
+                        *selected = picker_move(&filtered, *selected, 1);
+                    }
                 }
                 _ => {}
             }
@@ -4560,32 +4524,30 @@ async fn handle_mouse(
                         && ev.row < area.y + area.height
                     {
                         let row = (ev.row - area.y) as usize;
-                        let Mode::ProviderPicker { entries, .. } = &state.mode else {
-                            unreachable!()
+                        let chosen = if let Mode::ProviderPicker { entries, .. } = &state.mode {
+                            entries.get(row).and_then(|e| match e {
+                                ProviderEntry::Provider { name, ready, .. } => {
+                                    Some((name.clone(), *ready))
+                                }
+                                _ => None,
+                            })
+                        } else {
+                            None
                         };
-                        if let Some(ProviderEntry::Provider { name, ready, .. }) = entries.get(row)
-                        {
-                            apply_provider_picker_choice(
-                                name.clone(),
-                                *ready,
-                                config,
-                                agent_slot,
-                                state,
-                            );
+                        if let Some((name, ready)) = chosen {
+                            apply_provider_picker_choice(name, ready, config, agent_slot, state);
                         }
                     }
                 }
                 MouseEventKind::ScrollUp => {
-                    let Mode::ProviderPicker { entries, selected } = &mut state.mode else {
-                        unreachable!()
-                    };
-                    *selected = provider_picker_move(entries, *selected, -1);
+                    if let Mode::ProviderPicker { entries, selected } = &mut state.mode {
+                        *selected = provider_picker_move(entries, *selected, -1);
+                    }
                 }
                 MouseEventKind::ScrollDown => {
-                    let Mode::ProviderPicker { entries, selected } = &mut state.mode else {
-                        unreachable!()
-                    };
-                    *selected = provider_picker_move(entries, *selected, 1);
+                    if let Mode::ProviderPicker { entries, selected } = &mut state.mode {
+                        *selected = provider_picker_move(entries, *selected, 1);
+                    }
                 }
                 _ => {}
             }
