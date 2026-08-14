@@ -56,15 +56,45 @@ pub fn scaffold_project(
 
 /// Replace `{name}`-style placeholders in a template literal.
 pub(crate) fn render(template: &str, name: &str) -> String {
-    let mut out = template.to_string();
-    for (token, value) in [
-        ("{name}", snake_case(name).as_str()),
-        ("{snake}", snake_case(name).as_str()),
-        ("{Pascal}", pascal_case(name).as_str()),
-        ("{kebab}", kebab_case(name).as_str()),
-        ("{Name}", pascal_case(name).as_str()),
-    ] {
-        out = out.replace(token, value);
+    let values = [
+        ("{name}", snake_case(name)),
+        ("{snake}", snake_case(name)),
+        ("{Pascal}", pascal_case(name)),
+        ("{kebab}", kebab_case(name)),
+        ("{Name}", pascal_case(name)),
+    ];
+    // Walk char-by-char so `$`-prefixed placeholders (JavaScript template
+    // literals like `${name}`) are copied verbatim instead of having their
+    // `{name}` swallowed by the naive replace.
+    let mut out = String::with_capacity(template.len());
+    let chars: Vec<char> = template.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            let mut j = i + 2;
+            while j < chars.len() && chars[j] != '}' {
+                j += 1;
+            }
+            let end = (j + 1).min(chars.len());
+            let literal: String = chars[i..end].iter().collect();
+            out.push_str(&literal);
+            i = end;
+            continue;
+        }
+        let mut matched = false;
+        for (token, value) in &values {
+            let t: Vec<char> = token.chars().collect();
+            if chars[i..].starts_with(&t) {
+                out.push_str(value);
+                i += t.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            out.push(chars[i]);
+            i += 1;
+        }
     }
     out
 }
@@ -533,5 +563,21 @@ mod tests {
         assert_eq!(snake_case("My App 2"), "my_app_2");
         assert_eq!(pascal_case("my-app"), "MyApp");
         assert_eq!(kebab_case("Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn render_substitutes_tokens_but_not_js_template_literals() {
+        let tpl = "export function greeting(name: string): string {\n  return `Hello, ${name}!`\n}\n\nfunction App() {\n  return <h1>{greeting('{name}')}</h1>\n}\n";
+        let out = render(tpl, "bp-react");
+        // The JS template literal `${name}` must survive verbatim...
+        assert!(out.contains("Hello, ${name}!"), "{out}");
+        assert!(!out.contains("$bp_react"), "{out}");
+        // ...while the bare `{name}` placeholder still resolves.
+        assert!(out.contains("greeting('bp_react')"), "{out}");
+        // Non-$ placeholders all still work.
+        assert_eq!(
+            render("{snake} {kebab} {Pascal}", "hello world"),
+            "hello_world hello-world HelloWorld"
+        );
     }
 }

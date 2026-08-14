@@ -365,7 +365,7 @@ fn framework_templates(fw: Framework) -> Vec<(&'static str, &'static str)> {
             ),
             (
                 "tsconfig.json",
-                "{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"jsx\": \"preserve\",\n    \"strict\": true,\n    \"esModuleInterop\": true,\n    \"skipLibCheck\": true,\n    \"noEmit\": true\n  },\n  \"include\": [\"next-env.d.ts\", \"app\", \"lib\"]\n}\n",
+                "{\n  \"compilerOptions\": {\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"jsx\": \"preserve\",\n    \"strict\": true,\n    \"esModuleInterop\": true,\n    \"skipLibCheck\": true,\n    \"noEmit\": true,\n    \"paths\": {\n      \"@/*\": [\"./*\"]\n    }\n  },\n  \"include\": [\"next-env.d.ts\", \"app\", \"lib\"]\n}\n",
             ),
             (
                 "next.config.mjs",
@@ -399,7 +399,7 @@ fn framework_templates(fw: Framework) -> Vec<(&'static str, &'static str)> {
         Framework::Angular => vec![
             (
                 "package.json",
-                "{\n  \"name\": \"{kebab}\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"start\": \"ng serve\",\n    \"build\": \"ng build\",\n    \"test\": \"vitest run\"\n  },\n  \"dependencies\": {\n    \"@angular/common\": \"^17\",\n    \"@angular/core\": \"^17\",\n    \"@angular/platform-browser\": \"^17\",\n    \"rxjs\": \"^7\"\n  },\n  \"devDependencies\": {\n    \"@angular/cli\": \"^17\",\n    \"@angular/compiler\": \"^17\",\n    \"@angular/compiler-cli\": \"^17\",\n    \"typescript\": \"~5.3.0\",\n    \"vitest\": \"^2\"\n  }\n}\n",
+                "{\n  \"name\": \"{kebab}\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"start\": \"ng serve\",\n    \"build\": \"ng build\",\n    \"test\": \"vitest run\"\n  },\n  \"dependencies\": {\n    \"@angular/common\": \"^17\",\n    \"@angular/core\": \"^17\",\n    \"@angular/platform-browser\": \"^17\",\n    \"rxjs\": \"^7\"\n  },\n  \"devDependencies\": {\n    \"@angular-devkit/build-angular\": \"^17\",\n    \"@angular/cli\": \"^17\",\n    \"@angular/compiler\": \"^17\",\n    \"@angular/compiler-cli\": \"^17\",\n    \"typescript\": \"~5.3.0\",\n    \"vitest\": \"^2\"\n  }\n}\n",
             ),
             (
                 "tsconfig.json",
@@ -407,7 +407,11 @@ fn framework_templates(fw: Framework) -> Vec<(&'static str, &'static str)> {
             ),
             (
                 "angular.json",
-                "{\n  \"version\": 1,\n  \"projects\": {\n    \"{kebab}\": {\n      \"projectType\": \"application\",\n      \"root\": \"\",\n      \"sourceRoot\": \"src\",\n      \"prefix\": \"app\",\n      \"architect\": {\n        \"build\": {\n          \"builder\": \"@angular-devkit/build-angular:browser\",\n          \"options\": {\n            \"outputPath\": \"dist/{kebab}\",\n            \"index\": \"src/index.html\",\n            \"main\": \"src/main.ts\"\n          }\n        }\n      }\n    }\n  }\n}\n",
+                "{\n  \"version\": 1,\n  \"projects\": {\n    \"{kebab}\": {\n      \"projectType\": \"application\",\n      \"root\": \"\",\n      \"sourceRoot\": \"src\",\n      \"prefix\": \"app\",\n      \"architect\": {\n        \"build\": {\n          \"builder\": \"@angular-devkit/build-angular:browser\",\n          \"options\": {\n            \"outputPath\": \"dist/{kebab}\",\n            \"index\": \"src/index.html\",\n            \"main\": \"src/main.ts\",\n            \"tsConfig\": \"tsconfig.app.json\"\n          }\n        }\n      }\n    }\n  }\n}\n",
+            ),
+            (
+                "tsconfig.app.json",
+                "{\n  \"extends\": \"./tsconfig.json\",\n  \"compilerOptions\": {\n    \"outDir\": \"./out-tsc/app\",\n    \"types\": []\n  },\n  \"files\": [\"src/main.ts\"],\n  \"include\": [\"src/**/*.d.ts\"]\n}\n",
             ),
             (
                 "src/index.html",
