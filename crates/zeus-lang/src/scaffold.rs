@@ -44,7 +44,7 @@ pub fn scaffold_project(
     std::fs::create_dir_all(target).map_err(ScaffoldError::Io)?;
     let mut written = Vec::new();
     for (rel, contents) in templates {
-        let path = target.join(rel);
+        let path = target.join(render(rel, name));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(ScaffoldError::Io)?;
         }
@@ -55,10 +55,11 @@ pub fn scaffold_project(
 }
 
 /// Replace `{name}`-style placeholders in a template literal.
-fn render(template: &str, name: &str) -> String {
+pub(crate) fn render(template: &str, name: &str) -> String {
     let mut out = template.to_string();
     for (token, value) in [
         ("{name}", snake_case(name).as_str()),
+        ("{snake}", snake_case(name).as_str()),
         ("{Pascal}", pascal_case(name).as_str()),
         ("{kebab}", kebab_case(name).as_str()),
         ("{Name}", pascal_case(name).as_str()),
@@ -149,7 +150,7 @@ fn templates(lang: Language) -> Vec<(&'static str, &'static str)> {
         Language::TypeScript => vec![
             (
                 "package.json",
-                "{\n  \"name\": \"{kebab}\",\n  \"version\": \"0.1.0\",\n  \"scripts\": {\n    \"build\": \"tsc -p .\",\n    \"test\": \"vitest run\",\n    \"lint\": \"eslint .\"\n  },\n  \"devDependencies\": {\n    \"typescript\": \"^5\",\n    \"@types/node\": \"^20\"\n  }\n}\n",
+                "{\n  \"name\": \"{kebab}\",\n  \"version\": \"0.1.0\",\n  \"scripts\": {\n    \"build\": \"tsc -p .\",\n    \"test\": \"vitest run\",\n    \"lint\": \"eslint .\"\n  },\n  \"devDependencies\": {\n    \"typescript\": \"^5\",\n    \"@types/node\": \"^20\",\n    \"eslint\": \"^9\",\n    \"vitest\": \"^2\"\n  }\n}\n",
             ),
             (
                 "tsconfig.json",
@@ -318,6 +319,180 @@ fn templates(lang: Language) -> Vec<(&'static str, &'static str)> {
             (
                 "contracts/{Pascal}.sol",
                 "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\ncontract {Pascal} {\n    function hello() public pure returns (string memory) {\n        return \"Hello, {name}!\";\n    }\n}\n",
+            ),
+        ],
+        Language::Clojure => vec![
+            (
+                "deps.edn",
+                "{:paths [\"src\"]\n :deps {org.clojure/clojure {:mvn/version \"1.11.1\"}}}\n",
+            ),
+            (
+                "src/core.clj",
+                "(ns core)\n\n(defn -main []\n  (println \"Hello, {name}!\"))\n\n(-main)\n",
+            ),
+        ],
+        Language::Julia => vec![
+            (
+                "Project.toml",
+                "name = \"{Pascal}\"\nuuid = \"00000000-0000-0000-0000-000000000000\"\nauthors = [\"you\"]\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "main.jl",
+                "function main()\n    println(\"Hello, {name}!\")\nend\n\nmain()\n",
+            ),
+        ],
+        Language::Perl => vec![
+            (
+                "cpanfile",
+                "requires 'perl', '5.20';\n",
+            ),
+            (
+                "script/main.pl",
+                "#!/usr/bin/env perl\nuse strict;\nuse warnings;\n\nprint \"Hello, {name}!\\n\";\n",
+            ),
+        ],
+        Language::OCaml => vec![
+            (
+                "dune-project",
+                "(lang dune 3.0)\n",
+            ),
+            (
+                "bin/main.ml",
+                "let () = print_endline \"Hello, {name}!\"\n",
+            ),
+            (
+                "bin/dune",
+                "(executable\n (name main))\n",
+            ),
+        ],
+        Language::Nim => vec![
+            (
+                "{name}.nimble",
+                "version = \"0.1.0\"\nauthor = \"you\"\ndescription = \"{name}\"\nlicense = \"MIT\"\nsrcDir = \"src\"\n",
+            ),
+            (
+                "src/main.nim",
+                "echo \"Hello, {name}!\"\n",
+            ),
+        ],
+        Language::Crystal => vec![
+            (
+                "shard.yml",
+                "name: {name}\nversion: 0.1.0\n",
+            ),
+            (
+                "src/main.cr",
+                "puts \"Hello, {name}!\"\n",
+            ),
+        ],
+        Language::Groovy => vec![
+            (
+                "build.gradle",
+                "plugins { id 'groovy' }\nrepositories { mavenCentral() }\n\ndependencies { implementation 'org.apache.groovy:groovy:4.0.0' }\n",
+            ),
+            (
+                "src/main/groovy/Main.groovy",
+                "class Main {\n    static void main(String[] args) {\n        println 'Hello, {name}!'\n    }\n}\n",
+            ),
+        ],
+        Language::Fortran => vec![
+            (
+                "CMakeLists.txt",
+                "cmake_minimum_required(VERSION 3.16)\nproject({kebab} Fortran)\n\nadd_executable(main src/main.f90)\n",
+            ),
+            (
+                "src/main.f90",
+                "program main\n  implicit none\n  print *, 'Hello, {name}!'\nend program main\n",
+            ),
+        ],
+        Language::Shell => vec![
+            (
+                "main.sh",
+                "#!/usr/bin/env bash\nset -euo pipefail\n\necho \"Hello, {name}!\"\n",
+            ),
+        ],
+        Language::PowerShell => vec![
+            (
+                "main.ps1",
+                "#!/usr/bin/env pwsh\nWrite-Host \"Hello, {name}!\"\n",
+            ),
+        ],
+        Language::Erlang => vec![
+            (
+                "rebar.config",
+                "{erl_opts, [debug_info]}.\n",
+            ),
+            (
+                "src/main.erl",
+                "-module(main).\n-export([hello/0]).\n\nhello() -> io:format(\"Hello, {name}!~n\").\n",
+            ),
+        ],
+        Language::FSharp => vec![
+            (
+                "{kebab}.fsproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n  <ItemGroup>\n    <Compile Include=\"Program.fs\" />\n  </ItemGroup>\n</Project>\n",
+            ),
+            (
+                "Program.fs",
+                "printfn \"Hello, {name}!\"\n",
+            ),
+        ],
+        Language::ObjectiveC => vec![
+            (
+                "Makefile",
+                "CC=clang\nCFLAGS=-fobjc-arc -framework Foundation\n\nall:\n\t$(CC) $(CFLAGS) -o main src/main.m\n",
+            ),
+            (
+                "src/main.m",
+                "#import <Foundation/Foundation.h>\n\nint main(void) {\n    @autoreleasepool {\n        NSLog(@\"Hello, {name}!\");\n    }\n    return 0;\n}\n",
+            ),
+        ],
+        Language::V => vec![
+            (
+                "v.mod",
+                "Module {\n\tname: '{kebab}'\n\tversion: '0.1.0'\n}\n",
+            ),
+            (
+                "main.v",
+                "fn main() {\n\tprintln('Hello, {name}!')\n}\n",
+            ),
+        ],
+        Language::Ada => vec![
+            (
+                "project.gpr",
+                "project {Pascal} is\n   for Source_Dirs use (\"src\");\n   for Main use (\"main.adb\");\nend {Pascal};\n",
+            ),
+            (
+                "src/main.adb",
+                "with Ada.Text_IO;\n\nprocedure Main is\nbegin\n   Ada.Text_IO.Put_Line (\"Hello, {name}!\");\nend Main;\n",
+            ),
+        ],
+        Language::Pascal => vec![
+            (
+                "main.pas",
+                "program {Pascal};\n\nbegin\n  writeln('Hello, {name}!');\nend.\n",
+            ),
+        ],
+        Language::Lisp => vec![
+            (
+                "main.lisp",
+                "(format t \"Hello, {name}!~%\")",
+            ),
+        ],
+        Language::Scheme => vec![
+            (
+                "main.rkt",
+                "#lang racket\n\n(displayln \"Hello, {name}!\")\n",
+            ),
+        ],
+        Language::VisualBasic => vec![
+            (
+                "{kebab}.vbproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    <RootNamespace>{Pascal}</RootNamespace>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n</Project>\n",
+            ),
+            (
+                "Program.vb",
+                "Imports System\n\nModule Program\n    Sub Main()\n        Console.WriteLine(\"Hello, {name}!\")\n    End Sub\nEnd Module\n",
             ),
         ],
     }

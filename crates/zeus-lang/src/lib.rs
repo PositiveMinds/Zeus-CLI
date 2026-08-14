@@ -10,9 +10,11 @@
 //! Kept dependency-free so any zeus crate can use it.
 
 pub mod detect;
+pub mod framework;
 pub mod scaffold;
 pub mod spec;
 
 pub use detect::{detect_project, detect_source, Language};
+pub use framework::{framework_spec, scaffold_framework, Framework};
 pub use scaffold::{available_scaffold_languages, scaffold_project};
 pub use spec::{dev_commands, spec, FormatStyle, LangSpec, FILE_PLACEHOLDER};

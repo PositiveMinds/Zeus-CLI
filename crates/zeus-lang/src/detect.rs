@@ -27,6 +27,28 @@ pub enum Language {
     Haskell,
     Lua,
     Solidity,
+    Clojure,
+    Julia,
+    Perl,
+    OCaml,
+    Nim,
+    Crystal,
+    Groovy,
+    Fortran,
+    /// POSIX shell scripts (`.sh`/`.bash`/`.zsh`).
+    Shell,
+    PowerShell,
+    Erlang,
+    FSharp,
+    /// Objective-C (`.m`/`.h`) — `.h` is shared with C/C++, so the
+    /// extension census only counts `.m`.
+    ObjectiveC,
+    V,
+    Ada,
+    Pascal,
+    Lisp,
+    Scheme,
+    VisualBasic,
 }
 
 impl Language {
@@ -51,6 +73,25 @@ impl Language {
         Language::Haskell,
         Language::Lua,
         Language::Solidity,
+        Language::Clojure,
+        Language::Julia,
+        Language::Perl,
+        Language::OCaml,
+        Language::Nim,
+        Language::Crystal,
+        Language::Groovy,
+        Language::Fortran,
+        Language::Shell,
+        Language::PowerShell,
+        Language::Erlang,
+        Language::FSharp,
+        Language::ObjectiveC,
+        Language::V,
+        Language::Ada,
+        Language::Pascal,
+        Language::Lisp,
+        Language::Scheme,
+        Language::VisualBasic,
     ];
 
     /// Parse a language from a CLI-ish name ("rust", "ts", "c#", "c++",
@@ -80,6 +121,25 @@ impl Language {
             "haskell" | "hs" => Language::Haskell,
             "lua" => Language::Lua,
             "solidity" | "sol" => Language::Solidity,
+            "clojure" | "clj" | "cljs" => Language::Clojure,
+            "julia" | "jl" => Language::Julia,
+            "perl" | "pl" | "pm" => Language::Perl,
+            "ocaml" | "ml" | "mli" => Language::OCaml,
+            "nim" => Language::Nim,
+            "crystal" | "cr" => Language::Crystal,
+            "groovy" | "gro" | "gradle" => Language::Groovy,
+            "fortran" | "f90" | "f95" | "f" => Language::Fortran,
+            "shell" | "sh" | "bash" | "zsh" | "shellscript" => Language::Shell,
+            "powershell" | "pwsh" | "ps1" => Language::PowerShell,
+            "erlang" | "erl" | "hrl" => Language::Erlang,
+            "fsharp" | "fs" | "fsx" | "f#" => Language::FSharp,
+            "objectivec" | "objective-c" | "objc" | "m" => Language::ObjectiveC,
+            "vlang" | "v" => Language::V,
+            "ada" | "adb" | "ads" => Language::Ada,
+            "pascal" | "pas" | "pp" => Language::Pascal,
+            "lisp" | "lsp" | "cl" => Language::Lisp,
+            "scheme" | "scm" | "ss" => Language::Scheme,
+            "visualbasic" | "vb" | "vb.net" | "vba" => Language::VisualBasic,
             _ => return None,
         };
         Some(lang)
@@ -147,6 +207,39 @@ pub fn detect_project(root: &Path) -> Option<Language> {
     }
     if file("foundry.toml") || file("hardhat.config.ts") || file("hardhat.config.js") {
         return Some(Language::Solidity);
+    }
+    if file("deps.edn") || file("project.clj") || file("shadow-cljs.edn") {
+        return Some(Language::Clojure);
+    }
+    if file("Project.toml") {
+        return Some(Language::Julia);
+    }
+    if file("cpanfile") || file("Makefile.PL") {
+        return Some(Language::Perl);
+    }
+    if file("dune-project") || contains_file(root, &["opam"], 2) {
+        return Some(Language::OCaml);
+    }
+    if contains_file(root, &["nimble"], 1) || file("nim.cfg") {
+        return Some(Language::Nim);
+    }
+    if file("shard.yml") {
+        return Some(Language::Crystal);
+    }
+    if file("rebar.config") || contains_file(root, &["app.src"], 3) {
+        return Some(Language::Erlang);
+    }
+    if contains_file(root, &["fsproj"], 2) {
+        return Some(Language::FSharp);
+    }
+    if file("Podfile") || contains_ext(root, &["xcodeproj", "xcworkspace"], 1) {
+        return Some(Language::ObjectiveC);
+    }
+    if file("v.mod") {
+        return Some(Language::V);
+    }
+    if contains_ext(root, &["vbproj"], 2) {
+        return Some(Language::VisualBasic);
     }
     if file("Makefile") {
         return Some(Language::Cpp);
