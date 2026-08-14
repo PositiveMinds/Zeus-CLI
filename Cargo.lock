@@ -3808,6 +3808,7 @@ dependencies = [
  "zeus-lang",
  "zeus-logging",
  "zeus-provider",
+ "zeus-rag",
 ]
 
 [[package]]

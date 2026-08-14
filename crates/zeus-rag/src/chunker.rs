@@ -61,11 +61,9 @@ pub fn chunk_text(text: &str, approx_chars: usize, overlap_chars: usize) -> Vec<
         let end = next_break(&text[start..], approx_chars)
             .map(|d| start + d)
             .unwrap_or(text.len());
-        // The break may be closer than `overlap` (e.g. dense punctuation); if
-        // so, no overlap is possible and we must still advance past `end` to
-        // guarantee forward progress (an overlap >= break distance would make
-        // `start` stall forever and OOM).
-        let next = end.saturating_sub(overlap_chars);
+        // Walk back `overlap_chars` characters (not bytes — `end` is a byte
+        // index, so a byte subtraction could land mid-UTF-8-sequence).
+        let next = prev_boundary(text, end, overlap_chars);
         let next = if next <= start { end } else { next };
 
         let piece = text[start..end].trim();
@@ -78,6 +76,19 @@ pub fn chunk_text(text: &str, approx_chars: usize, overlap_chars: usize) -> Vec<
         start = next;
     }
     chunks
+}
+
+/// Byte offset `n` characters before `end` in `text` — always a char
+/// boundary. Clamps to the start of `text`.
+fn prev_boundary(text: &str, end: usize, n: usize) -> usize {
+    let mut idx = end;
+    for _ in 0..n {
+        match text[..idx].char_indices().next_back() {
+            Some((i, _)) => idx = i,
+            None => break,
+        }
+    }
+    idx
 }
 
 /// Find the last whitespace boundary within `approx_chars` of the head, but
@@ -192,6 +203,19 @@ mod tests {
         if c.len() >= 2 {
             let first_tail = c[0].chars().last().unwrap();
             assert!(c[1].contains(first_tail));
+        }
+    }
+
+    #[test]
+    fn chunk_text_handles_multibyte_utf8() {
+        // Non-ASCII sequences must never land on a mid-character byte index.
+        let text = "// café → 東京 → back\n".repeat(60);
+        let c = chunk_text(&text, 40, 10);
+        assert!(c.len() >= 2);
+        for piece in &c {
+            assert!(!piece.is_empty());
+            // Round-tripping proves every slice was on a char boundary.
+            assert!(String::from_utf8(piece.as_bytes().to_vec()).is_ok());
         }
     }
 

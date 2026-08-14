@@ -34,8 +34,8 @@ use zeus_provider::{
 mod cli;
 mod config;
 pub use cli::{
-    BgCmd, Cli, CodeintCmd, Commands, ConfigCmd, GitCmd, KeyCmd, ProjectCmd, PullCmd, ResetModeArg,
-    UserCommandCmd,
+    BgCmd, Cli, CodeintCmd, Commands, ConfigCmd, GitCmd, KeyCmd, ProjectCmd, PullCmd, RagindexCmd,
+    ResetModeArg, UserCommandCmd,
 };
 use config::{
     approver, get_toml_path, load_config, load_toml_or_empty, parse_toml_scalar, set_toml_path,
@@ -185,6 +185,7 @@ async fn run() -> Result<()> {
         Some(Commands::Serve { model }) => cmd_serve(&config, model).await,
         Some(Commands::UserCommand { action }) => cmd_user_commands(&config, action, cli.yes),
         Some(Commands::Codeint { action }) => cmd_codeint(&config, action),
+        Some(Commands::Ragindex { action }) => cmd_ragindex(&config, action).await,
         Some(Commands::Project { action }) => cmd_project(&config, action),
     }
 }
@@ -2590,6 +2591,118 @@ fn cmd_codeint(config: &Config, action: CodeintCmd) -> Result<()> {
                 );
             }
             println!("plan only — applying the edit is left to a review step.");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_ragindex(config: &Config, action: RagindexCmd) -> Result<()> {
+    let ws = workspace(config)?;
+    let root = ws.project_root.clone();
+
+    match action {
+        RagindexCmd::Index {
+            force,
+            embed,
+            provider,
+            model,
+        } => {
+            // Fast path: a fresh index that already satisfies the request.
+            let mut persisted = zeus_rag::PersistedRagIndex::load(&root);
+            if !force {
+                if let Some(p) = persisted.as_ref() {
+                    if p.is_fresh() && (!embed || p.has_vectors()) {
+                        println!(
+                            "index already fresh: {} chunk(s) in {} file(s) — use --force to rebuild",
+                            p.documents.len(),
+                            p.stamps.len()
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Stale index -> incremental refresh; force or no index -> full walk.
+            let mut index = if let Some(mut p) = persisted.take() {
+                if !force {
+                    p.refresh(800, 80);
+                }
+                p.into_index()
+            } else {
+                zeus_rag::RagIndex::from_project(&root, 800, 80)
+            };
+            if index.is_empty() {
+                println!("no source files to index");
+                return Ok(());
+            }
+
+            if embed {
+                match resolve_provider(config, provider).await {
+                    Ok(provider) => {
+                        let requested = model.unwrap_or_else(|| config.settings.model.model.clone());
+                        let (model, _) = resolve_model(&*provider, requested).await;
+                        let embedded = index
+                            .embed_all(&*provider, &model, 32)
+                            .await
+                            .unwrap_or_else(|e| {
+                                eprintln!("warning: embedding failed ({e}); index kept keyword-only");
+                                0
+                            });
+                        if embedded > 0 {
+                            println!("embedded {embedded} chunk(s)");
+                        } else {
+                            println!("no embeddings produced; index kept keyword-only");
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "warning: {e}; index kept keyword-only — start a local server or configure a cloud provider to enable embeddings"
+                    ),
+                }
+            }
+
+            let persisted = zeus_rag::PersistedRagIndex::from_index(&index);
+            persisted.save(&root).context("save RAG index")?;
+            println!(
+                "indexed {} chunk(s) in {} file(s) -> {}",
+                index.len(),
+                persisted.stamps.len(),
+                zeus_rag::PersistedRagIndex::file_path(&root).display()
+            );
+        }
+        RagindexCmd::Search { query, k } => {
+            let index = match zeus_rag::PersistedRagIndex::load(&root) {
+                Some(p) if p.is_fresh() => p.into_index(),
+                _ => {
+                    println!(
+                        "no fresh index at {}; run `zeus ragindex index` first",
+                        zeus_rag::PersistedRagIndex::file_path(&root).display()
+                    );
+                    return Ok(());
+                }
+            };
+            if index.is_empty() {
+                println!("index is empty; run `zeus ragindex index` first");
+                return Ok(());
+            }
+            let hits = index.search(&query, k.clamp(1, 20));
+            if hits.is_empty() {
+                println!("no chunks matched '{query}'");
+                return Ok(());
+            }
+            println!("top {} match(es) for '{query}':", hits.len());
+            for h in &hits {
+                let path = h
+                    .chunk
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&h.chunk.path)
+                    .display();
+                println!("[{:.0}%] {}:", h.score * 100.0, path);
+                for line in h.chunk.text.lines() {
+                    println!("  {line}");
+                }
+                println!();
+            }
         }
     }
     Ok(())

@@ -20,6 +20,7 @@ zeus-fs = { workspace = true }
 zeus-lang = { workspace = true }
 zeus-logging = { workspace = true }
 zeus-provider = { workspace = true }
+zeus-rag = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anstyle = "1.0.14"

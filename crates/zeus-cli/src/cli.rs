@@ -262,6 +262,14 @@ pub enum Commands {
         action: CodeintCmd,
     },
 
+    /// RAG index — database-free semantic retrieval over source files.
+    /// Build/refresh `.agent/rag_index.json`, optionally embedding chunks,
+    /// then hybrid-search it from the terminal.
+    Ragindex {
+        #[command(subcommand)]
+        action: RagindexCmd,
+    },
+
     /// Language support — detect a project's language, show its standard
     /// dev commands (build / test / lint / format), scaffold a minimal
     /// buildable skeleton, or format a file / project.
@@ -337,6 +345,39 @@ pub enum CodeintCmd {
         old: String,
         #[arg(long)]
         new: String,
+    },
+}
+
+/// Sub-actions for `zeus ragindex` (database-free RAG, no SQL).
+#[derive(Debug, Subcommand)]
+pub enum RagindexCmd {
+    /// Scan source files and write `.agent/rag_index.json`. When a stale
+    /// index exists it is refreshed incrementally — only changed files are
+    /// re-chunked; untouched chunks are kept.
+    Index {
+        /// Rebuild from scratch even if a fresh index already exists.
+        #[arg(long)]
+        force: bool,
+        /// Embed every chunk with the configured provider (best-effort:
+        /// without a reachable embeddings-capable provider the index stays
+        /// keyword-only).
+        #[arg(long)]
+        embed: bool,
+        /// Provider name from providers.toml (used with --embed).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model override (used with --embed).
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Hybrid keyword + vector search over a fresh index. Prints the top
+    /// matching chunks; a stale or missing index is reported instead of
+    /// re-chunking silently.
+    Search {
+        query: String,
+        /// Number of results to return.
+        #[arg(long, default_value_t = 5)]
+        k: usize,
     },
 }
 
