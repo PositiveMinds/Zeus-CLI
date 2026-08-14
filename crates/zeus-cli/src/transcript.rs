@@ -189,7 +189,7 @@ impl Block_ {
         } else {
             theme::cyan()
         };
-        let bg = theme::CARD_BG;
+        let bg = theme::card_bg();
         let avail = (width as usize)
             .saturating_sub(2)
             .clamp(20, Self::MAX_CONTENT_W);
@@ -282,7 +282,7 @@ impl Block_ {
     /// are enough to mark a turn without the extra weight.
     fn bubble_lines(&self, width: u16) -> Vec<Line<'static>> {
         let avail = (width as usize).max(20);
-        let border_style = Style::default().fg(theme::BORDER_SOFT);
+        let border_style = Style::default().fg(theme::border_soft());
         if self.role == Role::User {
             let content_w = ((avail * 7) / 10).clamp(20, 84);
             let wrapped = wrap_preserving_newlines(&self.text, content_w);

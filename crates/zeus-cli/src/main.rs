@@ -1565,6 +1565,7 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "settings",
         "view/change display settings: reduced_motion, notify, accent <#hex>|reset",
     ),
+    ("theme", "switch color theme: dark, light, or high-contrast"),
     (
         "model",
         "switch model (opens a picker), or /model <name> directly",
@@ -1749,6 +1750,32 @@ fn handle_settings_slash(arg: &str, config: &Config) {
         _ => eprintln!(
             "usage: /settings [reduced_motion on|off] [notify on|off] [accent <#hex>|reset]"
         ),
+    }
+}
+
+/// The `/theme` slash command (plain REPL): view or persist the TUI color
+/// theme preset. The plain REPL itself has no chrome to repaint, so a
+/// change here just saves — it applies live inside the TUI (`tui.rs`
+/// applies it immediately via `theme::set_theme` and saves the same way).
+fn handle_theme_slash(arg: &str, config: &Config) {
+    let path = &config.global.settings_toml;
+    let names = tui::theme::ThemeKind::ALL
+        .iter()
+        .map(|k| k.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match arg.trim() {
+        "" => println!(
+            "theme: {} (available: {names})",
+            config.settings.theme.as_deref().unwrap_or("dark")
+        ),
+        name => match tui::theme::ThemeKind::from_label(name) {
+            Some(_) => match zeus_config::set_theme(path, Some(name.to_string())) {
+                Ok(()) => println!("theme: {name} (takes effect next TUI launch)"),
+                Err(e) => eprintln!("couldn't save setting: {e}"),
+            },
+            None => eprintln!("'{name}' isn't a theme — try {names}"),
+        },
     }
 }
 
@@ -2065,6 +2092,7 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                 }
                 "provider" => handle_provider_slash(arg, config, &mut agent).await,
                 "settings" => handle_settings_slash(arg, config),
+                "theme" => handle_theme_slash(arg, config),
                 "session" => println!("session={}", agent.session_id()),
                 "sessions" => match render_sessions(config) {
                     Ok(text) => println!("{text}"),

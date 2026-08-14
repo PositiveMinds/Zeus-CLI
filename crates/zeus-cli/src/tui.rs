@@ -25,7 +25,7 @@ use crate::{
     print_repl_help_lines,
 };
 #[path = "theme.rs"]
-mod theme;
+pub(crate) mod theme;
 #[path = "tui_text.rs"]
 mod tui_text;
 use anyhow::{Context, Result};
@@ -146,6 +146,13 @@ enum Mode {
     /// to keys.toml, env var set, provider switched) and returns to Chat.
     KeyEntry {
         provider: String,
+    },
+    /// The two-pane side-by-side diff opened by `/diff`: `rows` hold the
+    /// aligned old/new cells, `scroll` the window offset into them.
+    /// ↑/↓, pgup/pgdn scroll; esc returns to Chat.
+    Diff {
+        rows: Vec<super::highlight::DiffRow>,
+        scroll: usize,
     },
 }
 
@@ -435,6 +442,16 @@ impl AgentMode {
             AgentMode::Auto => AgentMode::Build,
         }
     }
+}
+
+/// Which flavor of composer dropdown is currently open — slash commands
+/// (`/…`) or model autocomplete (`@…`). The two share one menu slot, the
+/// selection index, and the arrow/Tab/Enter/click handling; only the
+/// accept action differs (commands fill `/cmd `, models swap the `@token`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuKind {
+    Commands,
+    Models,
 }
 
 /// The accent color a mode drives the UI with — the HTML page's per-mode
@@ -1198,6 +1215,91 @@ impl AppState {
     fn command_matches(&self) -> Vec<(&str, &str)> {
         filter_commands(&self.input, &self.known_commands)
     }
+
+    /// The currently active composer dropdown. Slash commands win when the
+    /// input starts with `/…` (no whitespace yet — the existing behavior);
+    /// otherwise a trailing `@…` token turns the same dropdown into model
+    /// autocomplete, so the two never fight over the single menu slot.
+    /// Returns owned entries plus which kind so accept/render can treat
+    /// them differently (commands fill `/cmd `, models swap the `@token`).
+    fn menu(&self) -> (Vec<(String, String)>, MenuKind) {
+        let cmd = self.command_matches();
+        if !cmd.is_empty() {
+            return (
+                cmd.into_iter()
+                    .map(|(n, d)| (n.to_string(), d.to_string()))
+                    .collect(),
+                MenuKind::Commands,
+            );
+        }
+        let models = self.model_matches();
+        if !models.is_empty() {
+            return (models, MenuKind::Models);
+        }
+        (Vec::new(), MenuKind::Commands)
+    }
+
+    /// Model autocomplete candidates for the composer's trailing `@…`
+    /// token: every model the app already knows about — the cached live
+    /// probe (per provider), recents, and favorites — de-duplicated and
+    /// filtered by the text after the last `@`, case-insensitively.
+    /// An empty partial (bare `@`) lists everything.
+    fn model_matches(&self) -> Vec<(String, String)> {
+        filter_model_matches(
+            &self.input,
+            self.model_cache.as_deref().unwrap_or(&[]),
+            &self.recent_models,
+            &self.favorite_models,
+        )
+    }
+}
+
+/// Shared by `AppState::model_matches` and its unit tests — pure matching
+/// logic with no `AppState` dependency.
+fn filter_model_matches(
+    input: &str,
+    cache: &[(String, Vec<zeus_provider::ModelInfo>)],
+    recent: &[(String, String)],
+    favorites: &[(String, String)],
+) -> Vec<(String, String)> {
+    let last_token = input.rsplit(char::is_whitespace).next().unwrap_or("");
+    let Some(partial) = last_token.strip_prefix('@') else {
+        return Vec::new();
+    };
+    let partial = partial.to_ascii_lowercase();
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (provider, models) in cache {
+        for m in models {
+            let label = format!("{provider}/{model}", model = m.id);
+            if seen.insert(label.clone()) {
+                out.push((label, provider.clone()));
+            }
+        }
+    }
+    for (provider, model) in recent.iter().chain(favorites.iter()) {
+        let label = format!("{provider}/{model}");
+        if seen.insert(label.clone()) {
+            out.push((label, provider.clone()));
+        }
+    }
+    out.retain(|(label, _)| {
+        if partial.is_empty() {
+            return true;
+        }
+        let lower = label.to_ascii_lowercase();
+        if lower.starts_with(&partial) {
+            return true;
+        }
+        // Also match against the model id alone (after the provider's
+        // slash) — typing `@clau` should surface `openrouter/claude-…`.
+        lower
+            .rsplit_once('/')
+            .map(|(_, model)| model.starts_with(&partial))
+            .unwrap_or(false)
+    });
+    out
 }
 
 /// Prefix-match slash commands against the composer input: a leading `/` with
@@ -1375,7 +1477,7 @@ fn border_style() -> Style {
 fn render_menu(
     f: &mut Frame,
     area: Rect,
-    matches: &[(&str, &str)],
+    matches: &[(String, String)],
     selected: usize,
     accent: Color,
 ) -> Rect {
@@ -1388,7 +1490,7 @@ fn render_menu(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style())
-        .style(Style::default().bg(theme::MODAL_BG));
+        .style(Style::default().bg(theme::modal_bg()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1413,8 +1515,8 @@ fn render_menu(
         .collect();
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(theme::MODAL_SELECTED_BG)
-            .fg(theme::VOID)
+            .bg(theme::modal_selected_bg())
+            .fg(theme::void())
             .add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
@@ -1434,7 +1536,7 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
     // composer stays "focused" while busy too — only an actual picker/modal
     // mode takes the cursor away.
     let focused = matches!(state.mode, Mode::Chat);
-    let bar = if focused { accent } else { theme::BORDER };
+    let bar = if focused { accent } else { theme::border() };
     // A single thick accent bar down the left edge on a flat elevated panel
     // — no full box border, no `›` caret — rather than the earlier
     // all-sides bordered composer.
@@ -1442,7 +1544,7 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
         .borders(Borders::LEFT)
         .border_type(BorderType::Thick)
         .border_style(Style::default().fg(bar))
-        .style(Style::default().bg(theme::PANEL2));
+        .style(Style::default().bg(theme::panel2()));
     let raw_inner = block.inner(area);
     f.render_widget(block, area);
     // One column of breathing room between the accent bar and the text —
@@ -1491,22 +1593,23 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
     }
 
     let input_line = if !state.input.is_empty() {
-        // A queued draft takes priority over the busy placeholder — typing
-        // the next message mid-turn should actually show what you typed.
-        Line::from(Span::raw(state.input.clone()))
+        // `Text` not a single `Line` — a multiline draft (Shift+Enter) needs
+        // each `\n` to become its own row, and `Text::from(String)` splits
+        // on newlines exactly like the empty-state composer already does.
+        Text::from(state.input.clone())
     } else if state.busy {
-        Line::from(Span::styled(
+        Text::from(Line::from(Span::styled(
             format!(
                 "{} zeus is working… (you can type the next message)",
                 spinner_glyph(state)
             ),
             placeholder_style(),
-        ))
+        )))
     } else {
-        Line::from(vec![
+        Text::from(Line::from(vec![
             Span::styled("Ask anything… ", placeholder_style()),
             Span::styled("\"Fix a TODO in the codebase\"", placeholder_style()),
-        ])
+        ]))
     };
     f.render_widget(
         Paragraph::new(input_line).wrap(Wrap { trim: false }),
@@ -1539,7 +1642,7 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
         // exact for the overwhelmingly common case of typing forward with
         // the cursor at the end, and close enough otherwise.
         let typed_before: String = state.input.chars().take(state.cursor).collect();
-        let wrapped_before = wrap_text(&typed_before, inner.width.max(1) as usize);
+        let wrapped_before = wrap_preserving_newlines(&typed_before, inner.width.max(1) as usize);
         let last_row = input_text_h.saturating_sub(1);
         let row = (wrapped_before.len() as u16)
             .saturating_sub(1)
@@ -1605,7 +1708,7 @@ fn transcript_text(state: &AppState, width: u16) -> Text<'static> {
             // doesn't drift when a selection is active.
             lines.push(Line::from(vec![Span::styled(
                 " ".repeat(width as usize),
-                Style::default().bg(theme::SELECTED_BG),
+                Style::default().bg(theme::selected_bg()),
             )]));
         } else {
             lines.extend(block.to_lines(width));
@@ -1638,7 +1741,7 @@ fn style_selected(line: Line<'static>) -> Line<'static> {
     Line::from(
         line.spans
             .into_iter()
-            .map(|s| Span::styled(s.content, s.style.bg(theme::SELECTED_BG)))
+            .map(|s| Span::styled(s.content, s.style.bg(theme::selected_bg())))
             .collect::<Vec<_>>(),
     )
 }
@@ -1691,7 +1794,7 @@ fn render_search_bar(f: &mut Frame, area: Rect, search: &SearchState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::accent()))
-        .style(Style::default().bg(theme::PANEL))
+        .style(Style::default().bg(theme::panel()))
         .title(Line::from(Span::styled(
             " find ",
             Style::default()
@@ -1727,7 +1830,7 @@ fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionPickerState)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style())
-        .style(Style::default().bg(theme::MODAL_BG))
+        .style(Style::default().bg(theme::modal_bg()))
         .title(Line::from(vec![Span::styled(
             " Resume session ",
             theme::text().add_modifier(Modifier::BOLD),
@@ -1785,8 +1888,8 @@ fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionPickerState)
         .collect();
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(theme::MODAL_SELECTED_BG)
-            .fg(theme::VOID)
+            .bg(theme::modal_selected_bg())
+            .fg(theme::void())
             .add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
@@ -1854,7 +1957,7 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     // `render_menu` actually needs the contents, so this temporary borrow
     // of `state` doesn't stay alive across the whole function (it would
     // otherwise conflict with the `state.transcript_*` writes below).
-    let menu_h = menu_height(&state.command_matches());
+    let menu_h = menu_height(&state.menu().0);
     // The text row grows with the input — a long message used to be
     // capped at a single fixed row and silently clip everything past the
     // first wrapped line, with no indication anything was cut off. The cap
@@ -1870,7 +1973,7 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     // not a full box border).
     let composer_inner_w = area.width.saturating_sub(3).max(10) as usize;
     let max_input_rows = (area.height / 3).clamp(6, 20) as usize;
-    let input_text_h = wrap_text(&state.input, composer_inner_w)
+    let input_text_h = wrap_preserving_newlines(&state.input, composer_inner_w)
         .len()
         .clamp(1, max_input_rows) as u16;
     // +1 for the status row, +1 for a blank row of top padding — a
@@ -1927,13 +2030,19 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     // `rows[1]` was already computed above) would leave the composer/hints
     // drawn fresh and undimmed right next to a dimmed transcript.
     state.command_menu_area = if menu_h > 0 {
-        let matches = state.command_matches();
+        let (matches, kind) = state.menu();
+        let accent = match kind {
+            MenuKind::Commands => mode_accent(state.agent_mode),
+            // Model autocomplete keeps its own teal accent so it reads as
+            // a distinct (model-list) dropdown rather than a command one.
+            MenuKind::Models => theme::teal_color(),
+        };
         Some(render_menu(
             f,
             rows[1],
             &matches,
             state.command_selected,
-            mode_accent(state.agent_mode),
+            accent,
         ))
     } else {
         None
@@ -2001,7 +2110,7 @@ fn render_key_entry_modal(f: &mut Frame, area: Rect, provider: &str, input: &str
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style())
-        .style(Style::default().bg(theme::MODAL_BG))
+        .style(Style::default().bg(theme::modal_bg()))
         .title(Line::from(vec![Span::styled(
             " API key ",
             theme::text().add_modifier(Modifier::BOLD),
@@ -2123,7 +2232,7 @@ fn render_approval_modal(f: &mut Frame, area: Rect, pending: &ApprovalRequestMsg
         // distinct from a neutral picker — but the fill and title casing
         // still match the rest of the modal family for consistency.
         .border_style(Style::default().fg(theme::GOLD))
-        .style(Style::default().bg(theme::MODAL_BG))
+        .style(Style::default().bg(theme::modal_bg()))
         .title(Line::from(vec![Span::styled(
             " Permission needed ",
             theme::gold().add_modifier(Modifier::BOLD),
@@ -2171,6 +2280,85 @@ fn render_approval_modal(f: &mut Frame, area: Rect, pending: &ApprovalRequestMsg
     f.render_widget(Paragraph::new(shown).wrap(Wrap { trim: false }), rows[2]);
 }
 
+/// The `/diff` command's two-pane side-by-side view: a centered modal that
+/// lays each diff row out as `old │ new` cells, with the `-`/`+` markers
+/// stripped and a red/green tint telling removed from added. Header rows
+/// (file metadata and `@@` hunks) span the full width in dim/teal. The
+/// render clamps `scroll` to the real row count, so the key handler just
+/// nudges it; esc returns to Chat (handled in the key path, not here).
+fn render_diff_modal(f: &mut Frame, area: Rect, rows: &[super::highlight::DiffRow], scroll: usize) {
+    let width = area.width.saturating_sub(8).clamp(70, 180);
+    let max_h = area.height.saturating_sub(6);
+    let height = max_h.clamp(10, max_h) as usize;
+    let popup = centered_rect(width, height as u16, area);
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::border()))
+        .style(Style::default().bg(theme::modal_bg()))
+        .title(Line::from(vec![Span::styled(
+            " Diff ",
+            theme::teal().add_modifier(Modifier::BOLD),
+        )]))
+        .title_bottom(
+            Line::from(Span::styled(
+                " esc close · ↑/↓ (pgup/pgdn) scroll ",
+                theme::dim(),
+            ))
+            .alignment(Alignment::Center),
+        );
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let col_w = (inner.width.saturating_sub(3) / 2).max(10) as usize;
+    let max_scroll = rows.len().saturating_sub(inner.height as usize);
+    let scroll = scroll.min(max_scroll);
+    let end = (scroll + inner.height as usize).min(rows.len());
+    let mut shown: Vec<Line> = Vec::new();
+    for row in &rows[scroll..end] {
+        let line = match row {
+            super::highlight::DiffRow::Header(h) => Line::from(Span::styled(
+                h.to_string(),
+                if h.starts_with("@@") {
+                    theme::teal()
+                } else {
+                    theme::dim()
+                },
+            )),
+            super::highlight::DiffRow::Pair(old, new) => {
+                let old_txt = old.as_deref().unwrap_or("");
+                let new_txt = new.as_deref().unwrap_or("");
+                let old_pad = old_txt.chars().count().min(col_w);
+                let old_spans = if old.is_some() && new.is_some() {
+                    vec![Span::styled(old_txt.to_string(), theme::text())]
+                } else if old.is_some() {
+                    vec![Span::styled(old_txt.to_string(), theme::red())]
+                } else {
+                    vec![Span::styled("", theme::dim())]
+                };
+                let new_spans = if new.is_some() && old.is_some() {
+                    vec![Span::styled(new_txt.to_string(), theme::text())]
+                } else if new.is_some() {
+                    vec![Span::styled(new_txt.to_string(), theme::green())]
+                } else {
+                    vec![Span::styled("", theme::dim())]
+                };
+                let mut spans = old_spans;
+                let pad = " ".repeat(col_w.saturating_sub(old_pad));
+                spans.push(Span::styled(pad, theme::dim()));
+                spans.push(Span::styled("│", theme::border_soft()));
+                spans.push(Span::styled(" ", theme::dim()));
+                spans.extend(new_spans);
+                Line::from(spans)
+            }
+        };
+        shown.push(line);
+    }
+    f.render_widget(Paragraph::new(shown), inner);
+}
+
 /// Cap on the model/provider picker popups' height — without this a big
 /// catalog (an aggregator provider alone can list 50+ models) sizes the
 /// popup to fit every row at once and the modal swallows nearly the whole
@@ -2211,7 +2399,7 @@ fn render_model_picker(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style())
-        .style(Style::default().bg(theme::MODAL_BG))
+        .style(Style::default().bg(theme::modal_bg()))
         .title(Line::from(vec![Span::styled(
             " Select model ",
             theme::text().add_modifier(Modifier::BOLD),
@@ -2323,8 +2511,8 @@ fn render_model_picker(
     // panel-tint + colored-text highlight.
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(theme::MODAL_SELECTED_BG)
-            .fg(theme::VOID)
+            .bg(theme::modal_selected_bg())
+            .fg(theme::void())
             .add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
@@ -2369,7 +2557,7 @@ fn render_provider_picker(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style())
-        .style(Style::default().bg(theme::MODAL_BG))
+        .style(Style::default().bg(theme::modal_bg()))
         .title(Line::from(vec![Span::styled(
             " Select provider ",
             theme::text().add_modifier(Modifier::BOLD),
@@ -2415,8 +2603,8 @@ fn render_provider_picker(
         .collect();
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(theme::MODAL_SELECTED_BG)
-            .fg(theme::VOID)
+            .bg(theme::modal_selected_bg())
+            .fg(theme::void())
             .add_modifier(Modifier::BOLD),
     );
     let mut list_state = ListState::default();
@@ -2512,7 +2700,7 @@ fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, _config: &Config) 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(area.width as usize),
-            Style::default().fg(theme::BORDER),
+            Style::default().fg(theme::border()),
         ))),
         rows[1],
     );
@@ -2532,7 +2720,7 @@ fn mode_pills_line(mode: AgentMode) -> Line<'static> {
             spans.push(Span::styled(
                 format!(" {} ", name),
                 Style::default()
-                    .fg(theme::VOID)
+                    .fg(theme::void())
                     .bg(mode_accent(*m))
                     .add_modifier(Modifier::BOLD),
             ));
@@ -2553,7 +2741,7 @@ fn mode_pills_line(mode: AgentMode) -> Line<'static> {
 fn render_side(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
     // Fill the panel background.
     f.render_widget(
-        Paragraph::new("").style(Style::default().bg(theme::PANEL)),
+        Paragraph::new("").style(Style::default().bg(theme::panel())),
         area,
     );
 
@@ -2582,7 +2770,9 @@ fn render_side(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
     let head = Line::from(vec![
         Span::styled(
             "TODOs",
-            Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::dim_color())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
@@ -2668,7 +2858,7 @@ fn render_todos(f: &mut Frame, area: Rect, state: &AppState) {
             let box_mark = if item.done { "✓" } else { " " };
             let box_style = if item.done {
                 Style::default()
-                    .fg(theme::VOID)
+                    .fg(theme::void())
                     .bg(theme::GREEN)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -2676,7 +2866,7 @@ fn render_todos(f: &mut Frame, area: Rect, state: &AppState) {
             };
             let label_style = if item.done {
                 Style::default()
-                    .fg(theme::FAINT)
+                    .fg(theme::faint_color())
                     .add_modifier(Modifier::CROSSED_OUT)
             } else {
                 theme::text()
@@ -2706,7 +2896,9 @@ fn render_todos(f: &mut Frame, area: Rect, state: &AppState) {
 fn render_files(f: &mut Frame, area: Rect, state: &AppState) {
     let mut lines = vec![Line::from(Span::styled(
         "Files",
-        Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::dim_color())
+            .add_modifier(Modifier::BOLD),
     ))];
     let max_rows = (area.height as usize).saturating_sub(1);
     for path in state.files_touched.iter().rev().take(max_rows) {
@@ -2794,7 +2986,7 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     // particle simulation redrawing every tick was a real, measurable
     // source of lag for little payoff on a screen that's mostly text).
     f.render_widget(
-        Block::default().style(Style::default().bg(theme::INK)),
+        Block::default().style(Style::default().bg(theme::ink())),
         area,
     );
 
@@ -2808,26 +3000,18 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     let composer_w = (area.width.saturating_sub(8)).clamp(24, 64);
     // Borders (2) + "› " prefix (2) + "➜" suffix (3).
     let composer_text_w = (composer_w as usize).saturating_sub(7).max(10);
-    let wrapped_input = wrap_text(&state.input, composer_text_w);
+    let wrapped_input = wrap_preserving_newlines(&state.input, composer_text_w);
     let composer_text_h = wrapped_input.len().clamp(1, 10) as u16;
     let composer_h = composer_text_h + 2;
 
     // Slash-command palette sizing, same reasoning, plus it now reserves
     // its own space below the composer instead of the chips/hint sharing
     // the same `y` and getting painted over by it.
-    // Owned, not borrowed from `state` — `command_matches()` borrows
-    // `state.known_commands` through `&self`, which can't live across the
+    // Owned, not borrowed from `state` — `menu()` returns owned entries
+    // and borrows `state` only briefly, so it can't live across the
     // `state.chip_areas`/`state.command_menu_area` writes further down.
-    let palette_matches: Vec<(String, String)> = state
-        .command_matches()
-        .into_iter()
-        .map(|(n, d)| (n.to_string(), d.to_string()))
-        .collect();
-    let palette_refs: Vec<(&str, &str)> = palette_matches
-        .iter()
-        .map(|(n, d)| (n.as_str(), d.as_str()))
-        .collect();
-    let menu_h = menu_height(&palette_refs);
+    let (palette_matches, _menu_kind) = state.menu();
+    let menu_h = menu_height(&palette_matches);
 
     // ---- Centered content stack ----
     const STATUS_H: u16 = 1;
@@ -2859,7 +3043,11 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     // instead of pointing straight at `/model`/`/provider` up front.
     let ready = provider_status_ok(config, &state.provider);
     let pulse = 0.5 + 0.5 * (t_ms * 0.0024).sin();
-    let dot_color = if ready { theme::TEAL } else { theme::GOLD };
+    let dot_color = if ready {
+        theme::teal_color()
+    } else {
+        theme::GOLD
+    };
     let dot_style = if pulse > 0.6 {
         Style::default().fg(dot_color).add_modifier(Modifier::BOLD)
     } else {
@@ -2925,8 +3113,8 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     let composer_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::TEAL))
-        .style(Style::default().bg(theme::INK));
+        .border_style(Style::default().fg(theme::teal_color()))
+        .style(Style::default().bg(theme::ink()));
     let composer_inner = composer_block.inner(composer_area);
     f.render_widget(composer_block, composer_area);
     let cols = Layout::horizontal([
@@ -2955,7 +3143,7 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     let send_style = if ready {
         // The lit-up half of the HTML's teal→cyan send-button gradient.
         Style::default()
-            .fg(theme::EMPTY_CYAN)
+            .fg(theme::empty_cyan_color())
             .add_modifier(Modifier::BOLD)
     } else {
         theme::empty_faint()
@@ -2966,7 +3154,7 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     );
     if matches!(state.mode, Mode::Chat) && !state.busy {
         let typed_before: String = state.input.chars().take(state.cursor).collect();
-        let wrapped_before = wrap_text(&typed_before, composer_text_w);
+        let wrapped_before = wrap_preserving_newlines(&typed_before, composer_text_w);
         let last_row = composer_text_h.saturating_sub(1);
         let cursor_row = (wrapped_before.len() as u16)
             .saturating_sub(1)
@@ -3031,8 +3219,15 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
         hint_area,
     );
 
-    state.command_menu_area = menu_area
-        .map(|area| render_menu(f, area, &palette_refs, state.command_selected, theme::TEAL));
+    state.command_menu_area = menu_area.map(|area| {
+        render_menu(
+            f,
+            area,
+            &palette_matches,
+            state.command_selected,
+            theme::teal_color(),
+        )
+    });
 }
 
 fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
@@ -3046,7 +3241,7 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
 
     // Fill the whole frame with the void background first.
     f.render_widget(
-        Block::default().style(Style::default().bg(theme::VOID)),
+        Block::default().style(Style::default().bg(theme::void())),
         area,
     );
 
@@ -3073,7 +3268,7 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
 
     if has_side {
         let divider = vec![
-            Line::from(Span::styled("│", Style::default().fg(theme::BORDER)));
+            Line::from(Span::styled("│", Style::default().fg(theme::border())));
             main[2].height as usize
         ];
         f.render_widget(Paragraph::new(divider), main[2]);
@@ -3093,6 +3288,7 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
             | Mode::ProviderPicker { .. }
             | Mode::KeyEntry { .. }
             | Mode::Approval { .. }
+            | Mode::Diff { .. }
     ) || state.session_picker.is_some();
     if any_modal_open {
         dim_backdrop(f, area);
@@ -3145,6 +3341,10 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
 
     if let Mode::Approval { pending, scroll } = &state.mode {
         render_approval_modal(f, area, pending, *scroll);
+    }
+
+    if let Mode::Diff { rows, scroll } = &state.mode {
+        render_diff_modal(f, area, rows, *scroll);
     }
 
     if let Some(search) = &state.search {
@@ -3473,6 +3673,23 @@ async fn handle_key(
         return Ok(());
     }
 
+    // ---- Two-pane diff view (`/diff`) ----
+    if let Mode::Diff { .. } = &state.mode {
+        if let Mode::Diff { scroll, .. } = &mut state.mode {
+            match key.code {
+                KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down => *scroll = scroll.saturating_add(1),
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(20),
+                KeyCode::PageDown => *scroll = scroll.saturating_add(20),
+                _ => {}
+            }
+        }
+        if key.code == KeyCode::Esc {
+            state.mode = Mode::Chat;
+        }
+        return Ok(());
+    }
+
     // ---- Session-resume picker ----
     if let Some(picker) = state.session_picker.as_ref() {
         let filtered_len = session_picker_filtered(picker).len();
@@ -3787,6 +4004,10 @@ async fn handle_key(
         // this point), but composing the *next* message doesn't have to
         // wait for this one to finish first.
         match key.code {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                insert_char_at(&mut state.input, state.cursor, '\n');
+                state.cursor += 1;
+            }
             KeyCode::Enter => {
                 let trimmed = state.input.trim().to_string();
                 if !trimmed.is_empty() {
@@ -3821,10 +4042,12 @@ async fn handle_key(
         return Ok(());
     }
 
-    // While the slash-command dropdown is open, arrow keys move the
-    // highlight and Enter/Tab accept the highlighted entry (filling the
-    // input, ready for arguments) instead of their normal effect.
-    let menu_len = state.command_matches().len();
+    // While the slash-command / model-autocomplete dropdown is open, arrow
+    // keys move the highlight and Enter/Tab accept the highlighted entry
+    // instead of their normal effect — commands fill `/cmd ` ready for
+    // arguments, models swap the trailing `@…` token for the picked name.
+    let (menu_entries, menu_kind) = state.menu();
+    let menu_len = menu_entries.len();
     if menu_len > 0 {
         match key.code {
             KeyCode::Up => {
@@ -3841,8 +4064,22 @@ async fn handle_key(
             }
             KeyCode::Enter | KeyCode::Tab => {
                 let idx = state.command_selected.min(menu_len - 1);
-                let selected = state.command_matches()[idx].0.to_string();
-                state.input = format!("/{selected} ");
+                let selected = menu_entries[idx].0.clone();
+                match menu_kind {
+                    MenuKind::Commands => {
+                        state.input = format!("/{selected} ");
+                    }
+                    MenuKind::Models => {
+                        // Swap everything after the last `@` (the partial)
+                        // for the picked model, keeping any leading text.
+                        if let Some(at) = state.input.rfind('@') {
+                            state.input.truncate(at + 1);
+                            state.input.push_str(&selected);
+                        } else {
+                            state.input = selected;
+                        }
+                    }
+                }
                 state.cursor = char_count(&state.input);
                 state.command_selected = 0;
                 return Ok(());
@@ -3862,6 +4099,10 @@ async fn handle_key(
             if let Some(agent) = agent_slot.as_ref() {
                 apply_agent_mode(agent, state.agent_mode);
             }
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            insert_char_at(&mut state.input, state.cursor, '\n');
+            state.cursor += 1;
         }
         KeyCode::Enter => {
             if state.input.trim().is_empty() {
@@ -3990,7 +4231,10 @@ async fn handle_key(
                                 Ok(out) if out.stdout.trim().is_empty() => {
                                     state.push_info("(no changes)")
                                 }
-                                Ok(out) => state.push_info(out.stdout),
+                                Ok(out) => {
+                                    let rows = super::highlight::side_by_side_rows(&out.stdout);
+                                    state.mode = Mode::Diff { rows, scroll: 0 };
+                                }
                                 Err(e) => state.push_error(format!("diff failed: {e}")),
                             }
                         }
@@ -4069,6 +4313,46 @@ async fn handle_key(
                             _ => state.push_error(
                                 "usage: /settings [reduced_motion on|off] [notify on|off] [accent <#hex>|reset]",
                             ),
+                        }
+                    }
+                    "theme" => {
+                        let path = &config.global.settings_toml;
+                        match arg.trim() {
+                            "" => {
+                                state.push_info(format!(
+                                    "theme: {} (available: {})",
+                                    theme::current_theme().label(),
+                                    theme::ThemeKind::ALL
+                                        .iter()
+                                        .map(|k| k.label())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ));
+                            }
+                            name => match theme::ThemeKind::from_label(name) {
+                                Some(kind) => {
+                                    theme::set_theme(kind);
+                                    match zeus_config::set_theme(
+                                        path,
+                                        Some(kind.label().to_string()),
+                                    ) {
+                                        Ok(()) => {
+                                            state.push_info(format!("theme: {}", kind.label()))
+                                        }
+                                        Err(e) => {
+                                            state.push_error(format!("couldn't save setting: {e}"))
+                                        }
+                                    }
+                                }
+                                None => state.push_error(format!(
+                                    "'{name}' isn't a theme — try {}",
+                                    theme::ThemeKind::ALL
+                                        .iter()
+                                        .map(|k| k.label())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )),
+                            },
                         }
                     }
                     "model" => {
@@ -4457,9 +4741,10 @@ async fn handle_mouse(
             return;
         }
 
-        // Slash-command palette: click a row to accept it, same as
-        // pressing Enter/Tab on the highlighted entry — fills the input
-        // ready for arguments rather than sending immediately.
+        // Slash-command / model-autocomplete palette: click a row to
+        // accept it, same as pressing Enter/Tab on the highlighted entry —
+        // commands fill the input ready for arguments, models swap the
+        // trailing `@…` token, rather than sending immediately.
         if let Some(area) = state.command_menu_area {
             if col >= area.x
                 && col < area.x + area.width
@@ -4467,9 +4752,20 @@ async fn handle_mouse(
                 && row < area.y + area.height
             {
                 let idx = (row - area.y) as usize;
-                let name = state.command_matches().get(idx).map(|(n, _)| n.to_string());
-                if let Some(name) = name {
-                    state.input = format!("/{name} ");
+                let (entries, kind) = state.menu();
+                let selected = entries.get(idx).map(|(n, _)| n.clone());
+                if let Some(selected) = selected {
+                    match kind {
+                        MenuKind::Commands => state.input = format!("/{selected} "),
+                        MenuKind::Models => {
+                            if let Some(at) = state.input.rfind('@') {
+                                state.input.truncate(at + 1);
+                                state.input.push_str(&selected);
+                            } else {
+                                state.input = selected;
+                            }
+                        }
+                    }
                     state.cursor = char_count(&state.input);
                     state.command_selected = 0;
                 }
@@ -4582,11 +4878,11 @@ async fn handle_mouse(
         }
     }
 
-    // Slash-command palette: scroll to move the highlight, without needing
-    // to be over the palette itself — it's the only thing visible to
-    // scroll while it's open.
+    // Slash-command / model-autocomplete palette: scroll to move the
+    // highlight, without needing to be over the palette itself — it's the
+    // only thing visible to scroll while it's open.
     if !state.busy {
-        let menu_len = state.command_matches().len();
+        let menu_len = state.menu().0.len();
         if menu_len > 0 {
             match ev.kind {
                 MouseEventKind::ScrollUp => {
@@ -4719,6 +5015,19 @@ async fn handle_mouse(
                 _ => {}
             }
         }
+        Mode::Diff { .. } => match ev.kind {
+            MouseEventKind::ScrollUp => {
+                if let Mode::Diff { scroll, .. } = &mut state.mode {
+                    *scroll = scroll.saturating_sub(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Mode::Diff { scroll, .. } = &mut state.mode {
+                    *scroll = scroll.saturating_add(3);
+                }
+            }
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -5025,6 +5334,7 @@ pub async fn run(config: &Config, agent: Agent, yes: bool) -> Result<()> {
         config.settings.accent_color.as_deref(),
         config.settings.reduced_motion,
         config.settings.notify_on_completion,
+        config.settings.theme.as_deref(),
     );
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -5123,6 +5433,81 @@ mod tests {
     }
 
     #[test]
+    fn model_matches_trigger_on_at_token_and_filter() {
+        let cache: Vec<(String, Vec<zeus_provider::ModelInfo>)> = vec![(
+            "openrouter".to_string(),
+            vec![
+                zeus_provider::ModelInfo {
+                    id: "claude-sonnet-4".to_string(),
+                    name: String::new(),
+                    context_window: None,
+                },
+                zeus_provider::ModelInfo {
+                    id: "gpt-5".to_string(),
+                    name: String::new(),
+                    context_window: None,
+                },
+            ],
+        )];
+        let recent: Vec<(String, String)> =
+            vec![("openrouter".to_string(), "deepseek".to_string())];
+        let favorites: Vec<(String, String)> = Vec::new();
+
+        // Bare `@` lists everything the app knows about, de-duplicated.
+        let all = filter_model_matches("@", &cache, &recent, &favorites);
+        assert_eq!(
+            all,
+            vec![
+                (
+                    "openrouter/claude-sonnet-4".to_string(),
+                    "openrouter".to_string()
+                ),
+                ("openrouter/gpt-5".to_string(), "openrouter".to_string()),
+                ("openrouter/deepseek".to_string(), "openrouter".to_string()),
+            ]
+        );
+
+        // A partial narrows case-insensitively by prefix.
+        let claude = filter_model_matches("use @CLAU", &cache, &recent, &favorites);
+        assert_eq!(
+            claude,
+            vec![(
+                "openrouter/claude-sonnet-4".to_string(),
+                "openrouter".to_string()
+            )]
+        );
+
+        // Mid-sentence `@` also triggers (trailing token), and a provider/
+        // model that doesn't match is dropped.
+        let deep = filter_model_matches("switch to @deep", &cache, &recent, &favorites);
+        assert_eq!(
+            deep,
+            vec![("openrouter/deepseek".to_string(), "openrouter".to_string())]
+        );
+
+        // No `@` in the input means no autocomplete.
+        assert!(filter_model_matches("hello world", &cache, &recent, &favorites).is_empty());
+        // A non-trailing `@` (mid-word, followed by text after whitespace)
+        // doesn't trigger — only the last whitespace token counts.
+        assert!(filter_model_matches("hi @x there", &cache, &recent, &favorites).is_empty());
+    }
+
+    #[test]
+    fn menu_prefers_commands_but_falls_back_to_models() {
+        let cache: Vec<(String, Vec<zeus_provider::ModelInfo>)> = vec![(
+            "openrouter".to_string(),
+            vec![zeus_provider::ModelInfo {
+                id: "gpt-5".to_string(),
+                name: String::new(),
+                context_window: None,
+            }],
+        )];
+        // No `@`, no slash-prefix → nothing to show.
+        let matches = filter_model_matches("plain text", &cache, &[], &[]);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
     fn selection_plain_text_joins_selected_blocks() {
         let transcript: Vec<Block_> = vec![
             Block_::new(Role::User, "first question".into()),
@@ -5154,7 +5539,7 @@ mod tests {
         // Block 0 spans rows 0..2, block 1 spans rows 3..6 (wrapped).
         let rows = vec![(0u16, 2u16), (3u16, 6u16)];
         assert_eq!(transcript_block_at(10, 1, area, &rows, 0), Some(0));
-        assert_eq!(transcript_block_at(10, 4, area, &rows, 0), Some(1));
+        assert_eq!(transcript_block_at(10, 4, area, &rows, 1), Some(1));
         // The blank separator row between blocks hits nothing.
         assert_eq!(transcript_block_at(10, 2, area, &rows, 0), None);
         // Outside the pane: no block.
@@ -5163,5 +5548,300 @@ mod tests {
         assert_eq!(transcript_block_at(10, 1, area, &rows, 2), Some(1));
         // Without a computed area there is nothing to hit.
         assert_eq!(transcript_block_at(10, 1, None, &rows, 0), None);
+    }
+
+    // ---- TUI golden tests: modal renders, key/mouse handling ----
+
+    /// Build a minimal in-memory `Agent` rooted at a temp project dir (same
+    /// shape as `zeus-agent`'s own test harness): an `UnconfiguredProvider`
+    /// (never called — these tests only render/handle input), a `ToolManager`
+    /// over a temp workspace, and a fresh session. Lets `AppState::new`
+    /// construct a real state without touching the network or the user's
+    /// `~/.zeus`.
+    fn test_agent(root: &std::path::Path) -> Agent {
+        let config = test_config(root);
+        let workspace = zeus_fs::Workspace::from_config(&config).unwrap();
+        let terminal = zeus_agent::TerminalRunner::new(root.join(".agent/checkpoints"));
+        let background = zeus_agent::BackgroundTaskRegistry::new(root.join(".agent/background"));
+        let hooks = zeus_agent::HookRunner::new(root.join(".agent/hooks"), root.to_path_buf());
+        let mut tools = zeus_agent::ToolManager::new(
+            workspace,
+            terminal,
+            background,
+            hooks,
+            Vec::new(),
+            Vec::new(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        tools.set_global_skills_dir(None);
+        Agent::new(
+            std::sync::Arc::new(zeus_provider::UnconfiguredProvider { requested: None }),
+            tools,
+            zeus_agent::ContextManager::new(128_000, 0.8, 6),
+            SessionStore::new(root.join(".sessions")),
+            zeus_agent::ConversationState::new("test-session"),
+            zeus_agent::AgentOptions {
+                model: "test-model".into(),
+                max_tool_iterations: 8,
+                temperature: None,
+                max_tokens: Some(1024),
+                max_parallel_read_steps: 2,
+                tasks_file: None,
+            },
+        )
+    }
+
+    fn test_config(root: &std::path::Path) -> zeus_config::Config {
+        zeus_config::Config {
+            global: zeus_config::GlobalPaths::from_root(root.join(".zeus-home")),
+            project: None,
+            settings: zeus_config::AgentSettings::default(),
+            providers: zeus_config::ProvidersFile::default(),
+            project_root: Some(root.to_path_buf()),
+        }
+    }
+
+    fn test_app_state(root: &std::path::Path) -> (AppState, Config) {
+        let config = test_config(root);
+        let agent = test_agent(root);
+        let state = AppState::new(
+            &agent,
+            Vec::new(),
+            DirInfo { git_branch: None },
+            false,
+            &config,
+        );
+        (state, config)
+    }
+
+    /// Flatten every rendered cell into one string (rows joined by '\n') so
+    /// assertions can check for expected glyphs/columns without depending on
+    /// exact cursor/color internals.
+    fn buffer_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        let mut rows: Vec<String> = Vec::new();
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    line.push_str(cell.symbol());
+                }
+            }
+            rows.push(line);
+        }
+        rows
+    }
+
+    /// The `/diff` modal draws removed/added cells into two columns and
+    /// spans headers across the full width — a golden render that locks in
+    /// the two-pane layout.
+    #[test]
+    fn diff_modal_renders_two_pane_columns() {
+        use crate::highlight::DiffRow;
+        let rows = vec![
+            DiffRow::Header("@@ -1,2 +1,2 @@".to_string()),
+            DiffRow::Pair(Some("before".to_string()), Some("after".to_string())),
+            DiffRow::Pair(Some("only-old".to_string()), None),
+            DiffRow::Pair(None, Some("only-new".to_string())),
+            DiffRow::Pair(Some("same".to_string()), Some("same".to_string())),
+        ];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| render_diff_modal(f, f.area(), &rows, 0))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+
+        // Header row spans the modal: its `@@` hunk marker is present.
+        assert!(rows.iter().any(|r| r.contains("@@ -1,2 +1,2 @@")));
+        // Old/new column cells both appear.
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("before") && r.contains("after")));
+        // A removed-only row shows on the left; an added-only row on the right.
+        assert!(rows.iter().any(|r| r.contains("only-old")));
+        assert!(rows.iter().any(|r| r.contains("only-new")));
+        // Unchanged context fills both cells.
+        assert!(rows.iter().any(|r| r.contains("same")));
+        // The two columns are separated by the divider glyph.
+        assert!(rows.iter().any(|r| r.contains('│')));
+        // Title and bottom hint render.
+        assert!(rows.iter().any(|r| r.contains(" Diff ")));
+        assert!(rows.iter().any(|r| r.contains("esc close")));
+    }
+
+    /// Scrolling the diff modal with ↑/↓ and paging nudges the offset; the
+    /// render clamps it later, so keys just need to move the counter.
+    #[tokio::test]
+    async fn diff_mode_keys_scroll_and_esc_returns_to_chat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _config) = test_app_state(tmp.path());
+        state.mode = Mode::Diff {
+            rows: vec![crate::highlight::DiffRow::Header("@@".into())],
+            scroll: 0,
+        };
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut agent_slot: Option<Agent> = None;
+        let mut turn_handle: Option<TurnJoin> = None;
+        let mut cancel_tx: Option<watch::Sender<bool>> = None;
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key(
+            key(KeyCode::Down),
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &_config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(&state.mode, Mode::Diff { scroll: 1, .. }));
+        handle_key(
+            key(KeyCode::Up),
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &_config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(&state.mode, Mode::Diff { scroll: 0, .. }));
+        handle_key(
+            key(KeyCode::PageDown),
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &_config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(&state.mode, Mode::Diff { scroll: 20, .. }));
+        handle_key(
+            key(KeyCode::Esc),
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &_config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(state.mode, Mode::Chat));
+    }
+
+    /// Mouse wheel scrolls the two-pane diff (3 rows per notch).
+    #[tokio::test]
+    async fn diff_mode_mouse_scroll_adjusts_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _config) = test_app_state(tmp.path());
+        state.mode = Mode::Diff {
+            rows: vec![crate::highlight::DiffRow::Header("@@".into())],
+            scroll: 0,
+        };
+        let mut agent_slot: Option<Agent> = None;
+
+        let scroll = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(
+            scroll(MouseEventKind::ScrollDown),
+            &mut state,
+            &mut agent_slot,
+            &_config,
+        )
+        .await;
+        assert!(matches!(&state.mode, Mode::Diff { scroll: 3, .. }));
+        handle_mouse(
+            scroll(MouseEventKind::ScrollUp),
+            &mut state,
+            &mut agent_slot,
+            &_config,
+        )
+        .await;
+        assert!(matches!(&state.mode, Mode::Diff { scroll: 0, .. }));
+    }
+
+    /// A permission ask renders its description, the actual diff preview is
+    /// two-pane-colorized, and the footer hints at the answer keys.
+    #[test]
+    fn approval_modal_renders_preview_and_hints() {
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        let pending = ApprovalRequestMsg {
+            request: PermissionRequest {
+                tool: "edit".to_string(),
+                path: None,
+                command: None,
+                description: "Allow editing src/main.rs".to_string(),
+                preview: Some(
+                    "diff --git a/src/main.rs b/src/main.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n"
+                        .to_string(),
+                ),
+                overwrites: false,
+            },
+            reply: reply_tx,
+        };
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| render_approval_modal(f, f.area(), &pending, 0))
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+
+        assert!(rows.iter().any(|r| r.contains("Allow editing src/main.rs")));
+        assert!(rows.iter().any(|r| r.contains("Permission needed")));
+        assert!(rows.iter().any(|r| r.contains('│')));
+        assert!(rows.iter().any(|r| r.contains("y approve")));
+    }
+
+    /// Approval keys resolve the oneshot and return to Chat.
+    #[tokio::test]
+    async fn approval_key_y_resolves_and_returns_to_chat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _config) = test_app_state(tmp.path());
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        state.mode = Mode::Approval {
+            pending: ApprovalRequestMsg {
+                request: PermissionRequest {
+                    tool: "edit".to_string(),
+                    path: None,
+                    command: None,
+                    description: "Allow editing".to_string(),
+                    preview: None,
+                    overwrites: false,
+                },
+                reply: reply_tx,
+            },
+            scroll: 0,
+        };
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut agent_slot: Option<Agent> = None;
+        let mut turn_handle: Option<TurnJoin> = None;
+        let mut cancel_tx: Option<watch::Sender<bool>> = None;
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &_config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(state.mode, Mode::Chat));
+        assert_eq!(reply_rx.try_recv().unwrap(), ApprovalDecision::Approved);
     }
 }

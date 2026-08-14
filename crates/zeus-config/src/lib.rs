@@ -16,7 +16,7 @@ pub use keys::KeysFile;
 pub use paths::{ensure_global_dirs, global_home, project_agent_dir, GlobalPaths, ProjectPaths};
 pub use providers::{ProviderConfig, ProvidersFile};
 pub use settings::{
-    set_accent_color, set_notify_on_completion, set_reduced_motion, AgentSettings,
+    set_accent_color, set_notify_on_completion, set_reduced_motion, set_theme, AgentSettings,
     LlamaCppSettings, LocalModelEntry, McpServerConfig, PermissionDefault, PermissionRule,
     PermissionSettings, PermissionState, SettingsLayer, SettingsStack,
 };

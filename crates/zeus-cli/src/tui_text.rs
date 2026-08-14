@@ -39,7 +39,7 @@ pub(crate) fn mask_secret(s: &str) -> String {
     masked
 }
 
-pub(crate) fn menu_height(matches: &[(&str, &str)]) -> u16 {
+pub(crate) fn menu_height<T>(matches: &[T]) -> u16 {
     if matches.is_empty() {
         0
     } else {
@@ -237,9 +237,13 @@ pub(crate) fn gradient_wordmark(text: &str) -> Vec<Span<'static>> {
         .map(|(i, c)| {
             let t = i as f32 / (len - 1.0).max(1.0);
             let color = if t < 0.52 {
-                lerp_color(theme::WORDMARK_START, theme::WORDMARK_MID, t / 0.52)
+                lerp_color(theme::wordmark_start(), theme::wordmark_mid(), t / 0.52)
             } else {
-                lerp_color(theme::WORDMARK_MID, theme::WORDMARK_END, (t - 0.52) / 0.48)
+                lerp_color(
+                    theme::wordmark_mid(),
+                    theme::wordmark_end(),
+                    (t - 0.52) / 0.48,
+                )
             };
             Span::styled(
                 c.to_string(),
@@ -333,7 +337,7 @@ pub(crate) fn opaque(f: &mut Frame, area: Rect) {
     // tinted rather than covered. `Clear` actually resets the cells first.
     f.render_widget(Clear, area);
     f.render_widget(
-        Block::default().style(Style::default().bg(theme::INK)),
+        Block::default().style(Style::default().bg(theme::ink())),
         area,
     );
 }
@@ -526,7 +530,8 @@ mod tests {
 
     #[test]
     fn menu_height_is_zero_when_empty() {
-        assert_eq!(menu_height(&[]), 0);
+        let empty: Vec<(&str, &str)> = Vec::new();
+        assert_eq!(menu_height(&empty), 0);
     }
 
     #[test]

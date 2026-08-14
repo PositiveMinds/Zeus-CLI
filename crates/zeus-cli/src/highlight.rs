@@ -526,6 +526,57 @@ pub fn diff_lines(text: &str, plain_style: Style, width: usize) -> Vec<Vec<Span<
         .collect()
 }
 
+/// One row of a side-by-side diff: a full-width `Header` (file metadata or
+/// `@@` hunk line) or a `Pair` of old/new column cells. A `Pair` with both
+/// sides set is an unchanged context line; a removed-only row shows on the
+/// left, an added-only row on the right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffRow {
+    Header(String),
+    Pair(Option<String>, Option<String>),
+}
+
+/// Parse a unified diff into rows for the two-pane `/diff` view. Removed
+/// (`-`) and added (`+`) lines that appear adjacent are paired 1:1 in order
+/// (FIFO) so a changed line reads as `old → new` across the two columns
+/// rather than two stacked rows. Unchanged lines fill both cells.
+pub fn side_by_side_rows(text: &str) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
+    let mut removed: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for l in text.lines() {
+        let tag = l.chars().next().unwrap_or(' ');
+        if l.starts_with("diff ")
+            || l.starts_with("index ")
+            || l.starts_with("--- ")
+            || l.starts_with("+++ ")
+            || l.starts_with("new file ")
+            || l.starts_with("Binary files ")
+            || tag == '@'
+        {
+            for old in removed.drain(..) {
+                rows.push(DiffRow::Pair(Some(old), None));
+            }
+            rows.push(DiffRow::Header(l.to_string()));
+        } else if tag == '-' {
+            removed.push_back(l[1..].to_string());
+        } else if tag == '+' {
+            match removed.pop_front() {
+                Some(old) => rows.push(DiffRow::Pair(Some(old), Some(l[1..].to_string()))),
+                None => rows.push(DiffRow::Pair(None, Some(l[1..].to_string()))),
+            }
+        } else {
+            for old in removed.drain(..) {
+                rows.push(DiffRow::Pair(Some(old), None));
+            }
+            rows.push(DiffRow::Pair(Some(l.to_string()), Some(l.to_string())));
+        }
+    }
+    for old in removed.drain(..) {
+        rows.push(DiffRow::Pair(Some(old), None));
+    }
+    rows
+}
+
 /// ANSI-escape a unified diff for the plain REPL / non-TUI output. Honors the
 /// same fancy-output gate as the rest of the REPL styling (`styled`): when
 /// stdout is piped/redirected or `NO_COLOR` is set, the diff is returned
@@ -584,5 +635,29 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(flat.contains('x'));
+    }
+
+    #[test]
+    fn side_by_side_pairs_adjacent_removed_added() {
+        let text = "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n old\n-changed\n+changed!\nsame\n";
+        let rows = side_by_side_rows(text);
+        assert!(rows[0] == DiffRow::Header("--- a/f".to_string()));
+        assert!(rows[1] == DiffRow::Header("+++ b/f".to_string()));
+        assert!(matches!(&rows[2], DiffRow::Header(h) if h.starts_with("@@")));
+        assert!(rows[3] == DiffRow::Pair(Some(" old".into()), Some(" old".into())));
+        assert!(rows[4] == DiffRow::Pair(Some("changed".into()), Some("changed!".into())));
+        assert!(rows[5] == DiffRow::Pair(Some("same".into()), Some("same".into())));
+    }
+
+    #[test]
+    fn side_by_side_unmatched_removed_and_added_stand_alone() {
+        let rows = side_by_side_rows("@@ -1 +1 @@\n-old\n+new\n");
+        assert!(rows[1] == DiffRow::Pair(Some("old".into()), Some("new".into())));
+    }
+
+    #[test]
+    fn side_by_side_removed_only_rows_have_empty_right_cell() {
+        let rows = side_by_side_rows("@@ -1 +1 @@\n-dead\n");
+        assert!(rows[1] == DiffRow::Pair(Some("dead".into()), None));
     }
 }

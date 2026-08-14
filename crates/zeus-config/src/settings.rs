@@ -100,6 +100,10 @@ pub struct AgentSettings {
     /// has configured an audible one.
     #[serde(default = "default_true")]
     pub notify_on_completion: bool,
+    /// TUI color theme preset as a name (`dark`, `light`, `high-contrast`),
+    /// persisted from `/theme`. `None` (the default) keeps `dark`.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 /// One configured external MCP tool server, spawned over stdio.
@@ -474,6 +478,8 @@ struct PartialSettings {
     accent_color: Option<String>,
     #[serde(default)]
     notify_on_completion: Option<bool>,
+    #[serde(default)]
+    theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -542,6 +548,7 @@ impl SettingsStack {
                 reduced_motion: Some(false),
                 accent_color: None,
                 notify_on_completion: Some(true),
+                theme: None,
             },
         ));
         s
@@ -595,6 +602,7 @@ impl SettingsStack {
             reduced_motion: false,
             accent_color: None,
             notify_on_completion: true,
+            theme: None,
         };
 
         for (_layer, partial) in &self.layers {
@@ -670,6 +678,9 @@ impl SettingsStack {
             }
             if let Some(v) = partial.notify_on_completion {
                 out.notify_on_completion = v;
+            }
+            if let Some(theme) = &partial.theme {
+                out.theme = Some(theme.clone());
             }
             if let Some(roots) = &partial.project_roots {
                 // Later layers replace the list entirely when present.
@@ -802,6 +813,13 @@ pub fn set_accent_color(path: &Path, value: Option<String>) -> Result<()> {
 pub fn set_notify_on_completion(path: &Path, value: bool) -> Result<()> {
     let mut partial = load_partial(path)?;
     partial.notify_on_completion = Some(value);
+    save_partial(path, &partial)
+}
+
+/// Same, for the TUI theme preset (`None` clears back to `dark`).
+pub fn set_theme(path: &Path, value: Option<String>) -> Result<()> {
+    let mut partial = load_partial(path)?;
+    partial.theme = value;
     save_partial(path, &partial)
 }
 
