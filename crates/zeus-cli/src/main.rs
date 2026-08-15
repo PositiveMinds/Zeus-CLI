@@ -2479,6 +2479,11 @@ fn cmd_bulk_edit(
     yes: bool,
 ) -> Result<()> {
     let ws = workspace(config)?;
+    let roots = if roots.is_empty() {
+        vec![ws.project_root.clone()]
+    } else {
+        roots
+    };
     let plan = ws
         .files
         .bulk_edit_plan(&roots, &old, &new, replace_all)

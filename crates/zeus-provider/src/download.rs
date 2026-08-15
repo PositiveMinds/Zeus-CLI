@@ -76,8 +76,11 @@ async fn download_attempt(
 
     // Recreate or append depending on whether we resume. `append(true)` is
     // used for the resume case; a 200-with-ignored-range restarts the file.
+    // `write(true)` is always set — Windows rejects `truncate(true)` without
+    // write/append access, and both paths need to write bytes anyway.
     let mut out = tokio::fs::OpenOptions::new()
         .create(true)
+        .write(true)
         .append(offset > 0)
         .truncate(offset == 0)
         .open(tmp_path)
