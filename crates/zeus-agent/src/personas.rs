@@ -886,6 +886,18 @@ mod tests {
     }
 
     #[test]
+    fn read_only_classifies_by_tool_allowlist() {
+        // Only-read tools → read-only safe.
+        assert!(persona_by_id("research-scientist").unwrap().read_only());
+        assert!(persona_by_id("compliance-officer").unwrap().read_only());
+        // Declaring a mutating tool disqualifies the persona.
+        assert!(!persona_by_id("technical-writer").unwrap().read_only());
+        assert!(!persona_by_id("security-architect").unwrap().read_only());
+        // No allow-list at all → treated as potentially mutating.
+        assert!(!persona_by_id("backend-engineer").unwrap().read_only());
+    }
+
+    #[test]
     fn reviewer_personas_are_not_dispatch_targets() {
         let expected_reviewer = [
             "code-reviewer",

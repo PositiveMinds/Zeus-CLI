@@ -2710,13 +2710,14 @@ fn start_plan_turn(
 }
 
 /// Confirmed run of a plan `/plan` just generated — drives
-/// `Agent::orchestrate`, which re-plans the same goal (cheap relative to the
-/// execution itself) and then executes step by step behind its own
-/// `plan_execute` approval prompt. `orchestrate` returns a `(String,
-/// TokenUsage)` pair rather than a `TurnResult`; wrapped into one here so
-/// this flows through the exact same completion handling as every other
-/// turn kind, including the `PlanStepStarted`/`PlanStepDone`/`OrchestrationDone`
-/// events that already drive the sidebar and persona chip.
+/// `Agent::orchestrate`, which offers to resume an approved plan with
+/// pending steps first (re-planning is only the fallback) and then executes
+/// step by step behind its own `plan_execute` approval prompt.
+/// `orchestrate` returns a `(String, TokenUsage)` pair rather than a
+/// `TurnResult`; wrapped into one here so this flows through the exact same
+/// completion handling as every other turn kind, including the
+/// `PlanStepStarted`/`PlanStepDone`/`OrchestrationDone` events that already
+/// drive the sidebar and persona chip.
 fn start_orchestrate_turn(
     state: &mut AppState,
     agent_slot: &mut Option<Agent>,

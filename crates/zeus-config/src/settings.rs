@@ -901,6 +901,20 @@ provider = "openai"
     }
 
     #[test]
+    fn max_parallel_read_steps_resolves_from_layer_and_defaults_to_none() {
+        // Builtin default: no bound configured.
+        assert_eq!(SettingsStack::new().resolve().max_parallel_read_steps, None);
+
+        let tmp = TempDir::new().unwrap();
+        let local = tmp.path().join("local.toml");
+        std::fs::write(&local, "max_parallel_read_steps = 4\n").unwrap();
+        let mut stack = SettingsStack::new();
+        stack.push_file(SettingsLayer::Local, &local).unwrap();
+        let resolved = stack.resolve();
+        assert_eq!(resolved.max_parallel_read_steps, Some(4));
+    }
+
+    #[test]
     fn builtin_denies_destructive_bash() {
         let settings = AgentSettings::default();
         let deny_rm =

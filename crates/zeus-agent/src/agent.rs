@@ -982,7 +982,6 @@ impl Agent {
         // can still be declined here — declined steps never run and stay
         // pending, exactly as on the fresh-plan path.
         let mut accepted: Vec<PlanStep> = Vec::with_capacity(steps.len());
-        let mut declined: Vec<PlanStep> = Vec::new();
         let mut auto_accept = false;
         for step in &steps {
             if auto_accept {
@@ -1005,7 +1004,6 @@ impl Agent {
                     accepted.push(step.clone());
                 }
                 ApprovalDecision::Denied => {
-                    declined.push(step.clone());
                     on_event(AgentEvent::PlanStepDeclined { step: step.clone() });
                 }
             }
@@ -2840,6 +2838,267 @@ mod tests {
         assert!(joined.contains("plan changed vs"), "{joined}");
         assert!(joined.contains("new approach"), "{joined}");
         assert!(joined.contains("old approach"), "{joined}");
+    }
+
+    /// Wraps `MockProvider` but records the tool names offered on each
+    /// request, so a test can assert *what tools a headless step actually
+    /// exposes to the model* rather than what text it happens to produce.
+    #[derive(Clone)]
+    struct CapturingProvider {
+        inner: MockProvider,
+        tools_seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeus_provider::ModelProvider for CapturingProvider {
+        fn supports_prompt_cache(&self) -> bool {
+            self.inner.supports_prompt_cache()
+        }
+        fn id(&self) -> &str {
+            "capturing-mock"
+        }
+        async fn chat(&self, request: ChatRequest) -> zeus_provider::Result<ChatResponse> {
+            self.tools_seen
+                .lock()
+                .unwrap()
+                .push(request.tools.iter().map(|t| t.name.clone()).collect());
+            self.inner.chat(request).await
+        }
+        async fn stream(&self, request: ChatRequest) -> zeus_provider::Result<zeus_provider::ChatStream> {
+            self.tools_seen
+                .lock()
+                .unwrap()
+                .push(request.tools.iter().map(|t| t.name.clone()).collect());
+            self.inner.stream(request).await
+        }
+        async fn list_models(&self) -> zeus_provider::Result<Vec<ModelInfo>> {
+            self.inner.list_models().await
+        }
+        async fn embeddings(&self, request: EmbeddingRequest) -> zeus_provider::Result<EmbeddingResponse> {
+            self.inner.embeddings(request).await
+        }
+        async fn count_tokens(&self, request: TokenCountRequest) -> zeus_provider::Result<TokenCountResponse> {
+            self.inner.count_tokens(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_step_offers_only_read_only_tools() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "content 42").unwrap();
+        let tools = tool_manager(root);
+        let tools_seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            inner: MockProvider::new(vec![
+                MockReply::ToolCalls(vec![(
+                    "call-read".into(),
+                    "read".into(),
+                    r#"{"path":"a.txt"}"#.into(),
+                )]),
+                MockReply::Text("file says content 42".into()),
+            ]),
+            tools_seen: tools_seen.clone(),
+        };
+        let step = PlanStep {
+            id: 1,
+            description: "read a.txt".into(),
+            rationale: "grounding".into(),
+            persona: None,
+        };
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (text, cancelled, _usage) = run_headless_step(
+            &tools,
+            Arc::new(provider),
+            HeadlessSpec {
+                model: "mock".into(),
+                temperature: None,
+                max_tokens: Some(512),
+            },
+            &step,
+            "summarize the repo",
+            "",
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!cancelled);
+        assert_eq!(text, "file says content 42");
+        // Every request a headless step sends exposes only the read-only tool
+        // surface — a `write` call would have been auto-approved if the list
+        // were not filtered, but it can never even be offered here.
+        let seen = tools_seen.lock().unwrap();
+        assert!(!seen.is_empty(), "headless step must send tools");
+        for request_tools in seen.iter() {
+            assert!(request_tools.iter().any(|n| n == "read"));
+            assert!(
+                request_tools.iter().all(|n| crate::tools::is_read_only_tool(n)),
+                "non-read-only tool offered to headless step: {request_tools:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrate_resumes_an_approved_plan_with_pending_steps() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let tasks_file = root.join(".agent/tasks.json");
+        std::fs::create_dir_all(root.join(".agent")).unwrap();
+
+        // A prior run persisted an approved plan with step 1 done and step 2
+        // still pending. Resume should pick up exactly step 2 — no re-planning
+        // (the script has no plan JSON at the front), and the per-step accept
+        // gate still applies to the pending step.
+        let prior = crate::plans::TaskPlan {
+            goal: "do the thing".into(),
+            approved: true,
+            steps: vec![
+                crate::plans::TaskStep {
+                    id: 1,
+                    description: "first".into(),
+                    persona: None,
+                    done: true,
+                },
+                crate::plans::TaskStep {
+                    id: 2,
+                    description: "second".into(),
+                    persona: None,
+                    done: false,
+                },
+            ],
+            notes: String::new(),
+        };
+        prior.write(&tasks_file).unwrap();
+
+        let mut agent = test_agent(
+            root,
+            MockProvider::new(vec![
+                MockReply::Text("did the second thing".into()),
+                MockReply::Text("verdict: LGTM".into()),
+            ]),
+        );
+        agent.options.tasks_file = Some(tasks_file.clone());
+        let mut requested: Vec<String> = Vec::new();
+        let (summary, _usage) = agent
+            .orchestrate(
+                "do the thing",
+                |_ev| {},
+                |req: &PermissionRequest| {
+                    requested.push(req.tool.clone());
+                    ApprovalDecision::Approved
+                },
+            )
+            .await
+            .unwrap();
+
+        // The resume gate fired; the plan-execute gate did not.
+        assert!(requested.iter().any(|t| t == "plan_resume"), "{requested:?}");
+        assert!(!requested.iter().any(|t| t == "plan_execute"), "{requested:?}");
+        // Step 2 ran (only the pending step), and the review accepted it.
+        assert!(summary.contains("did the second thing"), "{summary}");
+        assert!(requested.iter().any(|t| t == "review_accept"), "{requested:?}");
+        // The persisted plan now shows both steps done.
+        let plan = crate::plans::TaskPlan::read(&tasks_file)
+            .unwrap()
+            .expect("tasks.json written");
+        assert_eq!(plan.completed(), 2, "both steps done after resume");
+        assert!(plan.steps.iter().all(|s| s.done));
+    }
+
+    #[tokio::test]
+    async fn orchestrate_declined_resume_falls_back_to_fresh_plan() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let tasks_file = root.join(".agent/tasks.json");
+        std::fs::create_dir_all(root.join(".agent")).unwrap();
+
+        let prior = crate::plans::TaskPlan {
+            goal: "do the thing".into(),
+            approved: true,
+            steps: vec![crate::plans::TaskStep {
+                id: 1,
+                description: "old stale step".into(),
+                persona: None,
+                done: false,
+            }],
+            notes: String::new(),
+        };
+        prior.write(&tasks_file).unwrap();
+
+        // Resume is declined, so orchestration re-plans from scratch — the
+        // script therefore starts with a plan JSON (popped by `plan_task`'s
+        // chat call), then the step and review stream answers.
+        let mut agent = test_agent(
+            root,
+            MockProvider::new(orchestration_script(
+                r#"[{"description":"fresh approach","rationale":"re-planned"}]"#,
+                "fresh step done",
+                "verdict: LGTM",
+            )),
+        );
+        agent.options.tasks_file = Some(tasks_file.clone());
+        let mut requested: Vec<String> = Vec::new();
+        let (summary, _usage) = agent
+            .orchestrate(
+                "do the thing",
+                |_ev| {},
+                |req: &PermissionRequest| {
+                    requested.push(req.tool.clone());
+                    if req.tool == "plan_resume" {
+                        ApprovalDecision::Denied
+                    } else {
+                        ApprovalDecision::Approved
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(requested.iter().any(|t| t == "plan_resume"), "{requested:?}");
+        assert!(requested.iter().any(|t| t == "plan_execute"), "{requested:?}");
+        assert!(summary.contains("fresh step done"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn orchestrate_blocks_reviewer_mutation_under_plan_mode() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Script: plan JSON (chat), step text (stream), then the reviewer
+        // tries to `write` a file — under forced Plan mode that must be
+        // blocked and surfaced as a tool error, not written to disk.
+        let mut agent = test_agent(
+            root,
+            MockProvider::new(vec![
+                MockReply::Text(
+                    r#"[{"description":"add a test","rationale":"proves behavior"}]"#.to_string(),
+                ),
+                MockReply::Text("step one done".to_string()),
+                MockReply::ToolCalls(vec![(
+                    "call-write".into(),
+                    "write".into(),
+                    r#"{"path":"pwned.txt","content":"evil"}"#.into(),
+                )]),
+                MockReply::Text("verdict: LGTM".to_string()),
+            ]),
+        );
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let (summary, _usage) = agent
+            .orchestrate("add a test", |ev| events.push(ev), approve)
+            .await
+            .unwrap();
+
+        assert!(summary.contains("Review:"), "{summary}");
+        let blocked = events.iter().find_map(|e| match e {
+            AgentEvent::ToolCallFinished { name, result, is_error, .. } if name == "write" => {
+                Some((result.clone(), *is_error))
+            }
+            _ => None,
+        });
+        let (result, is_error) = blocked.expect("write tool call recorded");
+        assert!(is_error, "write during review must be an error result");
+        assert!(result.contains("Plan mode is active"), "{result}");
+        assert!(!root.join("pwned.txt").exists(), "reviewer write must not land on disk");
     }
 
     #[tokio::test]

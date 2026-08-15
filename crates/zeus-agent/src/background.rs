@@ -448,6 +448,27 @@ mod tests {
     }
 
     #[test]
+    fn next_id_is_monotonic_across_registry_instances() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".agent/background");
+        // Two separate registry instances (as separate `zeus bg` processes
+        // would be) share the same on-disk counter. Sequential calls from
+        // each must mint distinct, increasing ids — no reuse after the other
+        // instance bumped the counter.
+        let a = BackgroundTaskRegistry::new(dir.clone());
+        let b = BackgroundTaskRegistry::new(dir.clone());
+
+        assert_eq!(a.next_id().unwrap(), 1);
+        assert_eq!(b.next_id().unwrap(), 2);
+        assert_eq!(a.next_id().unwrap(), 3);
+        assert_eq!(b.next_id().unwrap(), 4);
+
+        // The counter file was rewritten by the second call, not the first.
+        let counter = std::fs::read_to_string(a.counter_path()).unwrap();
+        assert_eq!(counter.trim(), "4");
+    }
+
+    #[test]
     fn spawn_list_and_stop() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("proj");
