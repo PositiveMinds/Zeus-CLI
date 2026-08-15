@@ -107,9 +107,9 @@ prompt_cache = true
 
 [providers.gemini]
 kind = "gemini"
-base_url = "https://generativelanguage.googleapis.com"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 api_key_env = "GEMINI_API_KEY"
-default_model = "gemini-2.0-flash"
+default_model = "gemini-3.6-flash"
 embeddings = true
 prompt_cache = false
 
@@ -303,7 +303,7 @@ prompt_cache = false
                 kind: "gemini".into(),
                 base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai".into()),
                 api_key_env: Some("GEMINI_API_KEY".into()),
-                default_model: Some("gemini-2.0-flash".into()),
+                default_model: Some("gemini-3.6-flash".into()),
                 headers: HashMap::new(),
                 embeddings: true,
                 prompt_cache: false,
