@@ -27,6 +27,13 @@ use crate::error::{FsError, Result};
 /// On-disk index filename (matches `ProjectPaths::index_json`).
 pub const INDEX_FILE: &str = ".agent/index.json";
 
+/// The RAG chunk index written by `rag_index`/the `rag_index` tool. Same
+/// "generated artifact" status as [`INDEX_FILE`], so reference searches must
+/// not report it either. Kept in sync with `zeus_rag::INDEX_FILE`; zeus-fs
+/// can't import that crate (would be a dependency cycle), so the path lives
+/// here as its own constant with a doc-level contract to match.
+pub const RAG_INDEX_FILE: &str = ".agent/rag_index.json";
+
 /// Skip files larger than this — huge generated/minified blobs add little to a
 /// symbol index and cost scan time.
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -400,21 +407,25 @@ pub fn paths_equal(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
-/// Drop reference hits that point at this project's own symbol-index file —
-/// a reference search must never count the generated `.agent/index.json` as a
-/// reference. Uses [`crate::search::GrepMatch`] so callers can feed grep
-/// results straight in.
-/// Drop hits that point at this project's own symbol-index file — a
-/// reference search must never report the generated `.agent/index.json` as a
-/// reference. Tolerates both absolute and project-relative hit paths.
+/// Drop reference hits that point at this project's own generated index
+/// files — a reference search must never count `.agent/index.json` (symbol
+/// index) or `.agent/rag_index.json` (RAG chunk index) as a reference. Uses
+/// [`crate::search::GrepMatch`] so callers can feed grep results straight in.
 pub fn filter_out_own_index(
     root: &Path,
     hits: Vec<crate::search::GrepMatch>,
 ) -> Vec<crate::search::GrepMatch> {
     let own_abs = SymbolIndex::file_path(root);
     let own_rel = PathBuf::from(INDEX_FILE);
+    let rag_abs = root.join(RAG_INDEX_FILE);
+    let rag_rel = PathBuf::from(RAG_INDEX_FILE);
     hits.into_iter()
-        .filter(|h| !paths_equal(&h.path, &own_abs) && !paths_equal(&h.path, &own_rel))
+        .filter(|h| {
+            !paths_equal(&h.path, &own_abs)
+                && !paths_equal(&h.path, &own_rel)
+                && !paths_equal(&h.path, &rag_abs)
+                && !paths_equal(&h.path, &rag_rel)
+        })
         .collect()
 }
 
@@ -505,6 +516,18 @@ mod tests {
                 path: PathBuf::from(".agent/index.json"),
                 line: 9,
                 text: "y".into(),
+                project: None,
+            },
+            GrepMatch {
+                path: PathBuf::from("C:/proj/.agent/rag_index.json"),
+                line: 11,
+                text: "w".into(),
+                project: None,
+            },
+            GrepMatch {
+                path: PathBuf::from(".agent/rag_index.json"),
+                line: 13,
+                text: "v".into(),
                 project: None,
             },
             GrepMatch {
