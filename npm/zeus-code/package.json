@@ -1,6 +1,6 @@
 {
   "name": "zeus-code",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Zeus — an agentic coding CLI for the terminal.",
   "license": "MIT",
   "homepage": "https://github.com/PositiveMinds/Zeus-CLI",
@@ -23,9 +23,9 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "zeus-code-windows-x64": "0.1.1",
-    "zeus-code-linux-x64": "0.1.1",
-    "zeus-code-darwin-x64": "0.1.1",
-    "zeus-code-darwin-arm64": "0.1.1"
+    "zeus-code-windows-x64": "0.1.2",
+    "zeus-code-linux-x64": "0.1.2",
+    "zeus-code-darwin-x64": "0.1.2",
+    "zeus-code-darwin-arm64": "0.1.2"
   }
 }

@@ -30,7 +30,7 @@ codegen-units = 1
 strip = true
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 authors = ["zeus contributors"]
