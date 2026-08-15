@@ -417,8 +417,20 @@ fn detach_into_own_session(cmd: &mut Command) {
     }
 }
 
+/// Give a background child its own process group/session on Windows.
+/// `DETACHED_PROCESS` creates the child with no console and no inherited
+/// console handles, so it keeps running after the spawning `zeus` process
+/// exits — and more importantly it does *not* hold the parent's stdout/stderr
+/// pipe handles open, which would otherwise make an interactive shell wait
+/// for the detached task (e.g. `cmd /C ping -n 600`) before the prompt
+/// returns. This is the Windows equivalent of the Unix `setsid` above.
 #[cfg(windows)]
-fn detach_into_own_session(_cmd: &mut Command) {}
+fn detach_into_own_session(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    cmd.creation_flags(DETACHED_PROCESS);
+}
 
 #[cfg(test)]
 mod tests {
