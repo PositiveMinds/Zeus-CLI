@@ -448,6 +448,9 @@ pub enum BgCmd {
         /// instead of the auto planner.
         #[arg(long)]
         workflow: Option<String>,
+        /// Model override for the orchestrated run (e.g. `deepseek/deepseek-chat`).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// List background tasks and their running/paused/exited status
     List,

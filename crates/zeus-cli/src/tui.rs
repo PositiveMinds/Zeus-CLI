@@ -3892,7 +3892,7 @@ async fn handle_key(
                                 Some((g, name)) => (g.trim(), Some(name.trim())),
                                 None => (rest, None),
                             };
-                            match crate::spawn_bg_orchestrate(config, goal, workflow) {
+                            match crate::spawn_bg_orchestrate(config, goal, workflow, None) {
                                 Ok(id) => {
                                     state.push_info(format!(
                                         "● background orchestration started id={id}"

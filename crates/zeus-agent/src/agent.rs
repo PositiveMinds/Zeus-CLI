@@ -26,6 +26,10 @@ use zeus_provider::{
     TokenUsage, ToolCall, ToolSpec,
 };
 
+/// How many times `drive_turn` re-prompts the model after a degenerate
+/// (empty/malformed) reply before falling back to the explanatory note.
+const MAX_DEGENERATE_RETRIES: usize = 2;
+
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
     pub model: String,
@@ -1755,57 +1759,92 @@ impl Agent {
             if self.auto_mode() {
                 tools.push(delegate_tool_spec());
             }
-            let request = ChatRequest {
-                model: self.options.model.clone(),
-                messages: self.state.messages.clone(),
-                tools,
-                temperature: self.options.temperature,
-                max_tokens: self.options.max_tokens,
-                cancel: Some(self.cancel_rx.clone()),
-            };
+            // A degenerate reply (empty text, or stray JSON punctuation with
+            // no real tool call) is common when a small/free/auto-routed
+            // model chokes on a large tool list. Rather than giving up on
+            // the first dud, retry a bounded number of times with a nudge —
+            // this makes weak default models (e.g. `openrouter/auto`) usable
+            // without the user having to notice and re-run or switch models.
+            let mut degenerate_retries = 0usize;
+            let (text, calls, call_order, finish) = loop {
+                let request = ChatRequest {
+                    model: self.options.model.clone(),
+                    messages: self.state.messages.clone(),
+                    tools: tools.clone(),
+                    temperature: self.options.temperature,
+                    max_tokens: self.options.max_tokens,
+                    cancel: Some(self.cancel_rx.clone()),
+                };
 
-            let mut stream = self
-                .provider
-                .stream(request)
-                .await
-                .map_err(AgentError::Provider)?;
+                let mut stream = self
+                    .provider
+                    .stream(request)
+                    .await
+                    .map_err(AgentError::Provider)?;
 
-            let mut text = String::new();
-            let mut calls: HashMap<String, (Option<String>, String)> = HashMap::new();
-            let mut call_order: Vec<String> = Vec::new();
-            let mut finish = FinishReason::Stop;
+                let mut text = String::new();
+                let mut calls: HashMap<String, (Option<String>, String)> = HashMap::new();
+                let mut call_order: Vec<String> = Vec::new();
+                let mut finish = FinishReason::Stop;
 
-            while let Some(ev) = stream.next().await {
-                match ev.map_err(AgentError::Provider)? {
-                    StreamEvent::TextDelta { text: t } => {
-                        text.push_str(&t);
-                        on_event(AgentEvent::TextDelta(t));
-                    }
-                    StreamEvent::ToolCallDelta {
-                        id,
-                        name,
-                        arguments_delta,
-                    } => {
-                        let entry = calls.entry(id.clone()).or_insert_with(|| {
-                            call_order.push(id.clone());
-                            (None, String::new())
-                        });
-                        if let Some(n) = name {
-                            entry.0 = Some(n);
+                while let Some(ev) = stream.next().await {
+                    match ev.map_err(AgentError::Provider)? {
+                        StreamEvent::TextDelta { text: t } => {
+                            text.push_str(&t);
+                            on_event(AgentEvent::TextDelta(t));
                         }
-                        entry.1.push_str(&arguments_delta);
-                    }
-                    StreamEvent::Done {
-                        finish_reason,
-                        usage,
-                    } => {
-                        total_usage.prompt_tokens += usage.prompt_tokens;
-                        total_usage.completion_tokens += usage.completion_tokens;
-                        total_usage.total_tokens += usage.total_tokens;
-                        finish = finish_reason;
+                        StreamEvent::ToolCallDelta {
+                            id,
+                            name,
+                            arguments_delta,
+                        } => {
+                            let entry = calls.entry(id.clone()).or_insert_with(|| {
+                                call_order.push(id.clone());
+                                (None, String::new())
+                            });
+                            if let Some(n) = name {
+                                entry.0 = Some(n);
+                            }
+                            entry.1.push_str(&arguments_delta);
+                        }
+                        StreamEvent::Done {
+                            finish_reason,
+                            usage,
+                        } => {
+                            total_usage.prompt_tokens += usage.prompt_tokens;
+                            total_usage.completion_tokens += usage.completion_tokens;
+                            total_usage.total_tokens += usage.total_tokens;
+                            finish = finish_reason;
+                        }
                     }
                 }
-            }
+
+                if !calls.is_empty() {
+                    break (text, calls, call_order, finish);
+                }
+                let trimmed = text.trim();
+                let is_degenerate = trimmed.is_empty()
+                    || (!trimmed.is_empty()
+                        && trimmed
+                            .chars()
+                            .all(|c| c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']')));
+                if !is_degenerate || degenerate_retries >= MAX_DEGENERATE_RETRIES {
+                    break (text, calls, call_order, finish);
+                }
+                degenerate_retries += 1;
+                let nudge = format!(
+                    "\n\nYour previous response came back empty or malformed. \
+                     This usually happens when a small model chokes on a large tool list. \
+                     Reply with a concrete answer, or make a valid tool call \
+                     (attempt {} of {}).",
+                    degenerate_retries,
+                    MAX_DEGENERATE_RETRIES
+                );
+                on_event(AgentEvent::TextDelta(nudge.clone()));
+                self.state
+                    .messages
+                    .push(Message::user(nudge.clone()));
+            };
 
             if finish == FinishReason::Cancelled {
                 on_event(AgentEvent::Cancelled);
@@ -2632,6 +2671,31 @@ mod tests {
             })
             .expect("read tool result event");
         assert!(read_result.contains("content 42"));
+    }
+
+    /// A degenerate (empty) reply is retried with a nudge instead of being
+    /// surfaced as-is; a following real reply wins through.
+    #[tokio::test]
+    async fn degenerate_reply_is_retried_not_surfaced() {
+        let tmp = TempDir::new().unwrap();
+        let mut agent = test_agent(
+            tmp.path(),
+            MockProvider::new(vec![
+                MockReply::Text("".into()),
+                MockReply::Text("retried OK".into()),
+            ]),
+        );
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let result = agent
+            .run_turn("say something", |ev| events.push(ev), approve)
+            .await
+            .unwrap();
+
+        assert_eq!(result.final_text, "retried OK");
+        assert!(!result.cancelled);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta(t) if t.contains("empty or malformed"))));
     }
 
     #[tokio::test]

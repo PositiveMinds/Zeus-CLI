@@ -187,7 +187,7 @@ async fn run() -> Result<()> {
         Some(Commands::UserCommand { action }) => cmd_user_commands(&config, action, cli.yes),
         Some(Commands::Codeint { action }) => cmd_codeint(&config, action),
         Some(Commands::Ragindex { action }) => cmd_ragindex(&config, action).await,
-        Some(Commands::Project { action }) => cmd_project(&config, action),
+        Some(Commands::Project { action }) => cmd_project(&config, action, cli.project_root.as_deref()),
     }
 }
 
@@ -2279,7 +2279,7 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                             Some((g, name)) => (g.trim(), Some(name.trim())),
                             None => (rest, None),
                         };
-                        match spawn_bg_orchestrate(config, goal, workflow) {
+                        match spawn_bg_orchestrate(config, goal, workflow, None) {
                             Ok(id) => {
                                 println!(
                                     "{}",
@@ -2805,7 +2805,15 @@ fn load_symbol_index(root: &Path) -> Result<SymbolIndex> {
         })
 }
 
-fn cmd_project(config: &Config, action: ProjectCmd) -> Result<()> {
+/// Where `zeus project scaffold` places a new project: an explicit
+/// `--project-root` wins; otherwise the current working directory — never the
+/// walked-up project root, so scaffolding from inside an existing repo doesn't
+/// accidentally dump the new project into the ancestor repo.
+fn scaffold_base(explicit_root: Option<&Path>, cwd: &Path) -> PathBuf {
+    explicit_root.map(Path::to_path_buf).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn cmd_project(config: &Config, action: ProjectCmd, explicit_root: Option<&Path>) -> Result<()> {
     let ws = workspace(config)?;
     let root = ws.project_root.clone();
     match action {
@@ -2868,7 +2876,15 @@ fn cmd_project(config: &Config, action: ProjectCmd) -> Result<()> {
             };
             let lang = lang.as_str();
             let name = name.as_str();
-            let target = root.join(name);
+            // A scaffold creates a *new* project, so it lands in the current
+            // working directory — not the walked-up project root (an ancestor
+            // repo's root would otherwise swallow the new project). Only an
+            // explicit `--project-root` redirects it elsewhere.
+            let base = scaffold_base(
+                explicit_root,
+                &std::env::current_dir().unwrap_or_else(|_| root.clone()),
+            );
+            let target = base.join(name);
             if target.exists() {
                 bail!(
                     "{} already exists — pick a different name",
@@ -3168,23 +3184,35 @@ fn list_md_names(dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Detached headless orchestration: re-invoke this binary as a background
-/// `agent --auto [--workflow]` run. Uses an argv-based spawn (not a shell
+/// Build the argv for a detached headless orchestration (`zeus agent <goal>
+/// --yes --auto [--workflow <name>] [--model <model>]`). The args go through
+/// `spawn_argv` (no shell wrapper) so the goal text survives untouched.
+fn bg_orchestrate_argv(goal: &str, workflow: Option<&str>, model: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["agent".into(), goal.into(), "--yes".into(), "--auto".into()];
+    if let Some(name) = workflow {
+        args.push("--workflow".into());
+        args.push(name.to_string());
+    }
+    if let Some(m) = model {
+        args.push("--model".into());
+        args.push(m.to_string());
+    }
+    args
+}
+
+/// Spawn a goal as a detached headless orchestration (the `bg orchestrate`
 /// wrapper) so the goal text survives untouched — nothing is quoted or
 /// expanded. Shared by `zeus bg orchestrate` and the REPL `/bg` command.
 pub(crate) fn spawn_bg_orchestrate(
     config: &Config,
     goal: &str,
     workflow: Option<&str>,
+    model: Option<&str>,
 ) -> anyhow::Result<u64> {
     let ws = workspace(config)?;
     let registry = BackgroundTaskRegistry::new(ws.project_root.join(".agent/background"));
     let exe = std::env::current_exe().context("resolve own executable")?;
-    let mut args: Vec<String> = vec!["agent".into(), goal.into(), "--yes".into(), "--auto".into()];
-    if let Some(name) = workflow {
-        args.push("--workflow".into());
-        args.push(name.to_string());
-    }
+    let args = bg_orchestrate_argv(goal, workflow, model);
     registry
         .spawn_argv(&exe.to_string_lossy(), args, &ws.project_root)
         .context("spawn background orchestration")
@@ -3201,8 +3229,12 @@ fn cmd_bg(config: &Config, action: BgCmd) -> Result<()> {
             println!("started background task id={id}: {command}");
             Ok(())
         }
-        BgCmd::Orchestrate { goal, workflow } => {
-            let id = spawn_bg_orchestrate(config, &goal, workflow.as_deref())?;
+        BgCmd::Orchestrate {
+            goal,
+            workflow,
+            model,
+        } => {
+            let id = spawn_bg_orchestrate(config, &goal, workflow.as_deref(), model.as_deref())?;
             println!("started background orchestration id={id}");
             let goal_flat = goal.replace('\n', " ");
             println!("  goal:     {goal_flat}");
@@ -3210,6 +3242,9 @@ fn cmd_bg(config: &Config, action: BgCmd) -> Result<()> {
                 "  workflow: {}",
                 workflow.as_deref().unwrap_or("(auto-plan)")
             );
+            if let Some(m) = &model {
+                println!("  model:    {m}");
+            }
             println!("  follow:  zeus bg output {id}   |   stop: zeus bg stop {id}");
             Ok(())
         }
@@ -3653,5 +3688,59 @@ mod tests {
         assert!(survey.contains("entries scanned"), "{survey}");
 
         assert!(build_project_survey(None).is_none());
+    }
+
+    /// A scaffold lands in the current working directory when no explicit
+    /// `--project-root` was given — never in a walked-up ancestor repo root.
+    #[test]
+    fn scaffold_base_prefers_cwd_over_walked_up_root() {
+        let cwd = std::path::Path::new("work/src/lib");
+        let repo_root = std::path::Path::new("work");
+        assert_eq!(
+            scaffold_base(None, cwd),
+            cwd.to_path_buf(),
+            "no explicit root -> cwd"
+        );
+        assert_eq!(
+            scaffold_base(Some(repo_root), cwd),
+            repo_root.to_path_buf(),
+            "explicit --project-root wins over cwd"
+        );
+    }
+
+    /// `zeus bg orchestrate` accepts `--model` and it reaches the detached
+    /// `agent` argv verbatim (so a bare OpenRouter ID like
+    /// `deepseek/deepseek-chat` passes through untouched).
+    #[test]
+    fn bg_orchestrate_argv_includes_model_flag() {
+        let args = bg_orchestrate_argv("write readme", Some("ship"), Some("deepseek/deepseek-chat"));
+        assert_eq!(args[0], "agent");
+        assert!(args.windows(2).any(|w| w == ["--workflow", "ship"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--model", "deepseek/deepseek-chat"]));
+        assert!(!args.windows(2).any(|w| w == ["--model"] && w[1].is_empty()));
+
+        let plain = bg_orchestrate_argv("write readme", None, None);
+        assert!(!plain.windows(2).any(|w| w[0] == "--model"));
+    }
+
+    #[test]
+    fn cli_parses_bg_orchestrate_model_flag() {
+        let cli = Cli::try_parse_from([
+            "zeus",
+            "bg",
+            "orchestrate",
+            "write readme",
+            "--model",
+            "deepseek/deepseek-chat",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Bg {
+                action: BgCmd::Orchestrate { model, .. },
+            } => assert_eq!(model.as_deref(), Some("deepseek/deepseek-chat")),
+            other => panic!("expected bg orchestrate, got {other:?}"),
+        }
     }
 }

@@ -140,12 +140,12 @@ const FIREWORKS: &[&str] = &[
 
 const OPENROUTER: &[&str] = &[
     "openrouter/auto",
-    "openrouter/anthropic/claude-opus-4",
-    "openrouter/anthropic/claude-sonnet-4",
-    "openrouter/openai/gpt-5",
-    "openrouter/google/gemini-2.5-flash",
-    "openrouter/deepseek/deepseek-chat",
-    "openrouter/meta-llama/llama-3.3-70b-instruct",
+    "anthropic/claude-opus-4",
+    "anthropic/claude-sonnet-4",
+    "openai/gpt-5",
+    "google/gemini-2.5-flash",
+    "deepseek/deepseek-chat",
+    "meta-llama/llama-3.3-70b-instruct",
 ];
 
 /// Mirrors the live opencodezen catalog so the recommended provider still
@@ -267,6 +267,29 @@ mod tests {
             uniq.sort();
             uniq.dedup();
             assert_eq!(ids.len(), uniq.len(), "duplicate model ids for {p}");
+        }
+    }
+
+    #[test]
+    fn openrouter_catalog_uses_api_model_ids() {
+        // OpenRouter model IDs are bare (`deepseek/deepseek-chat`,
+        // `anthropic/claude-opus-4`) — the only `openrouter/…` prefixed ID
+        // the API accepts is the auto-routing `openrouter/auto`. Anything
+        // else with that prefix gets a 400 from the live endpoint.
+        for m in known_models("openrouter").unwrap() {
+            if m.id == "openrouter/auto" {
+                continue;
+            }
+            assert!(
+                !m.id.starts_with("openrouter/"),
+                "invalid OpenRouter model id: {}",
+                m.id
+            );
+            assert!(
+                m.id.contains('/'),
+                "OpenRouter model ids carry an org/owner prefix: {}",
+                m.id
+            );
         }
     }
 }
