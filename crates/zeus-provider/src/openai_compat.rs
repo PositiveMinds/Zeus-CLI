@@ -567,7 +567,7 @@ mod tests {
 import sys, json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = int(sys.argv[1])
+PORT_FILE = sys.argv[1]
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -664,7 +664,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
-server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(PORT_FILE, "w") as f:
+    f.write(str(server.server_address[1]))
 server.serve_forever()
 "#
     }
@@ -680,31 +682,65 @@ server.serve_forever()
     struct TestServer {
         child: Child,
         base_url: String,
+        _dir: tempfile::TempDir,
     }
 
     impl TestServer {
-        fn start(port: u16) -> Self {
-            let tmp = std::env::temp_dir().join(format!("zeus_oa_test_server_{port}.py"));
-            std::fs::write(&tmp, server_script()).unwrap();
-            let child = Command::new(python_cmd())
-                .arg(&tmp)
-                .arg(port.to_string())
-                .spawn()
-                .expect("failed to spawn test server");
-            // Poll for readiness rather than a fixed sleep.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    break;
+        /// Spawn the python test server on an OS-assigned ephemeral port (never a
+        /// hardcoded one — a fixed port could already be held by a leaked server
+        /// from an earlier crashed run, and the old readiness probe would then
+        /// happily talk to a stale process). The child binds port 0 and writes the
+        /// actual port to a file inside a fresh temp dir; we poll for that file,
+        /// which can only ever be produced by *this* server. The child is killed
+        /// even if the readiness wait fails, so no process leaks on panic.
+        fn start() -> Self {
+        let dir = tempfile::TempDir::new().expect("create test server temp dir");
+        let script_path = dir.path().join("server.py");
+        let port_file = dir.path().join("port");
+        std::fs::write(&script_path, server_script()).unwrap();
+        let mut child = Command::new(python_cmd())
+            .arg(&script_path)
+            .arg(&port_file)
+            .spawn()
+            .expect("failed to spawn test server");
+        // If anything below panics, still kill the child before unwinding.
+        let mut guard = KillOnDrop(&mut child, true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let port = loop {
+            if let Ok(contents) = std::fs::read_to_string(&port_file) {
+                if let Ok(port) = contents.trim().parse::<u16>() {
+                    break port;
                 }
-                if std::time::Instant::now() >= deadline {
-                    panic!("test server on port {port} did not become ready in time");
-                }
-                std::thread::sleep(Duration::from_millis(50));
             }
-            Self {
-                child,
-                base_url: format!("http://127.0.0.1:{port}/v1"),
+            if std::time::Instant::now() >= deadline {
+                panic!("test server did not report its port in time");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        guard.disarm();
+        drop(guard);
+        Self {
+            child,
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            _dir: dir,
+        }
+    }
+    }
+
+    /// Kills the spawned child when it goes out of scope (used as a panic
+    /// guard while `start` is still waiting on the port file).
+    struct KillOnDrop<'a>(&'a mut Child, bool);
+
+    impl KillOnDrop<'_> {
+        fn disarm(&mut self) {
+            self.1 = false;
+        }
+    }
+
+    impl Drop for KillOnDrop<'_> {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = self.0.kill();
             }
         }
     }
@@ -718,7 +754,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn list_models_works() {
-        let server = TestServer::start(18091);
+        let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let models = provider.list_models().await.unwrap();
         assert_eq!(models.len(), 1);
@@ -727,7 +763,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn chat_sends_authorization_header() {
-        let server = TestServer::start(18100);
+        let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url).with_api_key("sk-test-key");
         let resp = provider
             .chat(ChatRequest::new(
@@ -741,7 +777,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn chat_returns_plain_text() {
-        let server = TestServer::start(18092);
+        let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let resp = provider
             .chat(ChatRequest::new("text-model", vec![Message::user("hi")]))
@@ -754,7 +790,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn chat_returns_tool_call() {
-        let server = TestServer::start(18093);
+        let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let resp = provider
             .chat(ChatRequest::new("tool-model", vec![Message::user("hi")]))
@@ -768,7 +804,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn stream_yields_text_deltas() {
-        let server = TestServer::start(18094);
+        let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let mut stream = provider
             .stream(ChatRequest::new("text-model", vec![Message::user("hi")]))
@@ -789,7 +825,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn stream_accumulates_tool_call_across_chunks() {
-        let server = TestServer::start(18095);
+        let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let mut stream = provider
             .stream(ChatRequest::new("tool-model", vec![Message::user("hi")]))
@@ -825,7 +861,7 @@ server.serve_forever()
     /// type: null, expected a sequence".
     #[tokio::test]
     async fn chat_tolerates_explicit_null_tool_calls() {
-        let server = TestServer::start(18098);
+        let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let resp = provider
             .chat(ChatRequest::new(
@@ -842,7 +878,7 @@ server.serve_forever()
     /// Same regression, but for a streamed delta's `"tool_calls": null`.
     #[tokio::test]
     async fn stream_tolerates_explicit_null_tool_calls() {
-        let server = TestServer::start(18099);
+        let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let mut stream = provider
             .stream(ChatRequest::new(
@@ -866,7 +902,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn embeddings_work() {
-        let server = TestServer::start(18096);
+        let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let resp = provider
             .embeddings(EmbeddingRequest {
