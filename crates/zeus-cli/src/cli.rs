@@ -456,6 +456,9 @@ pub enum BgCmd {
     List,
     /// Print captured stdout/stderr for a background task
     Output { id: u64 },
+    /// Stream a background task's captured output live (`tail -f` style):
+    /// prints everything so far, then new lines until the task exits.
+    Logs { id: u64 },
     /// Suspend a running task in place (resume continues it where it left off)
     Pause { id: u64 },
     /// Continue a previously-paused task

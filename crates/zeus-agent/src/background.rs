@@ -14,8 +14,10 @@ use crate::error::{AgentError, Result};
 use crate::terminal::{kill_tree, resume_process, suspend_process};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
@@ -303,6 +305,68 @@ impl BackgroundTaskRegistry {
             std::fs::read_to_string(self.stdout_path(id)).unwrap_or_default(),
             std::fs::read_to_string(self.stderr_path(id)).unwrap_or_default(),
         )
+    }
+
+    /// Stream a task's captured output live (`tail -f` style): print
+    /// everything captured so far, then print new lines as they're appended
+    /// to the log files, until the task exits and its logs are fully drained.
+    /// Returns promptly — the caller's shell isn't held hostage by a still-
+    /// running background task.
+    pub fn follow(&self, id: u64) -> Result<()> {
+        let Some((_, status)) = self.get(id)? else {
+            return Err(AgentError::Terminal(format!(
+                "no such background task: {id}"
+            )));
+        };
+        let mut stdout_pos = self.drain_from(self.stdout_path(id), 0);
+        let mut stderr_pos = self.drain_from(self.stderr_path(id), 0);
+        if status == TaskStatus::Exited {
+            return Ok(());
+        }
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            stdout_pos = self.drain_from(self.stdout_path(id), stdout_pos);
+            stderr_pos = self.drain_from(self.stderr_path(id), stderr_pos);
+            let status = match self.get(id)? {
+                Some((_, status)) => status,
+                None => return Err(AgentError::Terminal(format!(
+                    "no such background task: {id}"
+                ))),
+            };
+            if status == TaskStatus::Exited {
+                // One final drain so nothing the process flushed just before
+                // exiting is left unprinted.
+                let _ = self.drain_from(self.stdout_path(id), stdout_pos);
+                let _ = self.drain_from(self.stderr_path(id), stderr_pos);
+                return Ok(());
+            }
+        }
+    }
+
+    /// Print bytes appended to `path` since `pos`, returning the new end
+    /// position. Missing/unreadable files are treated as "nothing new".
+    fn drain_from(&self, path: PathBuf, pos: u64) -> u64 {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return pos;
+        };
+        let len = meta.len();
+        if len <= pos {
+            return pos;
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return pos;
+        };
+        if file.seek(SeekFrom::Start(pos)).is_err() {
+            return pos;
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_err() {
+            return pos;
+        }
+        print!("{}", String::from_utf8_lossy(&buf));
+        let _ = std::io::stdout().flush();
+        len
     }
 
     pub fn stop(&self, id: u64) -> Result<()> {
@@ -647,5 +711,44 @@ mod tests {
         assert_eq!(registry.list().unwrap().len(), 2);
         registry.shutdown_all().unwrap();
         assert_eq!(registry.list().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn follow_streams_output_and_returns_when_task_exits() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
+
+        // Emit three lines with a gap between them so `follow` must wait for
+        // the later ones, then exit — proving it streams, not just dumps.
+        // (`spawn` already wraps in a shell, so no `cmd /C`/`sh -c` here.)
+        let cmd = if cfg!(windows) {
+            "(echo one & ping -n 2 127.0.0.1 >NUL & echo two & ping -n 2 127.0.0.1 >NUL & echo three)"
+        } else {
+            "(echo one; sleep 1; echo two; sleep 1; echo three)"
+        };
+        let id = registry.spawn(cmd, &root).unwrap();
+
+        // Follow should return by the time the task has exited on its own.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        registry.follow(id).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "follow must return once the task exits"
+        );
+
+        let (stdout, _) = registry.output(id);
+        assert!(stdout.contains("one"), "stdout should capture 'one'");
+        assert!(stdout.contains("three"), "stdout should capture 'three'");
+    }
+
+    #[test]
+    fn follow_returns_immediately_for_unknown_task() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
+        assert!(registry.follow(999).is_err());
     }
 }

@@ -3264,6 +3264,10 @@ fn cmd_bg(config: &Config, action: BgCmd) -> Result<()> {
             println!("--- stdout ---\n{stdout}--- stderr ---\n{stderr}");
             Ok(())
         }
+        BgCmd::Logs { id } => {
+            registry.follow(id).context("follow background task")?;
+            Ok(())
+        }
         BgCmd::Pause { id } => {
             registry.pause(id).context("pause background task")?;
             println!("paused background task {id}");

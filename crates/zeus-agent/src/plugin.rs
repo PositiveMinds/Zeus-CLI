@@ -342,4 +342,50 @@ mod tests {
         assert_eq!(plugins[0].name(), "example");
         assert_eq!(plugins[0].tools()[0].name, "shout");
     }
+
+    #[test]
+    fn load_all_skips_corrupt_dylib_without_panicking() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A file with a dylib extension that is not a real dynamic library —
+        // e.g. a leftover text file, a truncated download, a half-written
+        // artifact. Loading it must fail gracefully and skip, not panic and
+        // take down the whole agent.
+        let corrupt = tmp.path().join(format!("broken.{}", dylib_extension()));
+        std::fs::write(&corrupt, b"this is definitely not a PE/ELF/Mach-O binary").unwrap();
+
+        let plugins = load_all(tmp.path());
+        assert!(plugins.is_empty(), "corrupt dylib must be skipped, not loaded");
+    }
+
+    #[test]
+    fn load_all_skips_truncated_dylib_without_panicking() {
+        let src = ensure_example_plugin();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A truncated real dylib: valid header-ish bytes but cut off, as a
+        // crash during a plugin download/install would leave behind.
+        let bytes = std::fs::read(&src).unwrap();
+        let truncated = tmp.path().join(format!("cut.{}", dylib_extension()));
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+
+        let plugins = load_all(tmp.path());
+        assert!(plugins.is_empty(), "truncated dylib must be skipped, not loaded");
+    }
+
+    #[test]
+    fn load_all_keeps_good_plugin_alongside_bad_ones() {
+        // One bad extension (a load failure) must not take down the good
+        // ones — same "one bad extension shouldn't break the agent" policy
+        // the loader documents.
+        let src = ensure_example_plugin();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let good = tmp.path().join(format!("good.{}", dylib_extension()));
+        std::fs::copy(&src, &good).unwrap();
+        let bad = tmp.path().join(format!("bad.{}", dylib_extension()));
+        std::fs::write(&bad, b"not a real library either").unwrap();
+
+        let plugins = load_all(tmp.path());
+        assert_eq!(plugins.len(), 1, "only the good plugin should load");
+        assert_eq!(plugins[0].name(), "good");
+        assert_eq!(plugins[0].tools()[0].name, "shout");
+    }
 }
