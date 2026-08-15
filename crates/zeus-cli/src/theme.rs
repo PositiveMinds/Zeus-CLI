@@ -78,9 +78,6 @@ pub const MUTED: Color = Color::Rgb(0x82, 0x90, 0xad);
 pub const EMPTY_FAINT: Color = Color::Rgb(0x56, 0x61, 0x80);
 /// `--teal`: empty-state status dot + composer accent (`#57efce`).
 pub const TEAL: Color = Color::Rgb(0x57, 0xef, 0xce);
-/// `--cyan` (empty-state): send-button "ready" color, the far end of the
-/// HTML's `linear-gradient(120deg, var(--teal), var(--cyan))` (`#58c0ff`).
-pub const EMPTY_CYAN: Color = Color::Rgb(0x58, 0xc0, 0xff);
 /// Wordmark gradient stops — near-white → `--gold-soft` → `--gold`,
 /// matching the HTML's `linear-gradient(100deg, #eef3ff 0%, #f6d98a 52%, #f2c661 100%)`.
 pub const WORDMARK_START: Color = Color::Rgb(0xee, 0xf3, 0xff);
@@ -110,7 +107,6 @@ pub struct Palette {
     pub empty_faint: Color,
     pub user_text: Color,
     pub teal: Color,
-    pub empty_cyan: Color,
     pub wordmark_start: Color,
     pub wordmark_mid: Color,
     pub wordmark_end: Color,
@@ -136,7 +132,6 @@ const DARK: Palette = Palette {
     empty_faint: EMPTY_FAINT,
     user_text: Color::Rgb(0xc7, 0xca, 0xdb),
     teal: TEAL,
-    empty_cyan: EMPTY_CYAN,
     wordmark_start: WORDMARK_START,
     wordmark_mid: WORDMARK_MID,
     wordmark_end: WORDMARK_END,
@@ -164,7 +159,6 @@ const LIGHT: Palette = Palette {
     empty_faint: Color::Rgb(0x6a, 0x73, 0x90),
     user_text: Color::Rgb(0x2a, 0x2f, 0x3f),
     teal: Color::Rgb(0x0e, 0x8f, 0x7c),
-    empty_cyan: Color::Rgb(0x1d, 0x7f, 0xb8),
     wordmark_start: Color::Rgb(0x14, 0x18, 0x29),
     wordmark_mid: Color::Rgb(0xa8, 0x6a, 0x1f),
     wordmark_end: Color::Rgb(0x8a, 0x56, 0x18),
@@ -192,7 +186,6 @@ const HIGH_CONTRAST: Palette = Palette {
     empty_faint: Color::Rgb(0xa0, 0xa0, 0xa0),
     user_text: Color::Rgb(0xff, 0xff, 0xff),
     teal: Color::Rgb(0x00, 0xff, 0xbe),
-    empty_cyan: Color::Rgb(0x66, 0xcc, 0xff),
     wordmark_start: Color::Rgb(0xff, 0xff, 0xff),
     wordmark_mid: Color::Rgb(0xff, 0xd7, 0x5e),
     wordmark_end: Color::Rgb(0xff, 0xb0, 0x20),
@@ -295,9 +288,6 @@ pub fn user_text_color() -> Color {
 }
 pub fn teal_color() -> Color {
     palette().teal
-}
-pub fn empty_cyan_color() -> Color {
-    palette().empty_cyan
 }
 pub fn wordmark_start() -> Color {
     palette().wordmark_start
@@ -501,7 +491,6 @@ mod tests {
         assert_eq!(muted_color(), MUTED);
         assert_eq!(empty_faint_color(), EMPTY_FAINT);
         assert_eq!(teal_color(), TEAL);
-        assert_eq!(empty_cyan_color(), EMPTY_CYAN);
         assert_eq!(wordmark_start(), WORDMARK_START);
         assert_eq!(wordmark_mid(), WORDMARK_MID);
         assert_eq!(wordmark_end(), WORDMARK_END);

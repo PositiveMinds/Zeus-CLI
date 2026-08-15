@@ -43,7 +43,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, Paragraph, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use std::io;
@@ -51,7 +51,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tui_text::*;
 use zeus_agent::{
-    personas_by_department, Agent, AgentEvent, SessionStore, SessionSummary, TurnResult,
+    personas_by_department, Agent, AgentEvent, SessionStore, TurnResult,
 };
 use zeus_config::{Config, KeysFile};
 use zeus_fs::{ApprovalDecision, PermissionRequest};
@@ -65,18 +65,13 @@ use transcript::*;
 mod pickers;
 use pickers::*;
 
+#[path = "modal.rs"]
+pub(crate) mod modal;
+use modal::*;
+
 #[path = "favorites.rs"]
 mod favorites;
 use favorites::*;
-
-/// A pending permission ask, bridged out of the spawned turn task. The reply
-/// is a oneshot so a modal ask can be answered at most once; dropping the
-/// sender (turn cancelled, app closing) resolves the waiting approver as a
-/// deny.
-struct ApprovalRequestMsg {
-    request: PermissionRequest,
-    reply: tokio::sync::oneshot::Sender<ApprovalDecision>,
-}
 
 /// Bridge one permission ask from the synchronous tool-dispatch approver into
 /// the render loop as a modal, then wait for the answer.
@@ -685,32 +680,6 @@ struct SearchState {
     matches: Vec<usize>,
     /// Which entry in `matches` is currently focused, jumped to with Enter.
     current: usize,
-}
-
-/// `/sessions` picker — an overlay on `Mode::Chat`, same pattern as
-/// `SearchState`: Up/Down/click to pick, Enter/click-to-apply to resume,
-/// Esc to close.
-struct SessionPickerState {
-    entries: Vec<SessionSummary>,
-    selected: usize,
-    /// Type-to-filter query — same convention as the model picker's own
-    /// search, matched against a session's id and last-message preview.
-    search: String,
-}
-
-/// Sessions matching `picker.search` (id or last-user-message substring,
-/// case-insensitive) — everything when the query is empty.
-fn session_picker_filtered(picker: &SessionPickerState) -> Vec<&SessionSummary> {
-    let q = picker.search.to_lowercase();
-    picker
-        .entries
-        .iter()
-        .filter(|s| {
-            q.is_empty()
-                || s.id.to_lowercase().contains(&q)
-                || s.last_user.to_lowercase().contains(&q)
-        })
-        .collect()
 }
 
 struct TodoItem {
@@ -1423,36 +1392,6 @@ fn transcript_block_at(
 
 /// One-line pitch + signup URL for the key-entry modal — the "why this
 /// provider, where do I get a key" copy a first-time user actually needs.
-/// Any provider not listed here (custom entries in `providers.toml`) still
-/// gets a sane generic prompt.
-fn provider_blurb(name: &str) -> (&'static str, Option<&'static str>) {
-    match name {
-        "opencodezen" => (
-            "OpenCode Zen gives you access to a curated set of coding models — including free tiers — with a single API key.",
-            Some("https://opencode.ai/zen"),
-        ),
-        "openrouter" => (
-            "OpenRouter routes a single API key to hundreds of models across many providers, including several free ones.",
-            Some("https://openrouter.ai/keys"),
-        ),
-        "anthropic" => ("Claude models, directly from Anthropic.", Some("https://console.anthropic.com/settings/keys")),
-        "openai" => ("GPT models, directly from OpenAI.", Some("https://platform.openai.com/api-keys")),
-        "gemini" => ("Gemini models, directly from Google.", Some("https://aistudio.google.com/apikey")),
-        "grok" => ("Grok models, directly from xAI.", Some("https://console.x.ai")),
-        "deepseek" => ("DeepSeek's own models, directly from DeepSeek.", Some("https://platform.deepseek.com/api_keys")),
-        "mistral" => ("Mistral's own models, directly from Mistral AI.", Some("https://console.mistral.ai/api-keys")),
-        "groq" => ("Very fast inference on open models, via Groq's LPU hardware.", Some("https://console.groq.com/keys")),
-        "together" => ("A wide catalog of open models hosted by Together AI.", Some("https://api.together.ai/settings/api-keys")),
-        "fireworks" => ("Fast hosted inference for open models, via Fireworks AI.", Some("https://fireworks.ai/account/api-keys")),
-        "perplexity" => ("Perplexity's search-grounded models.", Some("https://www.perplexity.ai/settings/api")),
-        "cohere" => ("Cohere's Command model family.", Some("https://dashboard.cohere.com/api-keys")),
-        "cerebras" => ("Extremely fast inference on open models, via Cerebras hardware.", Some("https://cloud.cerebras.ai")),
-        "deepinfra" => ("A wide catalog of open models hosted by DeepInfra.", Some("https://deepinfra.com/dash/api_keys")),
-        "novita" => ("A wide catalog of open models hosted by Novita AI.", Some("https://novita.ai/settings/key-management")),
-        _ => ("Paste your API key below to connect this provider.", None),
-    }
-}
-
 fn byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
@@ -1470,76 +1409,6 @@ fn remove_char_at(s: &mut String, char_idx: usize) {
     if bi < s.len() {
         s.remove(bi);
     }
-}
-
-/// The six-letter-row "ZEUS" wordmark, hacker-green block letters — a static
-/// logo (no animation; an earlier Matrix-rain splash was replaced after
-/// feedback that the animation felt out of place) styled after opencode's
-/// blocky splash wordmark.
-/// Warm-to-cool "AI" gradient (orange → pink → purple → blue → cyan),
-/// matching the sweep across Antigravity CLI's logo — `t` in `0.0..=1.0`.
-fn placeholder_style() -> Style {
-    theme::faint()
-}
-
-/// Violet border used by the centered picker popups.
-fn border_style() -> Style {
-    theme::violet()
-}
-
-/// Slash-command dropdown — command names in violet bold, descriptions dim,
-/// highlight bar on the selected row (mirrors the HTML `.palette-item`
-/// rows: `.pc` command labels colored `--mode-color`, `.pd` descriptions
-/// dim, `.active` row tinted with the mode color).
-fn render_menu(
-    f: &mut Frame,
-    area: Rect,
-    matches: &[(String, String)],
-    selected: usize,
-    accent: Color,
-) -> Rect {
-    // Backdrop-dim, opaque fill, violet chrome, solid selection bar — the
-    // same modal treatment as the picker family, since this is a real modal
-    // (opened by typing "/" or ctrl+p) rather than a passive dropdown, even
-    // though it was originally styled as the latter.
-    dim_backdrop(f, f.area());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style())
-        .style(Style::default().bg(theme::modal_bg()));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let name_width = matches
-        .iter()
-        .map(|(n, _)| n.len())
-        .max()
-        .unwrap_or(0)
-        .max(8);
-    let items: Vec<ListItem> = matches
-        .iter()
-        .map(|(name, desc)| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("/{name:<name_width$}"),
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(desc.to_string(), placeholder_style()),
-            ]))
-        })
-        .collect();
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .bg(theme::modal_selected_bg())
-            .fg(theme::void())
-            .add_modifier(Modifier::BOLD),
-    );
-    let mut list_state = ListState::default();
-    list_state.select(Some(selected.min(matches.len().saturating_sub(1))));
-    f.render_stateful_widget(list, inner, &mut list_state);
-    inner
 }
 
 /// The pinned input box: a mode-colored accent bar down the left edge, an
@@ -1681,21 +1550,62 @@ fn hint_pair(key: &str, label: &str) -> Vec<Span<'static>> {
     ]
 }
 
+/// Build the key-binding legend, shrinking it to fit `max_w` columns:
+/// full 4-space gaps when there's room, 2-space gaps on a tighter terminal,
+/// and whole trailing pairs dropped (from the right) once that still
+/// overflows — so the row never clips mid-label on a narrow window. The
+/// full legend is ~92 columns, wider than a sidebar-less 80-col terminal.
+fn hints_for_width(pairs: &[[&str; 2]], max_w: usize) -> Vec<Span<'static>> {
+    fn assembled(pairs: &[[&str; 2]], gap: &'static str) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        for (i, [key, label]) in pairs.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(gap));
+            }
+            spans.extend(hint_pair(key, label));
+        }
+        spans
+    }
+    fn width(spans: &[Span<'static>]) -> usize {
+        spans.iter().map(|s| s.content.chars().count()).sum()
+    }
+
+    for gap in ["    ", "  "] {
+        let spans = assembled(pairs, gap);
+        if width(&spans) <= max_w {
+            return spans;
+        }
+    }
+    let mut spans = Vec::new();
+    for pair in pairs {
+        let mut candidate = spans.clone();
+        if !candidate.is_empty() {
+            candidate.push(Span::raw("  "));
+        }
+        candidate.extend(hint_pair(pair[0], pair[1]));
+        if width(&candidate) > max_w {
+            break;
+        }
+        spans = candidate;
+    }
+    spans
+}
+
 /// Mode/model/provider now lives inside the input box itself (its second
 /// line), so this row is just the key-binding legend underneath it.
 fn render_hints(f: &mut Frame, area: Rect, _state: &AppState) {
-    let mut spans = hint_pair("tab", "agents");
-    spans.push(Span::raw("    "));
-    spans.extend(hint_pair("/ ctrl+p", "commands"));
-    spans.push(Span::raw("    "));
-    spans.extend(hint_pair("click", "select"));
-    spans.push(Span::raw("    "));
-    spans.extend(hint_pair("ctrl+y", "copy"));
-    spans.push(Span::raw("    "));
-    spans.extend(hint_pair("ctrl+f", "find"));
-    spans.push(Span::raw("    "));
-    spans.extend(hint_pair("esc", "close"));
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let pairs: &[[&str; 2]] = &[
+        ["tab", "agents"],
+        ["/ ctrl+p", "commands"],
+        ["click", "select"],
+        ["ctrl+y", "copy"],
+        ["ctrl+f", "find"],
+        ["esc", "close"],
+    ];
+    f.render_widget(
+        Paragraph::new(Line::from(hints_for_width(pairs, area.width as usize))),
+        area,
+    );
 }
 
 /// Animated activity glyph: cycles through braille frames based on elapsed
@@ -1828,92 +1738,6 @@ fn render_search_bar(f: &mut Frame, area: Rect, search: &SearchState) {
         Paragraph::new(Line::from(Span::styled(label, theme::text()))),
         inner,
     );
-}
-
-/// The `/sessions` picker: saved conversations, arrow keys or click to
-/// navigate, Enter/click to resume, Esc to close — modeled after
-/// `render_model_picker`'s popup chrome. Returns the list's rect for mouse
-/// hit-testing.
-fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionPickerState) -> Rect {
-    let width = area.width.saturating_sub(6).clamp(40, 96);
-    let filtered = session_picker_filtered(picker);
-    let height = (filtered.len() as u16 + 5)
-        .min(PICKER_MAX_H)
-        .clamp(9, area.height.saturating_sub(4).max(9));
-    let popup = centered_rect(width, height, area);
-
-    f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style())
-        .style(Style::default().bg(theme::modal_bg()))
-        .title(Line::from(vec![Span::styled(
-            " Resume session ",
-            theme::text().add_modifier(Modifier::BOLD),
-        )]))
-        .title(
-            Line::from(vec![
-                Span::styled(format!("{} ", filtered.len()), theme::faint()),
-                Span::styled("esc ", theme::dim()),
-            ])
-            .alignment(Alignment::Right),
-        )
-        .title_bottom(
-            Line::from(Span::styled(
-                " ↑/↓ navigate · enter resume · esc dismiss ",
-                theme::dim(),
-            ))
-            .alignment(Alignment::Center),
-        );
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-    let search_line = if picker.search.is_empty() {
-        Line::from(vec![
-            Span::styled("▸ ", theme::violet()),
-            Span::styled("Search sessions…", placeholder_style()),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("▸ ", theme::violet()),
-            Span::styled(picker.search.clone(), theme::text()),
-        ])
-    };
-    f.render_widget(Paragraph::new(search_line), rows[0]);
-
-    let list_area = rows[1];
-    let inner_w = list_area.width as usize;
-    let items: Vec<ListItem> = filtered
-        .iter()
-        .map(|s| {
-            let preview = if s.last_user.is_empty() {
-                "(no user message yet)".to_string()
-            } else {
-                s.last_user.clone()
-            };
-            let head = format!("{}  {} msg  ", s.id, s.message_count);
-            let room = inner_w.saturating_sub(char_count(&head));
-            let preview: String = preview.chars().take(room).collect();
-            ListItem::new(Line::from(vec![
-                Span::styled(s.id.clone(), theme::text().add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  {} msg  ", s.message_count), theme::dim()),
-                Span::styled(preview, theme::faint()),
-            ]))
-        })
-        .collect();
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .bg(theme::modal_selected_bg())
-            .fg(theme::void())
-            .add_modifier(Modifier::BOLD),
-    );
-    let mut list_state = ListState::default();
-    list_state.select(Some(picker.selected.min(filtered.len().saturating_sub(1))));
-    f.render_stateful_widget(list, list_area, &mut list_state);
-
-    list_area
 }
 
 /// Resets everything tied to *this conversation's view* — transcript,
@@ -2066,571 +1890,6 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     };
 }
 
-/// Darkens every cell in `area` toward black — approximates the reference
-/// product's semi-transparent black backdrop behind an open modal. Ratatui
-/// has no real alpha blending, so this directly blends each already-
-/// rendered cell's fg/bg color toward black instead of compositing a
-/// translucent layer; the modal drawn immediately afterward fully repaints
-/// its own footprint anyway; so it doesn't matter that this dims that too.
-fn dim_backdrop(f: &mut Frame, area: Rect) {
-    fn dim(c: Color) -> Color {
-        match c {
-            Color::Rgb(r, g, b) => Color::Rgb(
-                (r as f32 * 0.45) as u8,
-                (g as f32 * 0.45) as u8,
-                (b as f32 * 0.45) as u8,
-            ),
-            other => other,
-        }
-    }
-    let buf = f.buffer_mut();
-    for y in area.y..area.y.saturating_add(area.height) {
-        for x in area.x..area.x.saturating_add(area.width) {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.fg = dim(cell.fg);
-                cell.bg = dim(cell.bg);
-            }
-        }
-    }
-}
-
-/// The `Mode::KeyEntry` screen — a centered "API key" modal with a short
-/// pitch for the provider, a link to get a key, a masked input field, and
-/// an `enter submit` footer. Returns the input field's inner rect so the
-/// caller can place the terminal cursor in it.
-fn render_key_entry_modal(f: &mut Frame, area: Rect, provider: &str, input: &str) -> Rect {
-    let (blurb, url) = provider_blurb(provider);
-    let width = area.width.saturating_sub(10).clamp(40, 76);
-    let blurb_lines = textwrap_len(blurb, width as usize - 4);
-    // A pasted key is one long unbroken token — masked or not, it's the
-    // same length as typed, so a long one (some provider tokens run past
-    // 100 chars) needs the same wrap-and-grow treatment as any other input
-    // box instead of running off the edge of a fixed single-line field.
-    let key_display_len = if input.is_empty() {
-        0
-    } else {
-        char_count(input)
-    };
-    let input_text_h = wrap_text(
-        &"x".repeat(key_display_len),
-        (width as usize).saturating_sub(6).max(10),
-    )
-    .len()
-    .clamp(1, 5) as u16;
-    // title, blank, blurb lines, blank, url line (if any), blank, input box (border×2 + text), blank, footer
-    let height = (3 + blurb_lines + if url.is_some() { 2 } else { 0 } + 4 + input_text_h as usize)
-        .clamp(9, area.height.saturating_sub(4).max(9) as usize) as u16;
-    let popup = centered_rect(width, height, area);
-
-    f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style())
-        .style(Style::default().bg(theme::modal_bg()))
-        .title(Line::from(vec![Span::styled(
-            " API key ",
-            theme::text().add_modifier(Modifier::BOLD),
-        )]))
-        .title(Line::from(Span::styled(" esc ", theme::dim())).alignment(Alignment::Right))
-        .title_bottom(
-            Line::from(Span::styled(" enter submit ", theme::dim())).alignment(Alignment::Center),
-        );
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let mut rows: Vec<Constraint> = vec![Constraint::Length(1)];
-    for _ in 0..blurb_lines {
-        rows.push(Constraint::Length(1));
-    }
-    if url.is_some() {
-        // `Min(0)` rather than `Length(1)` — a blank spacer, so on a short
-        // terminal it's the first thing the layout solver sacrifices down
-        // to zero height instead of squeezing the input box itself (which
-        // stays `Length`-fixed below). On a tall enough terminal it simply
-        // absorbs the little slack `height`'s own clamp already builds in.
-        rows.push(Constraint::Min(0));
-        rows.push(Constraint::Length(1));
-    }
-    rows.push(Constraint::Min(0));
-    rows.push(Constraint::Length(input_text_h + 2));
-    let rows = Layout::vertical(rows).split(inner);
-
-    let mut r = 0usize;
-    f.render_widget(
-        Paragraph::new(format!("Paste your {provider} API key below.")).style(theme::dim()),
-        rows[r],
-    );
-    r += 1;
-    for line in wrap_text(blurb, width as usize - 4) {
-        f.render_widget(Paragraph::new(line).style(theme::text()), rows[r]);
-        r += 1;
-    }
-    if let Some(url) = url {
-        r += 1; // blank spacer row
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("Go to ", theme::dim()),
-                Span::styled(url, theme::cyan().add_modifier(Modifier::UNDERLINED)),
-                Span::styled(" to get a key", theme::dim()),
-            ])),
-            rows[r],
-        );
-        r += 1;
-    }
-    r += 1; // blank spacer row before the input box
-
-    // Violet border (matching the outer modal's own chrome) and plain text
-    // color — this used to be a one-off teal border with green typed text,
-    // an unexplained divergence from every other input field in the app.
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style());
-    let input_inner = input_block.inner(rows[r]);
-    f.render_widget(input_block, rows[r]);
-    if input.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "paste or type your key…",
-                placeholder_style(),
-            ))),
-            input_inner,
-        );
-    } else {
-        f.render_widget(
-            Paragraph::new(mask_secret(input))
-                .style(theme::text())
-                .wrap(Wrap { trim: false }),
-            input_inner,
-        );
-    }
-
-    input_inner
-}
-
-/// A pending tool-permission ask, as a centered modal with the *actual*
-/// diff/content preview (up to what `zeus-fs` computed — ~40 changed
-/// lines) instead of a single clipped line squeezed into the pinned input
-/// bar — a high-stakes "can I do this?" moment deserves to actually be
-/// legible, not a truncated one-liner you have to trust blind.
-fn render_approval_modal(f: &mut Frame, area: Rect, pending: &ApprovalRequestMsg, scroll: usize) {
-    let req = &pending.request;
-    let preview = req.preview.as_deref().unwrap_or("");
-    let width = area.width.saturating_sub(8).clamp(50, 120);
-    let preview_w = width.saturating_sub(4) as usize;
-    let preview_lines: Vec<Line> = if super::highlight::looks_like_diff(preview) {
-        super::highlight::diff_lines(preview, placeholder_style(), preview_w)
-            .into_iter()
-            .map(Line::from)
-            .collect()
-    } else if !preview.is_empty() {
-        preview
-            .lines()
-            .flat_map(|l| wrap_text(l, preview_w))
-            .map(|l| Line::from(Span::styled(l, placeholder_style())))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let max_preview_h = area.height.saturating_sub(10).max(3) as usize;
-    let preview_h = preview_lines.len().min(max_preview_h);
-    let truncated = preview_lines.len() > preview_h;
-    let height = (5 + preview_h + usize::from(truncated))
-        .clamp(6, area.height.saturating_sub(4).max(6) as usize) as u16;
-    let popup = centered_rect(width, height, area);
-
-    f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        // Gold border/title stays — a permission ask is deliberately
-        // distinct from a neutral picker — but the fill and title casing
-        // still match the rest of the modal family for consistency.
-        .border_style(Style::default().fg(theme::GOLD))
-        .style(Style::default().bg(theme::modal_bg()))
-        .title(Line::from(vec![Span::styled(
-            " Permission needed ",
-            theme::gold().add_modifier(Modifier::BOLD),
-        )]))
-        .title_bottom(
-            Line::from(Span::styled(
-                " y approve · s for session · n/esc deny · ↑/↓ scroll ",
-                theme::dim(),
-            ))
-            .alignment(Alignment::Center),
-        );
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(inner);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("Allow {}?", req.description),
-            theme::text().add_modifier(Modifier::BOLD),
-        ))),
-        rows[0],
-    );
-
-    // Clamp the counter the key handler nudged to the real line count, then
-    // show a scrolled window of the preview (↑/↓, pgup/pgdn) instead of only
-    // ever showing the top of it.
-    let max_scroll = preview_lines.len().saturating_sub(preview_h);
-    let scroll = scroll.min(max_scroll);
-    let end = scroll + preview_h;
-    let mut shown: Vec<Line> = preview_lines[scroll..end].to_vec();
-    if truncated {
-        let remaining = preview_lines.len() - end;
-        let hint = if remaining > 0 {
-            format!("… {remaining} more line(s) below — ↑/↓ (pgup/pgdn) scroll")
-        } else {
-            "end of preview — ↑/↓ (pgup/pgdn) scroll".to_string()
-        };
-        shown.push(Line::from(Span::styled(hint, theme::faint())));
-    }
-    f.render_widget(Paragraph::new(shown).wrap(Wrap { trim: false }), rows[2]);
-}
-
-/// The `/diff` command's two-pane side-by-side view: a centered modal that
-/// lays each diff row out as `old │ new` cells, with the `-`/`+` markers
-/// stripped and a red/green tint telling removed from added. Header rows
-/// (file metadata and `@@` hunks) span the full width in dim/teal. The
-/// render clamps `scroll` to the real row count, so the key handler just
-/// nudges it; esc returns to Chat (handled in the key path, not here).
-fn render_diff_modal(f: &mut Frame, area: Rect, rows: &[super::highlight::DiffRow], scroll: usize) {
-    let width = area.width.saturating_sub(8).clamp(70, 180);
-    let max_h = area.height.saturating_sub(6);
-    let height = max_h.clamp(10, max_h) as usize;
-    let popup = centered_rect(width, height as u16, area);
-
-    f.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::border()))
-        .style(Style::default().bg(theme::modal_bg()))
-        .title(Line::from(vec![Span::styled(
-            " Diff ",
-            theme::teal().add_modifier(Modifier::BOLD),
-        )]))
-        .title_bottom(
-            Line::from(Span::styled(
-                " esc close · ↑/↓ (pgup/pgdn) scroll ",
-                theme::dim(),
-            ))
-            .alignment(Alignment::Center),
-        );
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let col_w = (inner.width.saturating_sub(3) / 2).max(10) as usize;
-    let max_scroll = rows.len().saturating_sub(inner.height as usize);
-    let scroll = scroll.min(max_scroll);
-    let end = (scroll + inner.height as usize).min(rows.len());
-    let mut shown: Vec<Line> = Vec::new();
-    for row in &rows[scroll..end] {
-        let line = match row {
-            super::highlight::DiffRow::Header(h) => Line::from(Span::styled(
-                h.to_string(),
-                if h.starts_with("@@") {
-                    theme::teal()
-                } else {
-                    theme::dim()
-                },
-            )),
-            super::highlight::DiffRow::Pair(old, new) => {
-                let old_txt = old.as_deref().unwrap_or("");
-                let new_txt = new.as_deref().unwrap_or("");
-                let old_pad = old_txt.chars().count().min(col_w);
-                let old_spans = if old.is_some() && new.is_some() {
-                    vec![Span::styled(old_txt.to_string(), theme::text())]
-                } else if old.is_some() {
-                    vec![Span::styled(old_txt.to_string(), theme::red())]
-                } else {
-                    vec![Span::styled("", theme::dim())]
-                };
-                let new_spans = if new.is_some() && old.is_some() {
-                    vec![Span::styled(new_txt.to_string(), theme::text())]
-                } else if new.is_some() {
-                    vec![Span::styled(new_txt.to_string(), theme::green())]
-                } else {
-                    vec![Span::styled("", theme::dim())]
-                };
-                let mut spans = old_spans;
-                let pad = " ".repeat(col_w.saturating_sub(old_pad));
-                spans.push(Span::styled(pad, theme::dim()));
-                spans.push(Span::styled("│", theme::border_soft()));
-                spans.push(Span::styled(" ", theme::dim()));
-                spans.extend(new_spans);
-                Line::from(spans)
-            }
-        };
-        shown.push(line);
-    }
-    f.render_widget(Paragraph::new(shown), inner);
-}
-
-/// Cap on the model/provider picker popups' height — without this a big
-/// catalog (an aggregator provider alone can list 50+ models) sizes the
-/// popup to fit every row at once and the modal swallows nearly the whole
-/// screen. Ratatui's stateful `List` already scrolls to keep the selected
-/// row in view, so capping the height just means the list scrolls instead
-/// of the popup growing without bound — same navigation, smaller footprint.
-const PICKER_MAX_H: u16 = 20;
-
-/// A centered modal listing the current provider's available models —
-/// arrow keys or a mouse click/scroll to navigate, Enter or a click to
-/// select, Esc to close without changing anything. Modeled after opencode's
-/// own "Select model" popup.
-#[allow(clippy::too_many_arguments)] // single call-site UI modal; grouping has no reuse
-fn render_model_picker(
-    f: &mut Frame,
-    area: Rect,
-    current_provider: &str,
-    current_model: &str,
-    entries: &[PickerEntry],
-    selected: usize,
-    search: &str,
-    favorites: &[(String, String)],
-) -> Rect {
-    let width = area.width.saturating_sub(6).clamp(36, 78);
-    let filtered = model_picker_filtered(entries, search);
-    let height = (filtered.len() as u16 + 6)
-        .min(PICKER_MAX_H)
-        .clamp(9, area.height.saturating_sub(4).max(9));
-    let popup = centered_rect(width, height, area);
-
-    f.render_widget(Clear, popup);
-    let corner = Line::from(vec![
-        Span::styled(format!("{} ", filtered.len()), theme::faint()),
-        Span::styled("esc ", theme::dim()),
-    ])
-    .alignment(Alignment::Right);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style())
-        .style(Style::default().bg(theme::modal_bg()))
-        .title(Line::from(vec![Span::styled(
-            " Select model ",
-            theme::text().add_modifier(Modifier::BOLD),
-        )]))
-        .title(corner)
-        .title_bottom(
-            Line::from(Span::styled(
-                " ↑/↓ navigate · enter select · ctrl+f favorite · ctrl+a connect provider · esc dismiss ",
-                theme::dim(),
-            ))
-            .alignment(Alignment::Center),
-        );
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(inner);
-    let search_line = if search.is_empty() {
-        Line::from(vec![
-            Span::styled("▸ ", theme::violet()),
-            Span::styled("Search providers or models…", placeholder_style()),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("▸ ", theme::violet()),
-            Span::styled(search.to_string(), theme::text()),
-        ])
-    };
-    f.render_widget(Paragraph::new(search_line), rows[0]);
-
-    let list_area = rows[2];
-    let inner_w = list_area.width as usize;
-
-    let items: Vec<ListItem> = filtered
-        .iter()
-        .map(|entry| match entry {
-            PickerEntry::Header(name) => ListItem::new(Line::from(Span::styled(
-                name.to_uppercase(),
-                theme::violet().add_modifier(Modifier::BOLD),
-            ))),
-            PickerEntry::SubHeader(family) => ListItem::new(Line::from(vec![
-                Span::styled("  ", theme::faint()),
-                Span::styled(family.clone(), theme::dim().add_modifier(Modifier::ITALIC)),
-            ])),
-            PickerEntry::Model { provider, model } => {
-                let is_current = model.id == current_model && provider == current_provider;
-                let is_fav = favorites
-                    .iter()
-                    .any(|(p, m)| p == provider && m == &model.id);
-                let marker = if is_current { "● " } else { "  " };
-                let marker_style = theme::gold().add_modifier(Modifier::BOLD);
-                let star = if is_fav { "★ " } else { "" };
-                let provider_suffix = format!(" {provider}");
-                let free = is_free_model(&model.id);
-                // Context window + price, when known — the same data
-                // already fetched for `ModelInfo`/used for the sidebar's
-                // cost estimate, just not previously shown in the picker
-                // itself (you'd otherwise have to select a model blind to
-                // find out its size or cost tier).
-                let mut meta_parts: Vec<String> = Vec::new();
-                if let Some(window) = model.context_window {
-                    meta_parts.push(format_token_count(window));
-                }
-                if free {
-                    meta_parts.push("Free".to_string());
-                } else if let Some((prompt_rate, completion_rate)) =
-                    cost_per_million_tokens(provider, &model.id)
-                {
-                    meta_parts.push(format!(
-                        "${}/${}",
-                        fmt_price(prompt_rate),
-                        fmt_price(completion_rate)
-                    ));
-                }
-                let tag = meta_parts.join("  ·  ");
-                let left_w = char_count(marker)
-                    + char_count(star)
-                    + char_count(&model.name)
-                    + char_count(&provider_suffix);
-                let pad_w = inner_w.saturating_sub(left_w + char_count(&tag)).max(1);
-                let mut spans = vec![
-                    Span::styled(marker, marker_style),
-                    Span::styled(star, theme::gold()),
-                    Span::styled(
-                        model.name.clone(),
-                        theme::text().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(provider_suffix, theme::dim()),
-                ];
-                if !tag.is_empty() {
-                    spans.push(Span::raw(" ".repeat(pad_w)));
-                    let tag_style = if free {
-                        theme::gold().add_modifier(Modifier::BOLD)
-                    } else {
-                        theme::faint()
-                    };
-                    spans.push(Span::styled(tag, tag_style));
-                }
-                ListItem::new(Line::from(spans))
-            }
-        })
-        .collect();
-    // A solid full-width warm highlight bar for the selected row, matching
-    // the reference product's own selection style, instead of a subtle
-    // panel-tint + colored-text highlight.
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .bg(theme::modal_selected_bg())
-            .fg(theme::void())
-            .add_modifier(Modifier::BOLD),
-    );
-    let mut list_state = ListState::default();
-    list_state.select(Some(selected.min(filtered.len().saturating_sub(1))));
-    f.render_stateful_widget(list, list_area, &mut list_state);
-
-    list_area
-}
-
-/// The `/provider` popup: providers grouped into Local / Free / Paid headers
-/// with a status dot (green = ready, amber = needs a key) and a hint that
-/// selecting a key-less provider opens the paste prompt.
-fn render_provider_picker(
-    f: &mut Frame,
-    area: Rect,
-    current_provider: &str,
-    entries: &[ProviderEntry],
-    selected: usize,
-) -> Rect {
-    let width = area.width.saturating_sub(6).clamp(36, 76);
-    let height = (entries.len() as u16 + 4)
-        .min(PICKER_MAX_H)
-        .clamp(8, area.height.saturating_sub(4).max(8));
-    let popup = centered_rect(width, height, area);
-
-    let provider_count = entries
-        .iter()
-        .filter(|e| matches!(e, ProviderEntry::Provider { .. }))
-        .count();
-
-    f.render_widget(Clear, popup);
-    let corner = Line::from(vec![
-        Span::styled(format!("{provider_count} "), theme::faint()),
-        Span::styled("esc ", theme::dim()),
-    ])
-    .alignment(Alignment::Right);
-    // Picking a provider that still needs a key doesn't dead-end here — it
-    // opens the key-paste prompt, then automatically opens the model picker
-    // for that provider once the key is saved (see `persist_key_and_switch`).
-    let footer = " ↑/↓ navigate · enter select (asks for a key if needed) · ctrl+k set/update key · esc dismiss ";
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style())
-        .style(Style::default().bg(theme::modal_bg()))
-        .title(Line::from(vec![Span::styled(
-            " Select provider ",
-            theme::text().add_modifier(Modifier::BOLD),
-        )]))
-        .title(corner)
-        .title_bottom(Line::from(Span::styled(footer, theme::dim())).alignment(Alignment::Center));
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let items: Vec<ListItem> = entries
-        .iter()
-        .map(|entry| match entry {
-            ProviderEntry::Header(name) => ListItem::new(Line::from(Span::styled(
-                format!(" {} ", name.to_uppercase()),
-                theme::violet().add_modifier(Modifier::BOLD),
-            ))),
-            ProviderEntry::Provider { name, kind, ready } => {
-                let is_current = name == current_provider;
-                // A connected provider gets a plain checkmark gutter,
-                // matching the reference product's own treatment — no
-                // separate "(current)"/"needs key" text; readiness alone
-                // tells the story, and `apply_provider_picker_choice`
-                // routes an unready pick straight to the key prompt anyway.
-                let gutter = if *ready {
-                    Span::styled("✓", theme::green().add_modifier(Modifier::BOLD))
-                } else {
-                    Span::styled(" ", theme::faint())
-                };
-                let name_style = if is_current {
-                    theme::text().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                } else {
-                    theme::text().add_modifier(Modifier::BOLD)
-                };
-                ListItem::new(Line::from(vec![
-                    gutter,
-                    Span::raw("  "),
-                    Span::styled(name.clone(), name_style),
-                    Span::raw("  "),
-                    Span::styled(kind.clone(), theme::dim()),
-                ]))
-            }
-        })
-        .collect();
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .bg(theme::modal_selected_bg())
-            .fg(theme::void())
-            .add_modifier(Modifier::BOLD),
-    );
-    let mut list_state = ListState::default();
-    list_state.select(Some(selected.min(entries.len().saturating_sub(1))));
-    f.render_stateful_widget(list, inner, &mut list_state);
-
-    inner
-}
-
 /// The top bar is a single flex row (logo, mode pills, spacer, provider
 /// button all inline) plus its `border-bottom` hairline — 2 rows total,
 /// matching the HTML's `.topbar` exactly rather than stacking modes below
@@ -2685,12 +1944,29 @@ fn render_topbar(f: &mut Frame, area: Rect, state: &AppState, _config: &Config) 
     // Which specialist is driving the current Auto-mode plan step /
     // `/workflow` phase — previously only visible as a scrolling info line
     // in the transcript, easy to lose once a long run scrolls past it.
-    let persona_line = state.active_persona.as_ref().map(|p| {
-        Line::from(vec![
-            Span::styled(" ▸ ", theme::faint()),
-            Span::styled(p.clone(), theme::gold().add_modifier(Modifier::ITALIC)),
-        ])
-    });
+    // Truncated to whatever the topbar has left over after logo + pills
+    // instead of being clipped mid-name by the right edge on a narrow
+    // terminal.
+    let persona_slot = rows[0]
+        .width
+        .saturating_sub(logo.width() as u16 + 3 + pills.width() as u16);
+    let persona_line = (persona_slot >= 4)
+        .then_some(state.active_persona.as_deref())
+        .flatten()
+        .map(|p| {
+            let avail = (persona_slot as usize).saturating_sub(4); // " ▸ " + "…"
+            let shown: String = if char_count(p) > avail {
+                let mut s: String = p.chars().take(avail).collect();
+                s.push('…');
+                s
+            } else {
+                p.to_string()
+            };
+            Line::from(vec![
+                Span::styled(" ▸ ", theme::faint()),
+                Span::styled(shown, theme::gold().add_modifier(Modifier::ITALIC)),
+            ])
+        });
     let persona_w = persona_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
 
     // logo | gap | mode pills | persona chip | flexible spacer. No
@@ -2918,8 +2194,17 @@ fn render_files(f: &mut Frame, area: Rect, state: &AppState) {
             .add_modifier(Modifier::BOLD),
     ))];
     let max_rows = (area.height as usize).saturating_sub(1);
+    // The sidebar is 44 cols — long paths get an ellipsis tail instead of
+    // being clipped mid-path by the panel's right edge.
+    let max_w = area.width as usize;
     for path in state.files_touched.iter().rev().take(max_rows) {
-        lines.push(Line::from(Span::styled(format!("· {path}"), theme::dim())));
+        let shown = if char_count(path) + 2 > max_w {
+            let keep = max_w.saturating_sub(3);
+            format!("{}…", path.chars().take(keep).collect::<String>())
+        } else {
+            path.clone()
+        };
+        lines.push(Line::from(Span::styled(format!("· {shown}"), theme::dim())));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -3015,8 +2300,10 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     // center, and on a short terminal `centered_row`'s own height clamp
     // could squeeze the chips/hint down to zero height with no error.
     let composer_w = (area.width.saturating_sub(8)).clamp(24, 64);
-    // Borders (2) + "› " prefix (2) + "➜" suffix (3).
-    let composer_text_w = (composer_w as usize).saturating_sub(7).max(10);
+    // Left accent bar + one column of breathing room (2 columns total) —
+    // no `›` caret and no `➜` send glyph, matching the main composer's
+    // "Enter is the only way to send" metaphor.
+    let composer_text_w = (composer_w as usize).saturating_sub(2).max(10);
     let wrapped_input = wrap_preserving_newlines(&state.input, composer_text_w);
     let composer_text_h = wrapped_input.len().clamp(1, 10) as u16;
     let composer_h = composer_text_h + 2;
@@ -3116,59 +2403,42 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     );
     y += QUESTION_H + GAP;
 
-    // Composer: rounded box, teal `›` glyph, live input, a send glyph that
-    // lights up once there's something to send. Height grows with wrapped
-    // line count (same fix as the main chat composer) — this screen's
-    // input previously rendered without any `.wrap(...)` at all, so long
-    // typed/pasted text ran straight off the right edge of the box instead
-    // of wrapping. Sizing (`composer_w`/`composer_text_w`/`wrapped_input`/
-    // `composer_text_h`/`composer_h`) was already computed above, for
-    // `total_h`.
+    // Composer: same flat accent-bar panel as the pinned chat composer — no
+    // `›` caret, no send glyph, Enter is the only way to send. Height grows
+    // with wrapped line count (same fix as the main chat composer) — this
+    // screen's input previously rendered without any `.wrap(...)` at all,
+    // so long typed/pasted text ran straight off the right edge of the box
+    // instead of wrapping. Sizing (`composer_w`/`composer_text_w`/
+    // `wrapped_input`/`composer_text_h`/`composer_h`) was already computed
+    // above, for `total_h`.
     let composer_area = centered_row(area, y, composer_h, composer_w);
     opaque(f, composer_area);
-    let ready = !state.input.trim().is_empty();
+    let accent = mode_accent(state.agent_mode);
     let composer_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::teal_color()))
-        .style(Style::default().bg(theme::ink()));
-    let composer_inner = composer_block.inner(composer_area);
+        .borders(Borders::LEFT)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(accent))
+        .style(Style::default().bg(theme::panel2()));
+    let raw_inner = composer_block.inner(composer_area);
     f.render_widget(composer_block, composer_area);
-    let cols = Layout::horizontal([
-        Constraint::Length(2),
-        Constraint::Min(0),
-        Constraint::Length(3),
-    ])
-    .split(composer_inner);
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "›",
-            theme::teal().add_modifier(Modifier::BOLD),
-        )),
-        cols[0],
-    );
+    // Same one column of breathing room between the accent bar and the text
+    // as the chat composer.
+    let composer_inner = Rect {
+        x: raw_inner.x + 1,
+        y: raw_inner.y,
+        width: raw_inner.width.saturating_sub(1),
+        height: raw_inner.height,
+    };
     let input_line = if state.input.is_empty() {
         Paragraph::new(Line::from(Span::styled(
             "Describe a task, or paste a file path…",
-            theme::empty_faint(),
+            placeholder_style(),
         )))
     } else {
         Paragraph::new(Text::from(state.input.clone()).style(theme::text()))
             .wrap(Wrap { trim: false })
     };
-    f.render_widget(input_line, cols[1]);
-    let send_style = if ready {
-        // The lit-up half of the HTML's teal→cyan send-button gradient.
-        Style::default()
-            .fg(theme::empty_cyan_color())
-            .add_modifier(Modifier::BOLD)
-    } else {
-        theme::empty_faint()
-    };
-    f.render_widget(
-        Paragraph::new(Span::styled("➜", send_style)).alignment(Alignment::Right),
-        cols[2],
-    );
+    f.render_widget(input_line, composer_inner);
     if matches!(state.mode, Mode::Chat) && !state.busy {
         let typed_before: String = state.input.chars().take(state.cursor).collect();
         let wrapped_before = wrap_preserving_newlines(&typed_before, composer_text_w);
@@ -3177,7 +2447,7 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
             .saturating_sub(1)
             .min(last_row);
         let cursor_col = wrapped_before.last().map(|l| char_count(l)).unwrap_or(0) as u16;
-        f.set_cursor_position((cols[1].x + cursor_col, cols[1].y + cursor_row));
+        f.set_cursor_position((composer_inner.x + cursor_col, composer_inner.y + cursor_row));
     }
     y += composer_h + GAP;
 
@@ -5700,6 +4970,75 @@ mod tests {
         // Title and bottom hint render.
         assert!(rows.iter().any(|r| r.contains(" Diff ")));
         assert!(rows.iter().any(|r| r.contains("esc close")));
+    }
+
+    /// The key-entry modal sizes its input box against the *actual* wrap
+    /// width (`width - 4`), not the old `width - 6` guess: a 71-char key
+    /// wraps to one row at the real 72-col inner width on a 100-wide
+    /// terminal, so the input box must be exactly one row tall rather than
+    /// a mis-sized (one line too tall) two-row box.
+    #[test]
+    fn key_entry_modal_sizes_to_real_wrap_width() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let key = "k".repeat(71);
+        let mut input_rect = Rect::default();
+        terminal
+            .draw(|f| {
+                input_rect = render_key_entry_modal(f, f.area(), "anthropic", &key);
+            })
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+        // `mask_secret` keeps only the last character visible.
+        assert!(rows.iter().any(|r| r.contains('k')));
+        // 71 chars fit one 72-col row — the old width-6 sizing would have
+        // wrapped at 70 and allocated a 2-row box.
+        assert_eq!(input_rect.height, 1);
+    }
+
+    #[test]
+    fn hints_elide_trailing_pairs_when_narrow() {
+        use ratatui::text::Span;
+        let pairs: &[[&str; 2]] = &[
+            ["tab", "agents"],
+            ["/ ctrl+p", "commands"],
+            ["click", "select"],
+            ["ctrl+y", "copy"],
+            ["ctrl+f", "find"],
+            ["esc", "close"],
+        ];
+        let join =
+            |spans: &[Span<'static>]| spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        // Wide terminal: full legend with 4-space gaps.
+        let wide = hints_for_width(pairs, 200);
+        assert_eq!(
+            join(&wide),
+            "tab agents    / ctrl+p commands    click select    ctrl+y copy    ctrl+f find    esc close"
+        );
+        // Mid-width: gaps collapse to 2 spaces before any pair drops.
+        let mid = hints_for_width(pairs, 85);
+        assert_eq!(
+            join(&mid),
+            "tab agents  / ctrl+p commands  click select  ctrl+y copy  ctrl+f find  esc close"
+        );
+        // Narrow terminal: trailing pairs dropped rather than clipped.
+        let narrow = hints_for_width(pairs, 30);
+        let narrow_text = join(&narrow);
+        assert!(narrow_text.starts_with("tab agents"));
+        assert!(!narrow_text.contains("esc close"));
+    }
+
+    /// The diff modal used to panic with `clamp(10, max_h)` whenever the
+    /// terminal was under 16 rows tall (`max_h` below the floor) — it should
+    /// render (shrunk to fit) instead of crashing.
+    #[test]
+    fn diff_modal_survives_short_terminal() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        let rows = vec![crate::highlight::DiffRow::Header("@@".into())];
+        terminal
+            .draw(|f| {
+                render_diff_modal(f, f.area(), &rows, 0);
+            })
+            .unwrap();
     }
 
     /// Scrolling the diff modal with ↑/↓ and paging nudges the offset; the
