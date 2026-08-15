@@ -1582,7 +1582,9 @@ pub struct ToolManager {
 /// status) — safe to run in Plan mode. Everything else (writes, git
 /// mutations, `bash`, MCP/plugin calls, whose side effects zeus can't
 /// characterize generically) is blocked while Plan mode is active.
-fn is_read_only_tool(name: &str) -> bool {
+/// `pub(crate)` so personas and orchestration can classify steps the same
+/// way Plan mode does (single source of truth for "does this mutate?").
+pub(crate) fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
         "read"

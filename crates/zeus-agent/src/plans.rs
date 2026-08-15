@@ -5,9 +5,10 @@
 //! the session: `TaskPlan` is written at plan time (`approved: false`),
 //! flipped to `true` when the user approves execution, and each step's `done`
 //! flag is flipped as the orchestrator completes it — so a human watching
-//! `.agent/tasks.json` mid-run sees live per-step progress. Nothing in zeus
-//! reads the file back for its own decisions yet; it exists as the durable
-//! record a human reviews before and during execution.
+//! `.agent/tasks.json` mid-run sees live per-step progress. The orchestrator
+//! also *reads the file back*: an approved plan with steps still pending is
+//! offered for resume on the next run instead of being re-planned from
+//! scratch, so an interrupted or declined-at-execution plan can be continued.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

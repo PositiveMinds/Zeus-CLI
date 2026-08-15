@@ -64,11 +64,13 @@ impl Persona {
     /// Whether this persona only inspects and never mutates the workspace.
     /// A persona is "read-only safe" (so a step can run as a headless parallel
     /// turn with no shared file-write access) iff it declares a tool
-    /// allow-list and every allowed tool is non-mutating.
+    /// allow-list and every allowed tool is non-mutating. Classification
+    /// reuses the same `is_read_only_tool` list Plan mode enforces centrally,
+    /// so a persona can't drift into "read-only" by declaring a tool that the
+    /// tool surface actually treats as mutating (test/verify/git_commit/…).
     pub fn read_only(&self) -> bool {
-        const MUTATING: &[&str] = &["write", "edit", "delete", "bash", "run", "exec"];
         match self.tools {
-            Some(tools) => !tools.iter().any(|t| MUTATING.contains(t)),
+            Some(tools) => !tools.is_empty() && tools.iter().all(|t| crate::tools::is_read_only_tool(t)),
             None => false,
         }
     }

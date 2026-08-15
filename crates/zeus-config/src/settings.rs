@@ -104,6 +104,11 @@ pub struct AgentSettings {
     /// persisted from `/theme`. `None` (the default) keeps `dark`.
     #[serde(default)]
     pub theme: Option<String>,
+    /// Cap on how many read-only orchestration steps run concurrently (the
+    /// "max parallel read steps" bound on the headless read-only batch).
+    /// `None` (the default) keeps the CLI's built-in bound of 2.
+    #[serde(default)]
+    pub max_parallel_read_steps: Option<usize>,
 }
 
 /// One configured external MCP tool server, spawned over stdio.
@@ -480,6 +485,8 @@ struct PartialSettings {
     notify_on_completion: Option<bool>,
     #[serde(default)]
     theme: Option<String>,
+    #[serde(default)]
+    max_parallel_read_steps: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -549,6 +556,7 @@ impl SettingsStack {
                 accent_color: None,
                 notify_on_completion: Some(true),
                 theme: None,
+                max_parallel_read_steps: None,
             },
         ));
         s
@@ -603,6 +611,7 @@ impl SettingsStack {
             accent_color: None,
             notify_on_completion: true,
             theme: None,
+            max_parallel_read_steps: None,
         };
 
         for (_layer, partial) in &self.layers {
@@ -681,6 +690,9 @@ impl SettingsStack {
             }
             if let Some(theme) = &partial.theme {
                 out.theme = Some(theme.clone());
+            }
+            if let Some(v) = partial.max_parallel_read_steps {
+                out.max_parallel_read_steps = Some(v);
             }
             if let Some(roots) = &partial.project_roots {
                 // Later layers replace the list entirely when present.

@@ -1007,7 +1007,7 @@ async fn build_agent_with_provider(
             // generating for as long as the model's context window allows.
             // `model.max_tokens` in settings.toml overrides this.
             max_tokens: Some(config.settings.model.max_tokens.unwrap_or(1024)),
-            max_parallel_read_steps: 2,
+            max_parallel_read_steps: config.settings.max_parallel_read_steps.unwrap_or(2),
             tasks_file: config.project.as_ref().map(|p| p.tasks_json.clone()),
         },
     ))

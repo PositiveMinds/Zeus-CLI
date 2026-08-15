@@ -848,72 +848,139 @@ impl Agent {
         let _ = self.cancel_tx.send(false);
         let mut total_usage = TokenUsage::default();
 
-        let (steps, usage) = self.plan_task(goal).await?;
-        add_usage(&mut total_usage, &usage);
-        on_event(AgentEvent::PlanGenerated {
-            steps: steps.clone(),
-        });
-
-        // Persist the drafted plan up front, then hold at the review gate:
-        // nothing below executes until the user approves. This is the
-        // "review-before-execute" step — Auto mode used to plan-then-run
-        // with no checkpoint, so a misframed goal would sail straight into
-        // file edits.
-        let mut plan = TaskPlan::from_steps(goal, &steps, "", false);
-        // Snapshot any previously persisted plan BEFORE overwriting it, so a
-        // re-planned run can diff the new step list against the old one rather
-        // than making the user re-read everything.
-        let prior_plan = match &self.options.tasks_file {
-            Some(path) => TaskPlan::read(path)?,
+        // Resume-from-plan: if an approved plan with pending steps already
+        // exists on disk, offer to continue it rather than re-planning the
+        // goal from scratch. Declining the resume gate falls through to a
+        // fresh plan below.
+        let resumed: Option<(TaskPlan, Vec<PlanStep>)> = match &self.options.tasks_file {
+            Some(path) => {
+                let existing = TaskPlan::read(path)?;
+                if let Some(existing) = existing {
+                    if existing.approved && existing.completed() < existing.steps.len() {
+                        let approved = matches!(
+                            approver(&PermissionRequest {
+                                tool: "plan_resume".into(),
+                                path: self.options.tasks_file.clone(),
+                                command: None,
+                                description: format!(
+                                    "resume the approved plan for: {goal} ({} of {} step(s) done, \
+                                     {} pending)",
+                                    existing.completed(),
+                                    existing.steps.len(),
+                                    existing.steps.len() - existing.completed()
+                                ),
+                                preview: Some(existing.render_lines()),
+                                overwrites: false,
+                            }),
+                            ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession
+                        );
+                        if approved {
+                            let pending = existing
+                                .steps
+                                .iter()
+                                .filter(|s| !s.done)
+                                .map(|s| PlanStep {
+                                    id: s.id,
+                                    description: s.description.clone(),
+                                    rationale: String::new(),
+                                    persona: s.persona.clone(),
+                                })
+                                .collect::<Vec<PlanStep>>();
+                            Some((existing, pending))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
             None => None,
         };
-        self.write_task_plan(&plan)?;
 
-        let mut preview = self.render_plan_preview(&steps);
-        if let (Some(path), Some(prior)) = (&self.options.tasks_file, prior_plan) {
-            if let Some(diff) = plan.diff_vs(&prior) {
-                preview.push_str(&format!("\n--- plan changed vs {}\n{diff}", path.display()));
+        let (mut plan, steps, resuming) = match resumed {
+            Some((existing, pending)) => {
+                on_event(AgentEvent::PlanGenerated {
+                    steps: pending.clone(),
+                });
+                (existing, pending, true)
             }
-        }
+            None => {
+                let (planned, usage) = self.plan_task(goal).await?;
+                add_usage(&mut total_usage, &usage);
+                on_event(AgentEvent::PlanGenerated {
+                    steps: planned.clone(),
+                });
+                (TaskPlan::from_steps(goal, &planned, "", false), planned, false)
+            }
+        };
 
-        let approved = matches!(
-            approver(&PermissionRequest {
-                tool: "plan_execute".into(),
-                path: self.options.tasks_file.clone(),
-                command: None,
-                description: format!(
-                    "execute the reviewed plan ({} step(s)) for: {goal}",
-                    steps.len()
-                ),
-                preview: Some(preview),
-                overwrites: false,
-            }),
-            ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession
-        );
-        if !approved {
-            let summary = format!(
-                "plan drafted ({n} step(s)) but you declined to execute — nothing changed. \
-                 Review {path} (and/or fine-tune the goal) then rerun to approve.",
-                n = steps.len(),
-                path = self
-                    .options
-                    .tasks_file
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "the plan".to_string())
+        if !resuming {
+            // Persist the drafted plan up front, then hold at the review gate:
+            // nothing below executes until the user approves. This is the
+            // "review-before-execute" step — Auto mode used to plan-then-run
+            // with no checkpoint, so a misframed goal would sail straight into
+            // file edits.
+            // Snapshot any previously persisted plan BEFORE overwriting it, so a
+            // re-planned run can diff the new step list against the old one rather
+            // than making the user re-read everything.
+            let prior_plan = match &self.options.tasks_file {
+                Some(path) => TaskPlan::read(path)?,
+                None => None,
+            };
+            self.write_task_plan(&plan)?;
+
+            let mut preview = self.render_plan_preview(&steps);
+            if let (Some(path), Some(prior)) = (&self.options.tasks_file, prior_plan) {
+                if let Some(diff) = plan.diff_vs(&prior) {
+                    preview.push_str(&format!("\n--- plan changed vs {}\n{diff}", path.display()));
+                }
+            }
+
+            let approved = matches!(
+                approver(&PermissionRequest {
+                    tool: "plan_execute".into(),
+                    path: self.options.tasks_file.clone(),
+                    command: None,
+                    description: format!(
+                        "execute the reviewed plan ({} step(s)) for: {goal}",
+                        steps.len()
+                    ),
+                    preview: Some(preview),
+                    overwrites: false,
+                }),
+                ApprovalDecision::Approved | ApprovalDecision::ApprovedForSession
             );
-            on_event(AgentEvent::OrchestrationDone {
-                summary: summary.clone(),
-            });
-            return Ok((summary, total_usage));
+            if !approved {
+                let summary = format!(
+                    "plan drafted ({n} step(s)) but you declined to execute — nothing changed. \
+                     Review {path} (and/or fine-tune the goal) then rerun to approve.",
+                    n = steps.len(),
+                    path = self
+                        .options
+                        .tasks_file
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "the plan".to_string())
+                );
+                on_event(AgentEvent::OrchestrationDone {
+                    summary: summary.clone(),
+                });
+                return Ok((summary, total_usage));
+            }
+            plan.approved = true;
+            self.write_task_plan(&plan)?;
         }
-        plan.approved = true;
-        self.write_task_plan(&plan)?;
 
         // Per-step acceptance: each recommended approach can be accepted or
         // declined independently. Declined steps are skipped (and reported),
         // the accepted ones run in order. `ApprovedForSession` auto-accepts
-        // every remaining step without re-prompting.
+        // every remaining step without re-prompting. On a resumed plan the
+        // plan as a whole was already approved, but individual pending steps
+        // can still be declined here — declined steps never run and stay
+        // pending, exactly as on the fresh-plan path.
         let mut accepted: Vec<PlanStep> = Vec::with_capacity(steps.len());
         let mut declined: Vec<PlanStep> = Vec::new();
         let mut auto_accept = false;
@@ -1009,6 +1076,7 @@ impl Agent {
                 // the run share the same completed-so-far snapshot and only
                 // read files mentally, so their model calls are independent.
                 let (start, end) = (read_run.0, read_run.1);
+                let tools = &self.tools;
                 let opt_model = self.options.model.clone();
                 let opt_temperature = self.options.temperature;
                 let opt_max_tokens = self.options.max_tokens;
@@ -1026,6 +1094,7 @@ impl Agent {
                         let base_snapshot = base_snapshot.clone();
                         async move {
                             run_headless_step(
+                                tools,
                                 provider,
                                 HeadlessSpec {
                                     model: opt_model,
@@ -1367,7 +1436,15 @@ impl Agent {
              Review only — do not edit files. End with a concise verdict."
         );
         self.state.messages.push(Message::user(review_prompt));
-        let result = self.drive_turn(&mut *on_event, &mut *approver).await?;
+        // Force Plan mode for the whole review turn: the "reviewers can't
+        // edit files" guarantee must be enforced by the tool gate, not just
+        // asserted in the prompt. Restore the caller's mode afterwards, same
+        // as `understand_topic`/`review_turn` do.
+        let was_plan = self.plan_mode();
+        self.set_plan_mode(true);
+        let result = self.drive_turn(&mut *on_event, &mut *approver).await;
+        self.set_plan_mode(was_plan);
+        let result = result?;
         if injected {
             self.state.messages.remove(0);
         }
@@ -2059,10 +2136,6 @@ fn step_summary(step: &PlanStep, text: &str) -> String {
     )
 }
 
-/// Run one planned step as a *headless* provider call (no tools, no shared
-/// conversation mutation) and return its text. Used for concurrent read-only
-/// steps: unconnected cloned provider/cancel handle in, finished text out,
-/// nothing about `self` shared or mutated.
 /// Model knobs shared by headless plan steps.
 fn add_usage(total: &mut TokenUsage, delta: &TokenUsage) {
     total.prompt_tokens += delta.prompt_tokens;
@@ -2076,12 +2149,22 @@ struct HeadlessSpec {
     max_tokens: Option<u32>,
 }
 
+/// Run one planned step as a *headless* provider call — a bounded loop over
+/// the *read-only* tool set, with no shared conversation mutation — and
+/// return its text. Used for concurrent read-only steps: unconnected cloned
+/// provider/cancel handle in, finished text out, nothing about `self` shared
+/// or mutated. The tools are the same `read_only_tool_specs` the delegate
+/// path uses, so these steps can actually ground themselves in the workspace
+/// (read/grep/glob/git) instead of only echoing the snapshot; auto-approval
+/// is safe because every exposed tool is non-mutating.
+///
 /// Returns `(text, was_cancelled, usage)`. A cancellation caught before the
 /// stream even starts (the provider's own upfront check) and one caught
 /// mid-stream (`FinishReason::Cancelled`) both surface through the same
 /// `was_cancelled` flag rather than one being an `Err` and the other an
 /// `Ok` — callers only need to check one thing.
 async fn run_headless_step(
+    tools: &ToolManager,
     provider: std::sync::Arc<dyn ModelProvider>,
     spec: HeadlessSpec,
     step: &PlanStep,
@@ -2103,42 +2186,99 @@ async fn run_headless_step(
         step.description
     );
 
-    let request = ChatRequest {
-        model: spec.model,
-        messages: vec![Message::system(system), Message::user(user)],
-        tools: Vec::new(),
-        temperature: spec.temperature,
-        max_tokens: spec.max_tokens.or(Some(512)),
-        cancel: Some(cancel),
-    };
-    let mut stream = match provider.stream(request).await {
-        Ok(s) => s,
-        Err(zeus_provider::ProviderError::Cancelled) => {
-            return Ok((String::new(), true, TokenUsage::default()));
-        }
-        Err(e) => return Err(AgentError::Provider(e)),
-    };
-    let mut text = String::new();
-    let mut cancelled = false;
+    let mut messages = vec![Message::system(system), Message::user(user)];
     let mut usage = TokenUsage::default();
-    while let Some(ev) = stream.next().await {
-        match ev.map_err(AgentError::Provider)? {
-            StreamEvent::TextDelta { text: t } => text.push_str(&t),
-            StreamEvent::ToolCallDelta { .. } => {}
-            StreamEvent::Done {
-                finish_reason,
-                usage: u,
-            } => {
-                if finish_reason == FinishReason::Cancelled {
-                    cancelled = true;
+    const MAX_ITERATIONS: usize = 5;
+    for _ in 0..MAX_ITERATIONS {
+        if *cancel.borrow() {
+            return Ok((String::new(), true, usage));
+        }
+        let request = ChatRequest {
+            model: spec.model.clone(),
+            messages: messages.clone(),
+            tools: tools.read_only_tool_specs(),
+            temperature: spec.temperature,
+            max_tokens: spec.max_tokens.or(Some(512)),
+            cancel: Some(cancel.clone()),
+        };
+        let mut stream = match provider.stream(request).await {
+            Ok(s) => s,
+            Err(zeus_provider::ProviderError::Cancelled) => {
+                return Ok((String::new(), true, usage));
+            }
+            Err(e) => return Err(AgentError::Provider(e)),
+        };
+        let mut text = String::new();
+        let mut calls: HashMap<String, (Option<String>, String)> = HashMap::new();
+        let mut call_order: Vec<String> = Vec::new();
+        let mut finish = FinishReason::Stop;
+        while let Some(ev) = stream.next().await {
+            match ev.map_err(AgentError::Provider)? {
+                StreamEvent::TextDelta { text: t } => text.push_str(&t),
+                StreamEvent::ToolCallDelta {
+                    id,
+                    name,
+                    arguments_delta,
+                } => {
+                    let entry = calls.entry(id.clone()).or_insert_with(|| {
+                        call_order.push(id.clone());
+                        (None, String::new())
+                    });
+                    if let Some(n) = name {
+                        entry.0 = Some(n);
+                    }
+                    entry.1.push_str(&arguments_delta);
                 }
-                usage.prompt_tokens += u.prompt_tokens;
-                usage.completion_tokens += u.completion_tokens;
-                usage.total_tokens += u.total_tokens;
+                StreamEvent::Done {
+                    finish_reason,
+                    usage: u,
+                } => {
+                    usage.prompt_tokens += u.prompt_tokens;
+                    usage.completion_tokens += u.completion_tokens;
+                    usage.total_tokens += u.total_tokens;
+                    finish = finish_reason;
+                }
             }
         }
+        if finish == FinishReason::Cancelled {
+            return Ok((text, true, usage));
+        }
+        if calls.is_empty() {
+            return Ok((text, false, usage));
+        }
+        let tool_calls: Vec<ToolCall> = call_order
+            .iter()
+            .filter_map(|id| {
+                let (name, arguments) = calls.get(id)?;
+                Some(ToolCall {
+                    id: id.clone(),
+                    name: name.clone().unwrap_or_default(),
+                    arguments: arguments.clone(),
+                })
+            })
+            .collect();
+        let mut assistant_msg = Message::assistant(text);
+        assistant_msg.tool_calls = tool_calls.clone();
+        messages.push(assistant_msg);
+        for call in &tool_calls {
+            // Every tool here is already filtered to read-only via
+            // `read_only_tool_specs`, so there's nothing an "ask" response
+            // would meaningfully gate — auto-approve, same as the delegated
+            // specialist loop.
+            let result = tools.dispatch_with_approver(
+                &call.name,
+                &call.arguments,
+                |_: &PermissionRequest| ApprovalDecision::Approved,
+            )?;
+            messages.push(Message::tool_result(call.id.clone(), result.content));
+        }
     }
-    Ok((text, cancelled, usage))
+    Ok((
+        "(headless step hit its consultation limit without a final answer — try a narrower subtask)"
+            .to_string(),
+        false,
+        usage,
+    ))
 }
 
 /// The `delegate` tool's spec — built fresh (not a `const`) since the

@@ -68,12 +68,31 @@ impl BackgroundTaskRegistry {
     fn next_id(&self) -> Result<u64> {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.counter_path();
-        let current: u64 = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
+        // The counter is a read-modify-write, and `zeus bg spawn` runs in its
+        // own fresh process each time — so without locking, two concurrent
+        // invocations can both read the same value and mint duplicate ids.
+        // Hold an exclusive advisory lock on the counter file itself for the
+        // duration of the update (released on drop/process exit, so a crash
+        // can't wedge it).
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // Don't truncate on open: we hold the lock and rewrite via
+            // set_len(0) + seek(0) below, and truncating before locking
+            // could discard a counter a concurrent process just wrote.
+            .truncate(false)
+            .open(&path)?;
+        file.lock().map_err(AgentError::Io)?;
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut file, &mut buf).map_err(AgentError::Io)?;
+        let current: u64 = buf.trim().parse().ok().unwrap_or(0);
         let next = current + 1;
-        std::fs::write(&path, next.to_string())?;
+        file.set_len(0).map_err(AgentError::Io)?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(AgentError::Io)?;
+        std::io::Write::write_all(&mut file, next.to_string().as_bytes())
+            .map_err(AgentError::Io)?;
+        let _ = file.unlock();
         Ok(next)
     }
 
