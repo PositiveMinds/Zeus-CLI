@@ -216,6 +216,7 @@ fn tool_calls_from(msg: &OllamaMessage, id_offset: usize) -> Vec<ToolCall> {
             id: format!("call-{}", id_offset + i),
             name: c.function.name.clone(),
             arguments: c.function.arguments.to_string(),
+            extra_content: None,
         })
         .collect()
 }
@@ -363,6 +364,7 @@ impl ModelProvider for OllamaProvider {
                                     id: call.id,
                                     name: Some(call.name),
                                     arguments_delta: call.arguments,
+                                    extra_content: None,
                                 }))
                                 .await
                                 .is_err()

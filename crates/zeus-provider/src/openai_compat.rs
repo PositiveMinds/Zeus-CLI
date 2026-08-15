@@ -110,11 +110,17 @@ fn to_openai_message(m: &Message) -> Value {
         obj["tool_calls"] = json!(m
             .tool_calls
             .iter()
-            .map(|c| json!({
-                "id": c.id,
-                "type": "function",
-                "function": { "name": c.name, "arguments": c.arguments },
-            }))
+            .map(|c| {
+                let mut tc = json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                });
+                if let Some(extra) = &c.extra_content {
+                    tc["extra_content"] = extra.clone();
+                }
+                tc
+            })
             .collect::<Vec<_>>());
     }
     obj
@@ -162,6 +168,10 @@ struct OaToolCall {
     #[serde(default)]
     id: String,
     function: OaFunctionCall,
+    /// Provider-specific metadata (Gemini: `google.thought_signature`) that
+    /// must be echoed verbatim on the next turn.
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 #[derive(Debug, Deserialize, Default)]
 struct OaMessage {
@@ -235,6 +245,9 @@ struct OaToolCallDelta {
     id: Option<String>,
     #[serde(default)]
     function: Option<OaFunctionDelta>,
+    /// Provider-specific metadata (Gemini: `google.thought_signature`).
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 #[derive(Debug, Deserialize, Default)]
 struct OaFunctionDelta {
@@ -302,6 +315,7 @@ impl ModelProvider for OpenAiCompatProvider {
                 id: c.id,
                 name: c.function.name,
                 arguments: c.function.arguments,
+                extra_content: c.extra_content,
             })
             .collect();
         let finish_reason =
@@ -448,6 +462,7 @@ impl ModelProvider for OpenAiCompatProvider {
                                     id,
                                     name,
                                     arguments_delta,
+                                    extra_content: tc.extra_content,
                                 }))
                                 .await
                                 .is_err()
@@ -600,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("stream"):
                 self._stream_chat(model)
             else:
-                self._chat(model, auth)
+                self._chat(model, auth, body)
         elif self.path == "/v1/embeddings":
             body = self._read_json()
             inputs = body.get("input", [])
@@ -611,7 +626,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "not found"})
 
-    def _chat(self, model, auth=""):
+    def _chat(self, model, auth="", body=None):
+        if body is None:
+            body = {}
         if model == "auth-echo-model":
             resp = {"choices": [{"message": {"role": "assistant", "content": f"auth:{auth}"},
                                   "finish_reason": "stop"}],
@@ -622,6 +639,25 @@ class Handler(BaseHTTPRequestHandler):
                             "tool_calls": [{"id": "call_1", "type": "function",
                                             "function": {"name": "shout", "arguments": "{\"text\":\"hi\"}"}}]},
                 "finish_reason": "tool_calls",
+            }], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        elif model == "gemini-tool-model":
+            # Gemini (3.1+) returns `extra_content.google.thought_signature`
+            # with each function call and rejects follow-ups that don't echo it.
+            sig = "sg_aG9wZWx5"
+            resp = {"choices": [{
+                "message": {"role": "assistant", "content": None,
+                            "tool_calls": [{"id": "call_1", "type": "function",
+                                            "function": {"name": "shout", "arguments": "{\"text\":\"hi\"}"},
+                                            "extra_content": {"google": {"thought_signature": sig}}}]},
+                "finish_reason": "tool_calls",
+            }], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        elif model == "echo-tool-model":
+            # Verifies the client echoes `extra_content` verbatim on follow-up.
+            echoed = body["messages"][1]["tool_calls"][0].get("extra_content")
+            ok = echoed == {"google": {"thought_signature": "sg_aG9wZWx5"}}
+            resp = {"choices": [{
+                "message": {"role": "assistant", "content": f"echoed:{ok}", "tool_calls": None},
+                "finish_reason": "stop",
             }], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
         elif model == "null-tool-calls-model":
             # Some OpenAI-compatible providers (observed from deepseek /
@@ -652,6 +688,13 @@ class Handler(BaseHTTPRequestHandler):
             chunks = [
                 {"choices": [{"delta": {"content": "hi", "tool_calls": None}, "finish_reason": None}]},
                 {"choices": [{"delta": {"tool_calls": None}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+            ]
+        elif model == "gemini-tool-model":
+            chunks = [
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "shout", "arguments": ""}, "extra_content": {"google": {"thought_signature": "sg_aG9wZWx5"}}}]}, "finish_reason": None}]},
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"text\""}}]}, "finish_reason": None}]},
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": ":\"hi\"}"}}]}, "finish_reason": None}]},
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
             ]
         else:
             chunks = [
@@ -800,6 +843,73 @@ server.serve_forever()
         assert_eq!(resp.message.tool_calls.len(), 1);
         assert_eq!(resp.message.tool_calls[0].name, "shout");
         assert_eq!(resp.message.tool_calls[0].arguments, r#"{"text":"hi"}"#);
+    }
+
+    /// Gemini (3.1+) attaches `extra_content.google.thought_signature` to each
+    /// function call; it must survive into the parsed `ToolCall` so the next
+    /// request can echo it (Gemini 400s otherwise).
+    #[tokio::test]
+    async fn chat_preserves_gemini_extra_content() {
+        let server = TestServer::start();
+        let provider = OpenAiCompatProvider::new("test", &server.base_url);
+        let resp = provider
+            .chat(ChatRequest::new("gemini-tool-model", vec![Message::user("hi")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(resp.message.tool_calls.len(), 1);
+        let call = &resp.message.tool_calls[0];
+        assert_eq!(call.extra_content.as_ref().unwrap()["google"]["thought_signature"], "sg_aG9wZWx5");
+    }
+
+    /// The follow-up request must echo `extra_content` verbatim on the
+    /// assistant tool-call message — the test server returns `echoed:True`
+    /// only if it sees the exact object.
+    #[tokio::test]
+    async fn chat_echoes_gemini_extra_content_on_followup() {
+        let server = TestServer::start();
+        let provider = OpenAiCompatProvider::new("test", &server.base_url);
+        let first = provider
+            .chat(ChatRequest::new("gemini-tool-model", vec![Message::user("hi")]))
+            .await
+            .unwrap();
+        let assistant = first.message.clone();
+        let mut messages = vec![Message::user("hi"), assistant];
+        messages.push(Message::tool_result("call_1", r#"{"ok":true}"#));
+        let resp = provider
+            .chat(ChatRequest::new("echo-tool-model", messages))
+            .await
+            .unwrap();
+        assert_eq!(resp.message.content, "echoed:True");
+    }
+
+    /// Same for the streaming path: the signature must ride the first
+    /// `ToolCallDelta` chunk.
+    #[tokio::test]
+    async fn stream_preserves_gemini_extra_content() {
+        let server = TestServer::start();
+        let provider = OpenAiCompatProvider::new("test", &server.base_url);
+        let mut stream = provider
+            .stream(ChatRequest::new("gemini-tool-model", vec![Message::user("hi")]))
+            .await
+            .unwrap();
+        let mut signature = None;
+        let mut arguments = String::new();
+        while let Some(ev) = stream.next().await {
+            if let StreamEvent::ToolCallDelta {
+                extra_content,
+                arguments_delta,
+                ..
+            } = ev.unwrap()
+            {
+                if let Some(extra) = extra_content {
+                    signature = extra["google"]["thought_signature"].as_str().map(String::from);
+                }
+                arguments.push_str(&arguments_delta);
+            }
+        }
+        assert_eq!(signature.as_deref(), Some("sg_aG9wZWx5"));
+        assert_eq!(arguments, r#"{"text":"hi"}"#);
     }
 
     #[tokio::test]

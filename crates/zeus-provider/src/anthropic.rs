@@ -263,6 +263,7 @@ impl ModelProvider for AnthropicProvider {
                         id: block.id.unwrap_or_default(),
                         name: block.name.unwrap_or_default(),
                         arguments: block.input.map(|v| v.to_string()).unwrap_or_default(),
+                        extra_content: None,
                     });
                 }
                 _ => {}
@@ -498,6 +499,7 @@ async fn handle_anthropic_event(
                         id,
                         name: Some(name),
                         arguments_delta: args,
+                        extra_content: None,
                     }))
                     .await;
             }

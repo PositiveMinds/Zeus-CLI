@@ -1629,7 +1629,8 @@ impl Agent {
                 Err(e) => return Err(AgentError::Provider(e)),
             };
             let mut text = String::new();
-            let mut calls: HashMap<String, (Option<String>, String)> = HashMap::new();
+            let mut calls: HashMap<String, (Option<String>, String, Option<serde_json::Value>)> =
+                HashMap::new();
             let mut call_order: Vec<String> = Vec::new();
             let mut finish = FinishReason::Stop;
             while let Some(ev) = stream.next().await {
@@ -1639,15 +1640,19 @@ impl Agent {
                         id,
                         name,
                         arguments_delta,
+                        extra_content,
                     } => {
                         let entry = calls.entry(id.clone()).or_insert_with(|| {
                             call_order.push(id.clone());
-                            (None, String::new())
+                            (None, String::new(), None)
                         });
                         if let Some(n) = name {
                             entry.0 = Some(n);
                         }
                         entry.1.push_str(&arguments_delta);
+                        if extra_content.is_some() {
+                            entry.2 = extra_content;
+                        }
                     }
                     StreamEvent::Done {
                         finish_reason,
@@ -1670,11 +1675,12 @@ impl Agent {
             let tool_calls: Vec<ToolCall> = call_order
                 .iter()
                 .filter_map(|id| {
-                    let (name, arguments) = calls.get(id)?;
+                    let (name, arguments, extra_content) = calls.get(id)?;
                     Some(ToolCall {
                         id: id.clone(),
                         name: name.clone().unwrap_or_default(),
                         arguments: arguments.clone(),
+                        extra_content: extra_content.clone(),
                     })
                 })
                 .collect();
@@ -1783,7 +1789,8 @@ impl Agent {
                     .map_err(AgentError::Provider)?;
 
                 let mut text = String::new();
-                let mut calls: HashMap<String, (Option<String>, String)> = HashMap::new();
+                let mut calls: HashMap<String, (Option<String>, String, Option<serde_json::Value>)> =
+                    HashMap::new();
                 let mut call_order: Vec<String> = Vec::new();
                 let mut finish = FinishReason::Stop;
 
@@ -1797,15 +1804,19 @@ impl Agent {
                             id,
                             name,
                             arguments_delta,
+                            extra_content,
                         } => {
                             let entry = calls.entry(id.clone()).or_insert_with(|| {
                                 call_order.push(id.clone());
-                                (None, String::new())
+                                (None, String::new(), None)
                             });
                             if let Some(n) = name {
                                 entry.0 = Some(n);
                             }
                             entry.1.push_str(&arguments_delta);
+                            if extra_content.is_some() {
+                                entry.2 = extra_content;
+                            }
                         }
                         StreamEvent::Done {
                             finish_reason,
@@ -1905,11 +1916,12 @@ impl Agent {
             let tool_calls: Vec<ToolCall> = call_order
                 .iter()
                 .map(|id| {
-                    let (name, arguments) = calls.get(id).unwrap();
+                    let (name, arguments, extra_content) = calls.get(id).unwrap();
                     ToolCall {
                         id: id.clone(),
                         name: name.clone().unwrap_or_default(),
                         arguments: arguments.clone(),
+                        extra_content: extra_content.clone(),
                     }
                 })
                 .collect();
@@ -2252,7 +2264,8 @@ async fn run_headless_step(
             Err(e) => return Err(AgentError::Provider(e)),
         };
         let mut text = String::new();
-        let mut calls: HashMap<String, (Option<String>, String)> = HashMap::new();
+        let mut calls: HashMap<String, (Option<String>, String, Option<serde_json::Value>)> =
+            HashMap::new();
         let mut call_order: Vec<String> = Vec::new();
         let mut finish = FinishReason::Stop;
         while let Some(ev) = stream.next().await {
@@ -2262,15 +2275,19 @@ async fn run_headless_step(
                     id,
                     name,
                     arguments_delta,
+                    extra_content,
                 } => {
                     let entry = calls.entry(id.clone()).or_insert_with(|| {
                         call_order.push(id.clone());
-                        (None, String::new())
+                        (None, String::new(), None)
                     });
                     if let Some(n) = name {
                         entry.0 = Some(n);
                     }
                     entry.1.push_str(&arguments_delta);
+                    if extra_content.is_some() {
+                        entry.2 = extra_content;
+                    }
                 }
                 StreamEvent::Done {
                     finish_reason,
@@ -2292,11 +2309,12 @@ async fn run_headless_step(
         let tool_calls: Vec<ToolCall> = call_order
             .iter()
             .filter_map(|id| {
-                let (name, arguments) = calls.get(id)?;
+                let (name, arguments, extra_content) = calls.get(id)?;
                 Some(ToolCall {
                     id: id.clone(),
                     name: name.clone().unwrap_or_default(),
                     arguments: arguments.clone(),
+                    extra_content: extra_content.clone(),
                 })
             })
             .collect();
@@ -2437,7 +2455,9 @@ mod tests {
         Text(String),
         /// One or more tool calls the model issues this iteration; the agent
         /// executes them, feeds results back, then streams the next reply.
-        ToolCalls(Vec<(String, String, String)>),
+        /// The optional 4th tuple element is provider metadata (`extra_content`)
+        /// the agent must carry through to the tool call it records.
+        ToolCalls(Vec<(String, String, String, Option<serde_json::Value>)>),
     }
 
     /// Deterministic, in-memory `ModelProvider` for turn-level tests: a script
@@ -2484,10 +2504,11 @@ mod tests {
                 MockReply::ToolCalls(calls) => {
                     let tool_calls: Vec<zeus_provider::ToolCall> = calls
                         .into_iter()
-                        .map(|(id, name, arguments)| zeus_provider::ToolCall {
+                        .map(|(id, name, arguments, extra_content)| zeus_provider::ToolCall {
                             id,
                             name,
                             arguments,
+                            extra_content,
                         })
                         .collect();
                     let mut message = Message::assistant("");
@@ -2517,11 +2538,12 @@ mod tests {
                     });
                 }
                 MockReply::ToolCalls(calls) => {
-                    for (id, name, args) in calls {
+                    for (id, name, args, extra_content) in calls {
                         events.push(StreamEvent::ToolCallDelta {
                             id: id.clone(),
                             name: Some(name.clone()),
                             arguments_delta: args.clone(),
+                            extra_content: extra_content.clone(),
                         });
                     }
                     events.push(StreamEvent::Done {
@@ -2645,6 +2667,7 @@ mod tests {
                     "call-read".into(),
                     "read".into(),
                     r#"{"path":"a.txt"}"#.into(),
+                    None,
                 )]),
                 MockReply::Text("file says content 42".into()),
             ]),
@@ -2671,6 +2694,47 @@ mod tests {
             })
             .expect("read tool result event");
         assert!(read_result.contains("content 42"));
+    }
+
+    /// Gemini (3.1+) returns `extra_content.google.thought_signature` on each
+    /// tool call and 400s follow-ups that don't echo it. The agent must carry
+    /// that metadata through the streamed tool-call into the recorded tool
+    /// call so the next request can re-send it verbatim.
+    #[tokio::test]
+    async fn run_turn_preserves_gemini_extra_content() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "content 42").unwrap();
+        let sig = serde_json::json!({"google": {"thought_signature": "sg_aG9wZWx5"}});
+        let mut agent = test_agent(
+            root,
+            MockProvider::new(vec![
+                MockReply::ToolCalls(vec![(
+                    "call-read".into(),
+                    "read".into(),
+                    r#"{"path":"a.txt"}"#.into(),
+                    Some(sig.clone()),
+                )]),
+                MockReply::Text("file says content 42".into()),
+            ]),
+        );
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let result = agent
+            .run_turn("read a.txt", |ev| events.push(ev), approve)
+            .await
+            .unwrap();
+
+        assert_eq!(result.final_text, "file says content 42");
+        let recorded = agent
+            .state
+            .messages
+            .iter()
+            .find_map(|m| m.tool_calls.iter().find(|c| c.id == "call-read"));
+        assert!(recorded.is_some());
+        assert_eq!(
+            recorded.unwrap().extra_content.as_ref().unwrap()["google"]["thought_signature"],
+            "sg_aG9wZWx5"
+        );
     }
 
     /// A degenerate (empty) reply is retried with a nudge instead of being
@@ -2965,6 +3029,7 @@ mod tests {
                     "call-read".into(),
                     "read".into(),
                     r#"{"path":"a.txt"}"#.into(),
+                    None,
                 )]),
                 MockReply::Text("file says content 42".into()),
             ]),
@@ -3148,6 +3213,7 @@ mod tests {
                     "call-write".into(),
                     "write".into(),
                     r#"{"path":"pwned.txt","content":"evil"}"#.into(),
+                    None,
                 )]),
                 MockReply::Text("verdict: LGTM".to_string()),
             ]),

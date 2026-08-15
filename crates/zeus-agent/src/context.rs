@@ -88,6 +88,7 @@ mod tests {
             id: id.into(),
             name: "read".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
         m
     }

@@ -109,6 +109,13 @@ pub struct ToolCall {
     pub name: String,
     /// JSON arguments string or object serialized as string by the provider.
     pub arguments: String,
+    /// Provider-specific per-call metadata that must be echoed verbatim back
+    /// on subsequent turns. Notably Gemini (3.1+) returns
+    /// `extra_content.google.thought_signature` with each function call and
+    /// rejects a follow-up request whose assistant message omits it. When
+    /// present, `to_openai_message` re-emits it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 /// Chat completion request.
@@ -170,6 +177,9 @@ pub enum StreamEvent {
         id: String,
         name: Option<String>,
         arguments_delta: String,
+        /// Provider-specific metadata to echo verbatim (see `ToolCall::extra_content`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_content: Option<serde_json::Value>,
     },
     /// Stream finished.
     Done {
