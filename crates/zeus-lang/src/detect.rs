@@ -11,6 +11,8 @@ pub enum Language {
     Go,
     TypeScript,
     JavaScript,
+    /// HTML/static markup pages (`.html`/`.htm`).
+    Html,
     Java,
     Kotlin,
     CSharp,
@@ -58,6 +60,7 @@ impl Language {
         Language::Go,
         Language::TypeScript,
         Language::JavaScript,
+        Language::Html,
         Language::Java,
         Language::Kotlin,
         Language::CSharp,
@@ -106,6 +109,7 @@ impl Language {
             "typescript" | "ts" => Language::TypeScript,
             "tsx" => Language::TypeScript,
             "javascript" | "js" | "node" | "jsx" => Language::JavaScript,
+            "html" | "htm" | "xhtml" => Language::Html,
             "java" => Language::Java,
             "kotlin" | "kt" | "kts" => Language::Kotlin,
             "csharp" | "cs" | "c#" => Language::CSharp,
@@ -261,6 +265,13 @@ pub fn detect_project(root: &Path) -> Option<Language> {
         } else {
             Language::JavaScript
         });
+    }
+
+    // A static site: HTML pages with no language manifest. Only reached
+    // after every manifest-driven check above, so bundled templates in
+    // real projects never get misdetected.
+    if contains_file(root, &["html", "htm"], 2) {
+        return Some(Language::Html);
     }
 
     // No manifest: whichever supported extension dominates the tree wins.
@@ -464,6 +475,21 @@ mod tests {
         assert_eq!(Language::from_name("C++"), Some(Language::Cpp));
         assert_eq!(Language::from_name("go"), Some(Language::Go));
         assert_eq!(Language::from_name("ts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_name("html"), Some(Language::Html));
+        assert_eq!(Language::from_name("htm"), Some(Language::Html));
         assert!(Language::from_name("brainfuck").is_none());
+    }
+
+    #[test]
+    fn detects_html_from_extension_census() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "index.html");
+        write(tmp.path(), "style.css");
+        write(tmp.path(), "script.js");
+        assert_eq!(detect_project(tmp.path()), Some(Language::Html));
+        assert_eq!(
+            detect_source(std::path::Path::new("a/index.html")),
+            Some(Language::Html)
+        );
     }
 }

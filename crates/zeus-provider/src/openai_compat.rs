@@ -281,6 +281,7 @@ impl ModelProvider for OpenAiCompatProvider {
         let resp = self
             .client
             .post(self.chat_url())
+            .headers(self.reqwest_headers())
             .json(&body)
             .send()
             .await
@@ -595,10 +596,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/chat/completions":
             body = self._read_json()
             model = body.get("model", "")
+            auth = self.headers.get('Authorization', '')
             if body.get("stream"):
                 self._stream_chat(model)
             else:
-                self._chat(model)
+                self._chat(model, auth)
         elif self.path == "/v1/embeddings":
             body = self._read_json()
             inputs = body.get("input", [])
@@ -609,8 +611,12 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "not found"})
 
-    def _chat(self, model):
-        if model == "tool-model":
+    def _chat(self, model, auth=""):
+        if model == "auth-echo-model":
+            resp = {"choices": [{"message": {"role": "assistant", "content": f"auth:{auth}"},
+                                  "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        elif model == "tool-model":
             resp = {"choices": [{
                 "message": {"role": "assistant", "content": None,
                             "tool_calls": [{"id": "call_1", "type": "function",
@@ -717,6 +723,20 @@ server.serve_forever()
         let models = provider.list_models().await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "test-model");
+    }
+
+    #[tokio::test]
+    async fn chat_sends_authorization_header() {
+        let server = TestServer::start(18100);
+        let provider = OpenAiCompatProvider::new("test", &server.base_url).with_api_key("sk-test-key");
+        let resp = provider
+            .chat(ChatRequest::new(
+                "auth-echo-model",
+                vec![Message::user("hi")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.message.content, "auth:Bearer sk-test-key");
     }
 
     #[tokio::test]

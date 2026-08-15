@@ -87,13 +87,6 @@ impl TaskPlan {
         Ok(())
     }
 
-    /// Mark every step complete (used once the orchestrator has run them all).
-    pub fn mark_all_done(&mut self) {
-        for step in &mut self.steps {
-            step.done = true;
-        }
-    }
-
     /// Mark the step with the given id complete. Unknown ids are ignored —
     /// declined steps never run, so they stay pending.
     pub fn mark_done(&mut self, id: usize) {
@@ -190,29 +183,6 @@ mod tests {
     fn read_missing_plan_is_none() {
         let missing = std::path::Path::new("/nonexistent/zeus/plan/tasks.json");
         assert!(TaskPlan::read(missing).unwrap().is_none());
-    }
-
-    #[test]
-    fn mark_all_done_sets_every_step() {
-        let steps = vec![
-            PlanStep {
-                id: 1,
-                description: "a".into(),
-                rationale: "one".into(),
-                persona: None,
-            },
-            PlanStep {
-                id: 2,
-                description: "b".into(),
-                rationale: "two".into(),
-                persona: None,
-            },
-        ];
-        let mut plan = TaskPlan::from_steps("g", &steps, "", false);
-        assert_eq!(plan.completed(), 0);
-        plan.mark_all_done();
-        assert_eq!(plan.completed(), 2);
-        assert!(plan.steps.iter().all(|s| s.done));
     }
 
     #[test]

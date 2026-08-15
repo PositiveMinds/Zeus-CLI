@@ -856,7 +856,10 @@ impl Agent {
             Some(path) => {
                 let existing = TaskPlan::read(path)?;
                 if let Some(existing) = existing {
-                    if existing.approved && existing.completed() < existing.steps.len() {
+                    if existing.approved
+                        && existing.goal == goal
+                        && existing.completed() < existing.steps.len()
+                    {
                         let approved = matches!(
                             approver(&PermissionRequest {
                                 tool: "plan_resume".into(),
@@ -1244,6 +1247,10 @@ impl Agent {
     /// Stamp the completed plan: every step done, notes = the final
     /// orchestrated summary (including any reviewer report), then emit
     /// `OrchestrationDone`.
+    /// Persist the completed plan: notes = the final orchestrated summary
+    /// (including any reviewer report), then emit `OrchestrationDone`. The
+    /// `done` flags are left exactly as execution marked them — declined
+    /// steps stay pending so a later resume can offer them again.
     fn finish_orchestration<E>(
         &mut self,
         summary: String,
@@ -1254,7 +1261,6 @@ impl Agent {
         E: FnMut(AgentEvent),
     {
         let mut plan = plan.clone();
-        plan.mark_all_done();
         plan.notes = summary.clone();
         self.write_task_plan(&plan)?;
         on_event(AgentEvent::OrchestrationDone {

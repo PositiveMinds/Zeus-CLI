@@ -201,6 +201,20 @@ fn templates(lang: Language) -> Vec<(&'static str, &'static str)> {
                 "const message = \"Hello, {name}!\";\nconsole.log(message);\n",
             ),
         ],
+        Language::Html => vec![
+            (
+                "index.html",
+                "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <title>{Name}</title>\n  <link rel=\"stylesheet\" href=\"style.css\">\n</head>\n<body>\n  <h1>Hello, {name}!</h1>\n  <p id=\"greeting\"></p>\n  <script src=\"script.js\"></script>\n</body>\n</html>\n",
+            ),
+            (
+                "style.css",
+                "body {\n  font-family: system-ui, sans-serif;\n  max-width: 40rem;\n  margin: 2rem auto;\n  padding: 0 1rem;\n  color: #222;\n}\n",
+            ),
+            (
+                "script.js",
+                "const greeting = document.getElementById(\"greeting\");\ngreeting.textContent = \"Hello, {name}!\";\n",
+            ),
+        ],
         Language::Java => vec![
             (
                 "pom.xml",

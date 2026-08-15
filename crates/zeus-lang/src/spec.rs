@@ -148,6 +148,18 @@ const SPECS: &[LangSpec] = &[
         format_style: FormatStyle::PerFile,
     },
     LangSpec {
+        language: Language::Html,
+        display_name: "HTML",
+        exts: &["html", "htm", "xhtml"],
+        markers: &[],
+        build: &[],
+        test: &[],
+        lint: &["npx", "html-validate", "."],
+        lint_fix: &["npx", "html-validate", "--fix", "."],
+        format: &["npx", "prettier", "--write", "{file}"],
+        format_style: FormatStyle::PerFile,
+    },
+    LangSpec {
         language: Language::Java,
         display_name: "Java",
         exts: &["java"],
@@ -588,6 +600,10 @@ mod tests {
     #[test]
     fn build_and_test_commands_are_always_present() {
         for (lang, s) in all_specs().iter().map(|s| (s.language, s)) {
+            if matches!(lang, Language::Html) {
+                // Markup has no compile or test step.
+                continue;
+            }
             assert!(!s.build.is_empty(), "{lang:?} needs a build command");
             assert!(!s.test.is_empty(), "{lang:?} needs a test command");
         }
