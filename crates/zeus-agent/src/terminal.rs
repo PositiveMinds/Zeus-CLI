@@ -582,40 +582,68 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     })
 }
 
-/// Best-effort whole-process-tree kill — build tools and `docker compose`
-/// spawn children that a plain single-PID kill would leave orphaned.
+/// One-shot `pid -> child pids` snapshot of the whole process table, via
+/// Toolhelp. Shared by `kill_tree` and the tree-aware suspend/resume so
+/// children are found the same way (same struct, same API).
 #[cfg(windows)]
-pub(crate) fn kill_tree(pid: u32) {
+fn snapshot_children() -> Option<std::collections::HashMap<u32, Vec<u32>>> {
     use libloading::{Library, Symbol};
-    use std::collections::HashMap;
     use std::ffi::c_void;
 
     unsafe {
         type CreateToolhelp32Snapshot = unsafe extern "system" fn(u32, u32) -> *mut c_void;
         type Process32FirstW = unsafe extern "system" fn(*mut c_void, *mut ProcessEntry32W) -> i32;
         type Process32NextW = unsafe extern "system" fn(*mut c_void, *mut ProcessEntry32W) -> i32;
+        type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+        const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+
+        let kernel32 = Library::new("kernel32.dll").ok()?;
+        let create_snapshot: Symbol<CreateToolhelp32Snapshot> =
+            kernel32.get(b"CreateToolhelp32Snapshot\0").ok()?;
+        let first: Symbol<Process32FirstW> = kernel32.get(b"Process32FirstW\0").ok()?;
+        let next: Symbol<Process32NextW> = kernel32.get(b"Process32NextW\0").ok()?;
+        let close_handle: Symbol<CloseHandle> = kernel32.get(b"CloseHandle\0").ok()?;
+
+        let snapshot = create_snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() {
+            return None;
+        }
+        let mut entry = ProcessEntry32W {
+            dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+            ..Default::default()
+        };
+        let mut children: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
+        let mut ok = first(snapshot, &mut entry);
+        while ok != 0 {
+            children
+                .entry(entry.th32_parent_process_id)
+                .or_default()
+                .push(entry.th32_process_id);
+            ok = next(snapshot, &mut entry);
+        }
+        close_handle(snapshot);
+        Some(children)
+    }
+}
+
+/// Best-effort whole-process-tree kill — build tools and `docker compose`
+/// spawn children that a plain single-PID kill would leave orphaned.
+#[cfg(windows)]
+pub(crate) fn kill_tree(pid: u32) {
+    use libloading::{Library, Symbol};
+    use std::ffi::c_void;
+
+    unsafe {
         type OpenProcess = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
         type TerminateProcess = unsafe extern "system" fn(*mut c_void, u32) -> i32;
         type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
 
-        const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
         const PROCESS_TERMINATE: u32 = 0x0001;
 
         let kernel32 = match Library::new("kernel32.dll") {
             Ok(lib) => lib,
-            Err(_) => return,
-        };
-        let create_snapshot: Symbol<CreateToolhelp32Snapshot> =
-            match kernel32.get(b"CreateToolhelp32Snapshot\0") {
-                Ok(sym) => sym,
-                Err(_) => return,
-            };
-        let first: Symbol<Process32FirstW> = match kernel32.get(b"Process32FirstW\0") {
-            Ok(sym) => sym,
-            Err(_) => return,
-        };
-        let next: Symbol<Process32NextW> = match kernel32.get(b"Process32NextW\0") {
-            Ok(sym) => sym,
             Err(_) => return,
         };
         let open_process: Symbol<OpenProcess> = match kernel32.get(b"OpenProcess\0") {
@@ -631,11 +659,14 @@ pub(crate) fn kill_tree(pid: u32) {
             Err(_) => return,
         };
 
+        let open_process = *open_process;
+        let terminate = *terminate;
+        let close_handle = *close_handle;
+
         // Snapshot the process table once, build pid -> children, then
         // terminate the tree depth-first (children before parents, so
         // nothing is left orphaned behind the task).
-        let snapshot = create_snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot.is_null() {
+        let Some(children) = snapshot_children() else {
             // No snapshot to walk — fall back to terminating just the pid.
             let h = open_process(PROCESS_TERMINATE, 0, pid);
             if !h.is_null() {
@@ -643,29 +674,11 @@ pub(crate) fn kill_tree(pid: u32) {
                 close_handle(h);
             }
             return;
-        }
-
-        let mut entry = ProcessEntry32W {
-            dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
-            ..Default::default()
         };
-        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        let mut ok = first(snapshot, &mut entry);
-        while ok != 0 {
-            children
-                .entry(entry.th32_parent_process_id)
-                .or_default()
-                .push(entry.th32_process_id);
-            ok = next(snapshot, &mut entry);
-        }
-        close_handle(snapshot);
 
-        let open_process = *open_process;
-        let terminate = *terminate;
-        let close_handle = *close_handle;
         fn terminate_recursive(
             pid: u32,
-            children: &HashMap<u32, Vec<u32>>,
+            children: &std::collections::HashMap<u32, Vec<u32>>,
             open_process: OpenProcess,
             terminate: TerminateProcess,
             close_handle: CloseHandle,
@@ -883,6 +896,12 @@ fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
     // No SIGSTOP/SIGCONT on Windows — go through ntdll's
     // NtSuspendProcess/NtResumeProcess, which freezes all threads of the
     // process (the approach PsSuspend/Process Explorer use).
+    //
+    // The tracked pid for a shell task is the `cmd`/`sh` wrapper, whose real
+    // work runs in child processes — so suspend/resume must walk the whole
+    // tree, mirroring the Unix process-group semantics (SIGSTOP/SIGCONT on
+    // `-pgid`). Freezing only the wrapper would leave the worker running
+    // while the task claims to be paused.
     use libloading::{Library, Symbol};
     use std::ffi::c_void;
 
@@ -910,20 +929,51 @@ fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
             .get(b"CloseHandle\0")
             .map_err(std::io::Error::other)?;
 
-        let handle = open_process(PROCESS_SUSPEND_RESUME, 0, pid);
-        if handle.is_null() {
-            return Err(std::io::Error::other(
-                "OpenProcess failed — task may have exited",
-            ));
+        // Collect the whole tree rooted at `pid` (DFS over the pid->children
+        // map; the root stays first, every descendant is gathered so a child
+        // worker isn't left running behind a frozen wrapper).
+        let mut targets = vec![pid];
+        if let Some(children) = snapshot_children() {
+            fn collect(
+                pid: u32,
+                children: &std::collections::HashMap<u32, Vec<u32>>,
+                out: &mut Vec<u32>,
+            ) {
+                if let Some(kids) = children.get(&pid) {
+                    for &kid in kids {
+                        collect(kid, children, out);
+                        out.push(kid);
+                    }
+                }
+            }
+            collect(pid, &children, &mut targets);
         }
-        let status = suspend_proc(handle);
-        close_handle(handle);
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "NtSuspend/ResumeProcess returned status {status:#x}"
-            )))
+
+        let mut first_error: Option<std::io::Error> = None;
+        for (idx, &target) in targets.iter().enumerate() {
+            let handle = open_process(PROCESS_SUSPEND_RESUME, 0, target);
+            if handle.is_null() {
+                // The root is the tracked task process itself — if it's gone
+                // the task has exited and there's nothing to freeze. Children
+                // may legitimately have exited mid-walk; skip them.
+                if idx == 0 {
+                    first_error = Some(std::io::Error::other(
+                        "OpenProcess failed — task may have exited",
+                    ));
+                }
+                continue;
+            }
+            let status = suspend_proc(handle);
+            close_handle(handle);
+            if status != 0 && first_error.is_none() {
+                first_error = Some(std::io::Error::other(format!(
+                    "NtSuspend/ResumeProcess returned status {status:#x} for pid {target}"
+                )));
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 }
@@ -1165,6 +1215,105 @@ mod tests {
 
         assert!(!process_is_alive(parent_pid), "root must be dead");
         assert!(!process_is_alive(ping_pid), "child must be reaped too");
+    }
+
+    /// `suspend_process`/`resume_process` on Windows must freeze the whole
+    /// tree, not just the tracked wrapper pid: spawn `cmd /C powershell` that
+    /// appends to a marker file, then prove the *child* (the actual worker)
+    /// stops advancing while suspended and continues after resume.
+    #[test]
+    #[cfg(windows)]
+    fn suspend_resume_freezes_children_not_just_wrapper() {
+        use std::process::Command as StdCommand;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let marker = tmp.path().join("marker.txt");
+        let script = tmp.path().join("writer.ps1");
+        std::fs::write(
+            &script,
+            format!(
+                "$marker = '{}'\r\nfor ($i = 1; $i -le 100000; $i++) {{\r\n  [System.IO.File]::AppendAllText($marker, ('tick {{0}}' -f $i) + [Environment]::NewLine)\r\n  Start-Sleep -Milliseconds 100\r\n}}\r\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+
+        let mut child = StdCommand::new("cmd")
+            .args([
+                "/C",
+                // No quotes around the script path: the TempDir path has no
+                // spaces, and cmd /C's quote rules disagree with Rust's
+                // CreateProcess quoting (backslash-escaped quotes get mangled,
+                // leaving powershell waiting on stdin instead of running).
+                &format!(
+                    "powershell -NoProfile -ExecutionPolicy Bypass -File {}",
+                    script.display()
+                ),
+            ])
+            .current_dir(&root)
+            .spawn()
+            .unwrap();
+        let parent_pid = child.id();
+
+        // Wait for the worker (powershell) to appear under the cmd wrapper.
+        let mut worker_pid = None;
+        for _ in 0..100 {
+            if let Some(pid) = find_child_of(parent_pid) {
+                worker_pid = Some(pid);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let worker_pid = worker_pid.expect("powershell worker should appear under cmd");
+        assert!(process_is_alive(worker_pid));
+
+        let lines = |path: &std::path::Path| -> usize {
+            std::fs::read_to_string(path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let wait_growth = |path: &std::path::Path| {
+            let before = lines(path);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if lines(path) > before || std::time::Instant::now() > deadline {
+                    return lines(path);
+                }
+            }
+        };
+
+        // The worker must be writing on its own before we suspend anything.
+        let count_before_pause = wait_growth(&marker);
+        assert!(count_before_pause > 0, "worker should be writing lines");
+
+        suspend_process(parent_pid).unwrap();
+
+        // Allow enough wall-clock time for several 100ms ticks; the marker
+        // must NOT advance while suspended, even though the wrapper pid (cmd)
+        // and the worker (powershell) both still exist.
+        std::thread::sleep(Duration::from_millis(600));
+        let count_paused = lines(&marker);
+        std::thread::sleep(Duration::from_millis(600));
+        let count_still_paused = lines(&marker);
+        assert_eq!(
+            count_paused, count_still_paused,
+            "worker must be frozen while suspended (wrapper-only suspend would keep appending)"
+        );
+
+        resume_process(parent_pid).unwrap();
+
+        let count_after_resume = wait_growth(&marker);
+        assert!(
+            count_after_resume > count_paused,
+            "worker must resume appending after resume"
+        );
+
+        kill_tree(parent_pid);
+        let _ = child.wait();
     }
 
     /// Direct child pids of `pid`, via the same Toolhelp snapshot the
