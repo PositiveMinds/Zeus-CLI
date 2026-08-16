@@ -680,7 +680,10 @@ fn probe_files(files: &[RepoFile], request: &str) -> ProbeReport {
 }
 
 /// Recursively collect files, skipping ignored dirs and capping depth/amount
-/// so a pathological repo can't hang the CLI.
+/// so a pathological repo can't hang the CLI. Every entry is kept only when it
+/// genuinely lives inside `root`; symlinks/junctions are resolved and never
+/// followed when they point outside it, so a scan can't leak into unrelated
+/// trees sitting elsewhere on disk.
 fn collect_all(root: &Path) -> Vec<RepoFile> {
     let mut out = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -699,22 +702,48 @@ fn collect_all(root: &Path) -> Vec<RepoFile> {
             };
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if path.is_dir() {
+
+            // Symlink/junction safety: a link (or junction) can point at an
+            // unrelated tree anywhere on disk. Resolve it and require the
+            // target to stay inside this project before listing or descending
+            // into it — otherwise the "scan of the current directory" would
+            // silently widen into a false broader environment.
+            let symlink_target = std::fs::symlink_metadata(&path)
+                .ok()
+                .filter(|m| m.file_type().is_symlink())
+                .and_then(|_| path.canonicalize().ok());
+            if let Some(target) = &symlink_target {
+                if !target.starts_with(root) {
+                    continue;
+                }
+            }
+
+            // Containment: never include an entry that resolves outside `root`
+            // (a broken/stray prefix can't be a project file).
+            let rel = match path.strip_prefix(root) {
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => continue,
+            };
+
+            let is_dir = match &symlink_target {
+                Some(target) => target.is_dir(),
+                None => path.is_dir(),
+            };
+            if is_dir {
                 if IGNORED_DIRS.contains(&name.as_str()) {
                     continue;
                 }
-                if let Ok(rel) = path.strip_prefix(root) {
-                    if rel.components().count() > 10 {
-                        continue;
-                    }
+                if rel.components().count() > 10 {
+                    continue;
                 }
                 stack.push(path);
             } else {
-                let rel = path.strip_prefix(root).unwrap_or(&path);
+                let is_test = is_test_path(&rel);
+                let is_config = is_config_path(&rel);
                 out.push(RepoFile {
-                    rel: rel.to_path_buf(),
-                    is_test: is_test_path(rel),
-                    is_config: is_config_path(rel),
+                    rel,
+                    is_test,
+                    is_config,
                 });
             }
         }
@@ -1443,6 +1472,47 @@ mod tests {
         let g = git_report(tmp.path());
         assert!(!g.present);
         assert_eq!(g.one_line(), "not a git repo");
+    }
+
+    #[cfg(any(unix, windows))]
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+    }
+
+    #[test]
+    fn collect_all_does_not_follow_symlinks_outside_root() {
+        // Regression: a symlink/junction inside the project pointing at an
+        // unrelated tree must not widen the scan — the "scan of the current
+        // directory" would otherwise leak in files from a false broader
+        // environment on the same disk.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("project");
+        let outside = tmp.path().join("unrelated");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(outside.join("secret.rs"), "// must not leak").unwrap();
+
+        let link = root.join("src").join("escaped");
+        if try_symlink_dir(&outside, &link).is_err() {
+            // Symlinks unavailable here (e.g. Windows without Developer Mode
+            // or an admin-elevated shell) — nothing to verify, skip.
+            return;
+        }
+
+        let files = collect_all(&root);
+        assert!(files.iter().any(|f| f.rel.ends_with("main.rs")));
+        assert!(
+            !files.iter().any(|f| f.rel.ends_with("secret.rs")),
+            "a symlink pointing outside the project must not be followed: {files:?}"
+        );
     }
 
     #[test]

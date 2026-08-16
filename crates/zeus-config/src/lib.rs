@@ -139,24 +139,107 @@ changes.\n- Use the project's existing error types and patterns.\n",
     }
 }
 
-/// Walk up from `start` looking for `.agent/` or `.git/` to identify the
-/// project root. Falls back to `start` itself if neither is found anywhere
-/// above it — treating "wherever you ran zeus from" as an ad-hoc project
-/// root, rather than refusing to work at all. This is safe: every settings
-/// file lookup already tolerates a missing `.agent/` (falls back to
-/// global/builtin defaults), and file operations are still contained to
-/// this root exactly as if `.agent/` existed — nothing here loosens path
-/// containment, it only decides *which* directory that containment applies
-/// to when no explicit marker is present.
+/// Resolve the project root a zeus session is scoped to.
+///
+/// Priority:
+///  - A `.git`/`.agent` marker *directly at* `start` — the session is scoped
+///    to exactly the real current directory.
+///  - A git work tree containing `start` — `git rev-parse --show-toplevel`
+///    names the authoritative project root. It cannot be a "false broader
+///    environment", because the current directory genuinely lives inside that
+///    repo.
+///  - Otherwise `start` itself, treated as an ad-hoc project root rather than
+///    refusing to work at all. This is safe: every settings file lookup
+///    already tolerates a missing `.agent/` (falls back to global/builtin
+///    defaults), and file operations are still contained to this root exactly
+///    as if `.agent/` existed — nothing here loosens path containment, it only
+///    decides *which* directory that containment applies to when no explicit
+///    marker is present.
+///
+/// The resolution never silently widens into a broader environment on behalf
+/// of a narrower starting directory:
+///  - The user's home directory (or any ancestor of it, e.g. a drive root) is
+///    never adopted as the root — even when git reports it as the toplevel of
+///    a dotfiles repo. `$HOME` is user-land, so such a root would sweep in
+///    every unrelated project living there.
+///  - An ancestor's `.agent/` marker is *not* followed. `.agent/` gets
+///    created unconditionally the moment any turn actually needs repo context
+///    (see `zeus-agent`'s `repo_context`/`project::persist`) — so one earlier
+///    bare `zeus` run directly in `$HOME` (or in some parent folder such as
+///    Desktop) plants a marker there permanently, and honoring it from below
+///    would widen every subfolder's project root up to that poisoned parent,
+///    mixing in whatever unrelated projects happen to live there. Running
+///    `zeus` directly in such a directory is still honored as-is (its own
+///    marker is accepted); this only stops something *underneath* it from
+///    climbing up into it.
+///  - Ancestor `.git/` markers *are* honored — a real repo, which zeus itself
+///    never plants — but the climb still stops before the home boundary.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
+    if start.join(".agent").is_dir() || start.join(".git").is_dir() {
+        return Some(start.to_path_buf());
+    }
+    let home = dirs::home_dir();
+    let home_canon = home.as_ref().and_then(|h| h.canonicalize().ok());
+
+    // Inside a git work tree, git knows the authoritative root — unless it
+    // resolves to home (or above), which is never a legitimate project.
+    if let Some(toplevel) = git_toplevel(start) {
+        if !is_home_or_ancestor(&toplevel, home.as_deref(), home_canon.as_deref()) {
+            return Some(toplevel);
+        }
+    }
+
+    let mut current = start.parent();
     while let Some(dir) = current {
-        if dir.join(".agent").is_dir() || dir.join(".git").is_dir() {
+        if is_home_or_ancestor(dir, home.as_deref(), home_canon.as_deref()) {
+            break;
+        }
+        if dir.join(".git").is_dir() {
             return Some(dir.to_path_buf());
         }
         current = dir.parent();
     }
     Some(start.to_path_buf())
+}
+
+/// Ask git for the authoritative project root (work-tree toplevel) of
+/// `start`. `None` when `start` isn't inside a git work tree or git isn't
+/// available — the caller then falls back to scoping on `start` itself.
+fn git_toplevel(start: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(start)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// True when `p` is the user's home directory or any ancestor of it (e.g. a
+/// drive root). Compared canonically so case/separator differences (git on
+/// Windows emits `/`) can't hide the boundary. A root that contains `$HOME`
+/// can only be a "false broader environment" that would sweep in every
+/// unrelated project under it.
+fn is_home_or_ancestor(p: &Path, home: Option<&Path>, home_canon: Option<&Path>) -> bool {
+    if let Some(home) = home {
+        if p == home {
+            return true;
+        }
+    }
+    let Some(home_canon) = home_canon else {
+        return false;
+    };
+    match p.canonicalize() {
+        Ok(canon) => home_canon.starts_with(canon),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -180,34 +263,95 @@ mod tests {
         // starting directory itself rather than None, so `zeus` works in a
         // plain, uninitialized directory instead of refusing to run.
         //
-        // One caveat: on Windows the OS temp dir lives inside the user's
-        // home (e.g. C:\Users\<name>\AppData\Local\Temp), so walking up may
-        // cross a real home `.agent`/`.git`. In that case the lookup *should*
-        // resolve to that ancestor project, not the temp dir — so we only
-        // assert the strict fallback when no marker naturally sits between
-        // the temp dir and the filesystem root.
+        // On Windows the OS temp dir lives inside the user's home (e.g.
+        // C:\Users\<name>\AppData\Local\Temp) — this used to mean the walk
+        // could cross a real home `.git`/`.agent` and adopt the home
+        // directory as the root instead of `isolated`. That was the actual
+        // bug (a `zeus` session in some unrelated empty folder anywhere
+        // under `$HOME` silently widening to the user's entire home tree,
+        // sweeping in every other project sitting there) — the walk no
+        // longer crosses into `$HOME` on behalf of a narrower starting
+        // directory, so the strict fallback now holds unconditionally.
         let tmp = TempDir::new().unwrap();
         let isolated = tmp.path().join("no_markers_here");
         std::fs::create_dir_all(&isolated).unwrap();
 
-        let ancestor_marker = (0..64)
-            .scan(Some(isolated.clone()), |acc, _| {
-                let current = acc.clone();
-                *acc = current
-                    .as_ref()
-                    .and_then(|c| c.parent().map(Path::to_path_buf));
-                current
-            })
-            .any(|p| p.join(".agent").is_dir() || p.join(".git").is_dir());
+        assert_eq!(find_project_root(&isolated), Some(isolated));
+    }
 
-        let found = find_project_root(&isolated);
-        if ancestor_marker {
-            // A real project/home root exists above the temp dir; trust the
-            // walk-up over the naive fallback rather than asserting it.
-            assert!(found.is_some());
-        } else {
-            assert_eq!(found, Some(isolated));
-        }
+    #[test]
+    fn find_project_root_does_not_widen_to_home_even_if_home_has_a_marker() {
+        // Regression for the home-root-widening bug: a `.git`/`.agent`
+        // sitting at `$HOME` (e.g. planted by an earlier bare `zeus` run
+        // directly there, or a dotfiles repo) must never get adopted as the
+        // project root for some unrelated, narrower directory underneath
+        // it — the scope stays on the real current directory.
+        let Some(home) = dirs::home_dir() else {
+            return; // no home dir resolvable in this environment — skip
+        };
+        let probe = home.join(format!("zeus-root-widening-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&probe);
+        std::fs::create_dir_all(&probe).unwrap();
+
+        let found = find_project_root(&probe);
+
+        let _ = std::fs::remove_dir_all(&probe);
+        assert_eq!(
+            found,
+            Some(probe),
+            "a marker at $HOME must never widen an unrelated subfolder's project root to $HOME"
+        );
+    }
+
+    #[test]
+    fn find_project_root_ignores_ancestor_agent_marker() {
+        // Regression for the poison-marker vector behind the original bug: an
+        // `.agent/` at an *ancestor* (planted there by an earlier bare `zeus`
+        // run directly in that folder) must never get adopted as the project
+        // root for a narrower starting directory. Scope stays on the real
+        // current directory — ancestor `.agent` markers are not followed at
+        // all, only one directly at `start`.
+        let tmp = TempDir::new().unwrap();
+        let poisoned = tmp.path().join("planted_here");
+        std::fs::create_dir_all(poisoned.join(".agent")).unwrap();
+        let start = poisoned.join("zeus_test").join("nested");
+        std::fs::create_dir_all(&start).unwrap();
+
+        assert_eq!(
+            find_project_root(&start),
+            Some(start),
+            "an ancestor `.agent` marker must not widen the project root"
+        );
+    }
+
+    #[test]
+    fn find_project_root_prefers_current_dir_marker() {
+        // A marker directly at the current directory wins over any outer repo
+        // or marker: the session is scoped to exactly where it is running.
+        let tmp = TempDir::new().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir_all(inner.join(".agent")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+
+        assert_eq!(find_project_root(&inner), Some(inner));
+        assert_eq!(
+            find_project_root(tmp.path()),
+            Some(tmp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn find_project_root_uses_git_toplevel_from_nested_dir() {
+        // Inside a git work tree the authoritative root comes from git (the
+        // `.git/HEAD` file is all it needs); if git isn't available the
+        // `.git`-dir walk still resolves to the same root.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".git/HEAD"), "ref: refs/heads/master\n").unwrap();
+        let nested = tmp.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(find_project_root(&nested), Some(tmp.path().to_path_buf()));
     }
 
     #[test]
