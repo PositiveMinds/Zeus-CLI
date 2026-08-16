@@ -1,15 +1,16 @@
-//! Self-update support, modeled on how opencode's CLI does it: detect which
-//! channel the running binary actually came from, ask that channel's own
-//! source what the latest version is, then delegate the upgrade to that
-//! channel's own tooling rather than trying to patch the running executable
-//! in place. Zeus only ships one real distribution channel today (the
-//! install.ps1/install.bat/install.sh script, downloading a prebuilt binary
-//! from the public releases mirror) — a `cargo install`/source checkout is
-//! treated as "update it yourself" rather than guessed at, since there's no
-//! guarantee the exe came from a repo this process can re-fetch.
+//! Self-update support. `zeus update` downloads the correct prebuilt release
+//! asset for the running platform and replaces the current executable in
+//! place — it works no matter *where* that executable happens to sit (the
+//! install script's directory, a manually-copied test folder, wherever),
+//! since it doesn't need to recognize the location, only write to it. The
+//! one case this deliberately leaves alone is a `cargo build`/`cargo install`
+//! dev checkout: self-replacing someone's own build with a downloaded
+//! binary would be surprising, not helpful, so that's still just pointed at
+//! rebuilding from source instead.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 /// The prebuilt binaries are mirrored to a separate public repo (see
 /// `.github/workflows/release.yml`) because the main repo's default
@@ -24,56 +25,19 @@ pub fn current_version() -> &'static str {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallMethod {
-    /// Installed by install.ps1/install.bat/install.sh into the fixed
-    /// per-OS directory those scripts use — safe to re-run to upgrade.
-    Script,
     /// A `cargo build`/`cargo install` output (dev checkout or `~/.cargo/bin`)
-    /// — no repo access assumed, so this is surfaced but not auto-upgraded.
+    /// — left alone; there's no way to tell this apart from "someone's
+    /// actively working on the source" from the exe path alone.
     Cargo,
-    Unknown,
-}
-
-impl InstallMethod {
-    pub fn label(self) -> &'static str {
-        match self {
-            InstallMethod::Script => "install script",
-            InstallMethod::Cargo => "cargo",
-            InstallMethod::Unknown => "unknown",
-        }
-    }
-}
-
-/// Where install.ps1/install.bat put the binary on Windows, and where
-/// install.sh (added alongside this) puts it on Unix.
-fn script_install_dir() -> Option<std::path::PathBuf> {
-    if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("zeus"))
-    } else {
-        dirs_home().map(|h| h.join(".local").join("share").join("zeus").join("bin"))
-    }
-}
-
-fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    /// Anything else — a prebuilt binary sitting somewhere on disk,
+    /// regardless of how it got there. Safe to self-replace in place.
+    Direct,
 }
 
 pub fn detect_install_method() -> InstallMethod {
     let Ok(exe) = std::env::current_exe() else {
-        return InstallMethod::Unknown;
+        return InstallMethod::Direct;
     };
-    let exe = match exe.canonicalize() {
-        Ok(p) => p,
-        Err(_) => exe,
-    };
-    if let Some(dir) = script_install_dir() {
-        if let Ok(dir) = dir.canonicalize() {
-            if exe.starts_with(&dir) {
-                return InstallMethod::Script;
-            }
-        } else if exe.starts_with(&dir) {
-            return InstallMethod::Script;
-        }
-    }
     let s = exe.to_string_lossy().to_ascii_lowercase();
     if s.contains(".cargo")
         || s.contains("target/debug")
@@ -83,7 +47,7 @@ pub fn detect_install_method() -> InstallMethod {
     {
         return InstallMethod::Cargo;
     }
-    InstallMethod::Unknown
+    InstallMethod::Direct
 }
 
 #[derive(Deserialize)]
@@ -91,15 +55,18 @@ struct GhRelease {
     tag_name: String,
 }
 
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(format!("zeus-cli/{}", current_version()))
+        .build()
+        .context("build http client")
+}
+
 /// Latest published version, tag-prefix (`v`) stripped.
 pub async fn latest_version() -> Result<String> {
     let url =
         format!("https://api.github.com/repos/{RELEASES_OWNER}/{RELEASES_REPO}/releases/latest");
-    let client = reqwest::Client::builder()
-        .user_agent(format!("zeus-cli/{}", current_version()))
-        .build()
-        .context("build http client")?;
-    let resp = client
+    let resp = http_client()?
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -127,44 +94,165 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     parse_version(latest) > parse_version(current)
 }
 
-/// Re-runs the published install script, pinned to `target_version` via the
-/// same `ZEUS_VERSION` env var the scripts already read — so a release that
-/// lands mid-upgrade can't leave the machine on a half-applied version.
-pub fn run_script_update(target_version: &str) -> Result<()> {
+/// The release asset name for the platform this binary is actually running
+/// on — matches exactly what `.github/workflows/release.yml`'s build matrix
+/// produces (`zeus-<target>.zip` on Windows, `.tar.gz` everywhere else).
+fn platform_asset_name() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Ok("zeus-x86_64-pc-windows-msvc.zip"),
+        ("linux", "x86_64") => Ok("zeus-x86_64-unknown-linux-gnu.tar.gz"),
+        ("macos", "x86_64") => Ok("zeus-x86_64-apple-darwin.tar.gz"),
+        ("macos", "aarch64") => Ok("zeus-aarch64-apple-darwin.tar.gz"),
+        (os, arch) => bail!("no prebuilt release published for {os}/{arch}"),
+    }
+}
+
+/// Extracts a downloaded release archive with whatever the platform already
+/// has on hand — `Expand-Archive` (built into every Windows 10/11) for the
+/// `.zip`, `tar` (universal on Linux/macOS) for the `.tar.gz` — rather than
+/// pulling in a zip/tar crate just for this one-shot use.
+fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
     let status = if cfg!(windows) {
-        let script_url = format!(
-            "https://raw.githubusercontent.com/{RELEASES_OWNER}/{RELEASES_REPO}/main/install.ps1"
-        );
         std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
                 "-Command",
-                &format!("$env:ZEUS_VERSION = '{target_version}'; irm {script_url} | iex"),
+                &format!(
+                    "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                    archive.display(),
+                    dest.display()
+                ),
             ])
             .status()
-            .context("spawn powershell to run install.ps1")?
+            .context("spawn powershell to extract the downloaded zip")?
     } else {
-        let script_url = format!(
-            "https://raw.githubusercontent.com/{RELEASES_OWNER}/{RELEASES_REPO}/main/install.sh"
-        );
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "curl -fsSL {script_url} | ZEUS_VERSION={target_version} sh"
-            ))
+        std::process::Command::new("tar")
+            .args([
+                "-xzf",
+                &archive.to_string_lossy(),
+                "-C",
+                &dest.to_string_lossy(),
+            ])
             .status()
-            .context("spawn shell to run install.sh")?
+            .context("spawn tar to extract the downloaded archive")?
     };
     if !status.success() {
-        bail!("install script exited with {status}");
+        bail!("extracting the downloaded archive failed with {status}");
     }
     Ok(())
 }
 
-/// `zeus update [--check]`: report on / apply the latest release, based on
-/// how this binary was actually installed.
+/// The release archive's internal layout differs by platform (the Windows
+/// zip is flat, the Unix tar.gz has one nested staging folder — see
+/// `release.yml`), so this walks the extracted tree looking for the binary
+/// by name instead of assuming a fixed relative path either way.
+fn find_extracted_binary(dir: &Path, exe_name: &str) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(exe_name) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Swaps the currently-running executable for `new_binary`, wherever the
+/// former happens to live. Windows won't let you delete or overwrite a
+/// `.exe` that's actively executing, but it *will* let you rename its
+/// directory entry away — so the running binary gets moved to a `.old`
+/// sibling first, then the new one takes its place. Unix allows replacing a
+/// running binary's path directly, but the same two-step sequence is used
+/// there too rather than special-casing it, since it's simpler to reason
+/// about one code path than two.
+fn self_replace(new_binary: &Path) -> Result<()> {
+    let current_exe = std::env::current_exe().context("locate the running executable")?;
+    let old_name = match current_exe.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!(
+            "{}.old.{ext}",
+            current_exe.file_stem().unwrap_or_default().to_string_lossy()
+        ),
+        None => format!(
+            "{}.old",
+            current_exe.file_name().unwrap_or_default().to_string_lossy()
+        ),
+    };
+    let old_path = current_exe.with_file_name(old_name);
+
+    // Best-effort: a `.old` left behind by a previous update that couldn't
+    // clean itself up yet (still running at the time) shouldn't block this
+    // one — Windows will simply fail this silently if that file is itself
+    // still in use for some other reason, which is fine, we just overwrite
+    // the rename target instead momentarily below.
+    let _ = std::fs::remove_file(&old_path);
+    std::fs::rename(&current_exe, &old_path)
+        .context("rename the running executable out of the way")?;
+    // `copy`, not `rename`, into place — the new binary lives in a temp
+    // directory that may be on a different drive/filesystem than the
+    // install location, and `rename` can't cross that boundary.
+    std::fs::copy(new_binary, &current_exe).context("install the downloaded binary")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&current_exe)
+            .context("read new binary's permissions")?
+            .permissions();
+        perms.set_mode(perms.mode() | 0o111);
+        std::fs::set_permissions(&current_exe, perms).context("mark new binary executable")?;
+    }
+
+    // Best-effort cleanup — this reliably fails on Windows (the file is
+    // this very process, still executing) and that's fine; it just leaves
+    // the `.old` file to be replaced by the next update's rename step above.
+    let _ = std::fs::remove_file(&old_path);
+    Ok(())
+}
+
+/// Downloads the release asset for this platform/version, extracts it, and
+/// self-replaces the running binary with what's inside.
+async fn self_update(version: &str) -> Result<()> {
+    let asset = platform_asset_name()?;
+    let tmp_dir = std::env::temp_dir().join(format!("zeus-update-{version}"));
+    let _ = std::fs::remove_dir_all(&tmp_dir); // stale leftovers from a prior attempt
+    std::fs::create_dir_all(&tmp_dir).context("create a temp directory for the update")?;
+
+    let url = format!(
+        "https://github.com/{RELEASES_OWNER}/{RELEASES_REPO}/releases/download/v{version}/{asset}"
+    );
+    let bytes = http_client()?
+        .get(&url)
+        .send()
+        .await
+        .context("download the release asset")?
+        .error_for_status()
+        .context("download failed — is this platform's asset actually published?")?
+        .bytes()
+        .await
+        .context("read the downloaded asset")?;
+    let archive_path = tmp_dir.join(asset);
+    std::fs::write(&archive_path, &bytes).context("save the downloaded archive")?;
+
+    extract_archive(&archive_path, &tmp_dir)?;
+
+    let exe_name = if cfg!(windows) { "zeus.exe" } else { "zeus" };
+    let new_binary = find_extracted_binary(&tmp_dir, exe_name)
+        .with_context(|| format!("couldn't find '{exe_name}' inside the downloaded archive"))?;
+
+    self_replace(&new_binary)?;
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    Ok(())
+}
+
+/// `zeus update [--check]`: report on / apply the latest release.
 pub async fn cmd_update(check_only: bool) -> Result<()> {
     let current = current_version();
     println!("current version: {current}");
@@ -177,10 +265,7 @@ pub async fn cmd_update(check_only: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "update available: {current} -> {latest} (installed via {})",
-        method.label()
-    );
+    println!("update available: {current} -> {latest}");
 
     if check_only {
         println!("run `zeus update` (without --check) to install it.");
@@ -188,23 +273,17 @@ pub async fn cmd_update(check_only: bool) -> Result<()> {
     }
 
     match method {
-        InstallMethod::Script => {
-            println!("re-running the install script, pinned to {latest}...");
-            run_script_update(&latest)?;
-            println!("updated to {latest}. Restart zeus to use it.");
-        }
         InstallMethod::Cargo => {
             println!(
-                "this binary looks like a cargo build/install, not the published installer — \
+                "this binary looks like a cargo build/install, not a prebuilt release — \
                  update it the same way you built it (e.g. `cargo build --release -p zeus-cli` \
                  after pulling, or `cargo install` from wherever you originally installed it)."
             );
         }
-        InstallMethod::Unknown => {
-            println!(
-                "couldn't tell how zeus was installed here — reinstall manually from \
-                 https://github.com/{RELEASES_OWNER}/{RELEASES_REPO}/releases/tag/v{latest}"
-            );
+        InstallMethod::Direct => {
+            println!("downloading v{latest} for this platform...");
+            self_update(&latest).await?;
+            println!("updated to {latest}. Restart zeus to use it.");
         }
     }
     Ok(())
@@ -225,5 +304,40 @@ mod tests {
     #[test]
     fn version_compare_tolerates_garbage() {
         assert!(!is_newer("not-a-version", "1.0.0"));
+    }
+
+    #[test]
+    fn platform_asset_name_resolves_on_every_ci_target() {
+        // CI (and any dev machine) only ever runs this on one of the four
+        // platforms release.yml's build matrix actually produces — a fifth,
+        // genuinely unsupported platform is meant to fail loudly at runtime
+        // via `cmd_update`'s `?`, not be silently tolerated here.
+        assert!(platform_asset_name().is_ok());
+    }
+
+    #[test]
+    fn find_extracted_binary_walks_nested_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("zeus-x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("zeus"), b"fake binary").unwrap();
+
+        let found = find_extracted_binary(tmp.path(), "zeus").unwrap();
+        assert_eq!(found, nested.join("zeus"));
+    }
+
+    #[test]
+    fn find_extracted_binary_finds_flat_layout_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("zeus.exe"), b"fake binary").unwrap();
+
+        let found = find_extracted_binary(tmp.path(), "zeus.exe").unwrap();
+        assert_eq!(found, tmp.path().join("zeus.exe"));
+    }
+
+    #[test]
+    fn find_extracted_binary_returns_none_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(find_extracted_binary(tmp.path(), "zeus").is_none());
     }
 }
