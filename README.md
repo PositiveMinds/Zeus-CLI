@@ -6,36 +6,56 @@ Published on npm as [`zeus-code`](https://www.npmjs.com/package/zeus-code).
 ## Features
 
 - **Terminal-native TUI** — a full ratatui chat interface: streaming replies,
-  syntax-highlighted diffs and code blocks, a command palette (`/` or
-  `ctrl+p`), message queuing while a turn is in flight, and session
-  search/resume.
+  syntax-highlighted diffs (including a side-by-side `/diff` view) and code
+  blocks, a command palette (`/` or `ctrl+p`), `@model` autocomplete,
+  multiline input, theme presets, message queuing while a turn is in flight,
+  and session search/resume.
 - **Three agent modes** — `Plan` (read-only research), `Build` (full tool
   access), and `Auto` (a continuous tool-calling loop that keeps going until
   the request is genuinely done), cycled with Tab.
 - **43 specialist personas across ~6 departments**, reachable in Auto mode
-  via a model-invoked `delegate` tool, or directly with `/agents`.
+  via a model-invoked `delegate` tool or a full `/plan`-driven orchestrated
+  run, or directly with `/agents`; an approved-but-interrupted plan resumes
+  where it left off instead of re-planning from scratch.
 - **Provider-agnostic** — Anthropic, OpenAI, Gemini, Grok, DeepSeek,
   OpenRouter, OpenCodeZen, and local runners (Ollama, LM Studio, llama.cpp),
-  with in-app key entry and a live model picker.
+  with in-app key entry, a live model picker, and automatic fallback to
+  whatever local server is actually reachable.
+- **Local model management** — download GGUF models straight from Hugging
+  Face (`zeus pull hf`, resumable via HTTP `Range` on a dropped connection)
+  or Ollama's registry, then serve one directly through an auto-downloaded
+  llama.cpp server (`zeus serve`) with zero separate setup.
 - **Filesystem-first safety core** — permission gates, path containment,
   checkpoints + rewind, and a database-free `.agent/` project state instead
   of a hidden daemon or cloud session store.
-- **Git, code intelligence, and background orchestration** — 24-operation
-  git integration with AI commit messages, a symbol index for
-  definitions/references, and `zeus bg` for long-running orchestrated tasks
-  you can check on, pause, resume, or stop independently of the TUI.
+- **Git, code intelligence, and RAG search** — 24-operation git integration
+  with AI commit messages and PR support, a tree-sitter-backed symbol index
+  (definitions/references/rename across 9 languages), and hybrid
+  keyword+vector search over the codebase for "find code about X" queries.
+- **Language/framework aware** — detects a project's stack across 41
+  languages and 13 frameworks to ground the agent's context, and can
+  scaffold a real, buildable starter project from scratch for 38 of them.
+- **Extensive DevOps tool integration** — Docker, Kubernetes, Terraform,
+  GitHub, AWS/Azure/GCP, Vercel, Supabase, and a dozen more platform CLIs are
+  wired in as first-class tools alongside the core file/git/search set.
+- **Background orchestration** — `zeus bg` runs long tasks (including a full
+  orchestrated `--auto` run) detached, so you can check on, pause, resume,
+  or stop them independently of the TUI.
+- **Android device testing** — drive a real device or emulator over `adb`
+  directly from the agent: install/launch, screenshot/screenrecord, logcat,
+  UI input automation, and file push/pull.
 - **Self-diagnosing** — `zeus doctor` checks every configured provider's
   readiness (key presence, or live reachability for local runners), not
   just the default one.
 
 ## Status
 
-| Phase | Focus | Status |
-|-------|--------|--------|
-| **1** | CLI, config, logging, provider abstraction | **done** |
-| **2** | Permissions, filesystem ops, checkpoints, search | **done** |
-| **3** | Agent loop, context, terminal execution | **done** |
-| **4–11** | Multi-agent orchestration, cloud providers, extensibility → Desktop | in progress |
+Phases 1–3 (CLI/config/logging/provider abstraction, permissions/filesystem
+ops/checkpoints/search, and the core agent loop) are done. Multi-agent
+orchestration, cloud providers, code intelligence, RAG search, scaffold
+detection/generation, local model management, and DevOps tool integration
+have all since landed too — see Features above for what's actually shipped
+rather than a phase-by-phase breakdown.
 
 ## Install
 
@@ -107,7 +127,11 @@ cargo run -p zeus-cli -- checkpoints
 cargo run -p zeus-cli -- rewind <turn-id>
 ```
 
-Binary name: `zeus` (package `zeus-cli`).
+Binary name: `zeus` (package `zeus-cli`). Run `zeus --help` for the full
+command list — code intelligence (`zeus codeint`), RAG search
+(`zeus ragindex`), project scaffolding (`zeus project scaffold --list`),
+local model serving (`zeus serve`), and Android device testing all have
+their own subcommands beyond what's shown here.
 
 ## Layout
 
@@ -133,11 +157,14 @@ Override home for tests: `ZEUS_HOME=/tmp/zeus-test`.
 
 ```text
 crates/
-  zeus-cli/       # binary
+  zeus-cli/       # binary: TUI + one-shot subcommands
+  zeus-agent/     # agent loop, tools, orchestration, personas
   zeus-config/    # paths + layered TOML
   zeus-logging/   # tracing + file logs
   zeus-provider/  # ModelProvider trait + real backends
-  zeus-fs/        # permission gate, file ops, checkpoints, search
+  zeus-fs/        # permission gate, file ops, checkpoints, search, device/git
+  zeus-lang/      # language/framework detection + scaffolding
+  zeus-rag/       # database-free chunk index + hybrid search
 ```
 
 ## Safety model (Phase 2)
@@ -154,9 +181,10 @@ crates/
 Besides a local Ollama/LM-Studio-style provider, zeus
 supports cloud LLMs via OpenAI-compatible and native Anthropic routes:
 
-- **OpenAI-compatible**: OpenAI, Grok (x.ai), OpenRouter, OpenCode Zen, Gemini
-  — configured under `providers.toml` (`kind = "openai_compat"`,
-  `base_url`, `api_key_env`, `default_model`, optional `headers`).
+- **OpenAI-compatible**: OpenAI, Grok (x.ai), OpenRouter, OpenCode Zen,
+  DeepSeek, Gemini — configured under `providers.toml`
+  (`kind = "openai_compat"`, `base_url`, `api_key_env`, `default_model`,
+  optional `headers`).
 - **Anthropic native** (`kind = "anthropic"`, `/v1/messages`, `x-api-key`).
 
 API keys come from an env var named by `api_key_env`, or an embedded
