@@ -10,9 +10,10 @@ use crate::mcp::McpClient;
 use crate::plugin::LoadedPlugin;
 use crate::terminal::{CommandProfile, Sandbox, TerminalOptions, TerminalRunner};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use zeus_fs::{
     filter_out_own_index, word_boundary, ApprovalDecision, CopyOptions, DeviceEngine, EditOptions,
@@ -53,8 +54,8 @@ impl ToolResult {
 /// Tool specs advertised to the model. Kept in sync with `ToolManager`'s
 /// `dispatch_with_approver` match arms below — every name here must have a
 /// handler, and vice versa.
-pub fn builtin_tool_specs() -> Vec<ToolSpec> {
-    let mut specs = vec![
+fn core_tool_specs() -> Vec<ToolSpec> {
+    vec![
         ToolSpec {
             name: "todowrite".into(),
             description: "Replace your own progress checklist for this session with the given list — call this whenever you break a request into multiple steps, and again every time a step's status changes. You own this list entirely: pass the FULL list every time (not a diff), including items already completed. Mark exactly one item in_progress at a time (the one you're actively working on), never more; mark an item completed only once you've actually verified it, not just attempted it. Skip this tool for a single trivial action.".into(),
@@ -703,7 +704,20 @@ ToolSpec {
                 "required": ["old", "new"]
             }),
         },
-    ];
+    ]
+}
+
+/// Every built-in tool (core + platform) — the full registry. Used by the
+/// dispatch-completeness test and re-exported for tooling. This is
+/// deliberately *not* the list the model sees: `ToolManager::all_tool_specs`
+/// filters platform tools down to those whose CLI is actually on PATH (see
+/// `platform_cli_for`/`filter_platform_specs`), so a small/free model isn't
+/// asked to weigh 80+ deployment tools it can't use — a 147-tool list is
+/// enough to make a small model burn every tool-call iteration without ever
+/// converging to a final answer (the "(no final answer after N tool calls)"
+/// failure, and the per-turn latency that makes simple tasks feel slow).
+pub fn builtin_tool_specs() -> Vec<ToolSpec> {
+    let mut specs = core_tool_specs();
     specs.extend(platform_tool_specs());
     specs
 }
@@ -1547,6 +1561,93 @@ pub fn platform_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// The CLI binary a platform tool needs on PATH before it's worth
+/// advertising to the model. `None` for core (non-platform) tools — those
+/// are always advertised. Tools whose CLI isn't present would fail at
+/// dispatch anyway, and carrying their specs is pure dead weight on every
+/// model request: ~80 deployment tools is a big enough list to slow
+/// time-to-first-token and push small/free models into degenerate retries
+/// and tool-call exhaustion. Dispatch still accepts these names regardless —
+/// this only controls what the model is nudged toward.
+fn platform_cli_for(name: &str) -> Option<&'static str> {
+    let (prefix, _) = name.split_once('_')?;
+    Some(match prefix {
+        "gh" => "gh",
+        "supabase" => "supabase",
+        "vercel" => "vercel",
+        "docker" => "docker",
+        "k8s" => "kubectl",
+        "tf" => "terraform",
+        "circleci" => "circleci",
+        "aws" | "cloudformation" => "aws",
+        "sam" => "sam",
+        "az" => "az",
+        "gcloud" => "gcloud",
+        "helm" => "helm",
+        "fly" => "flyctl",
+        "railway" => "railway",
+        "render" => "render",
+        "netlify" => "netlify",
+        "firebase" => "firebase",
+        _ => return None,
+    })
+}
+
+/// Drop platform-tool specs whose CLI isn't in `present`. Core tools have no
+/// CLI mapping (`platform_cli_for` returns `None`) and always survive.
+fn filter_platform_specs(
+    specs: Vec<ToolSpec>,
+    present: &HashSet<String>,
+) -> Vec<ToolSpec> {
+    specs
+        .into_iter()
+        .filter(|s| platform_cli_for(&s.name).map_or(true, |cli| present.contains(cli)))
+        .collect()
+}
+
+/// Which platform CLIs are on PATH. Pure PATH walk with filesystem existence
+/// checks — no process spawns — so it's cheap enough to call from
+/// `all_tool_specs` even without caching (`ToolManager` caches it anyway).
+/// Windows checks the `.exe/.cmd/.bat/.com` variants.
+fn detect_platform_clis() -> HashSet<String> {
+    const CLIS: &[&str] = &[
+        "gh", "supabase", "vercel", "docker", "kubectl", "terraform", "circleci", "aws", "sam",
+        "az", "gcloud", "helm", "flyctl", "railway", "render", "netlify", "firebase",
+    ];
+    CLIS.iter()
+        .filter(|c| cli_on_path(c))
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+fn cli_on_path(cli: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let mut names = vec![cli.to_string()];
+    if cfg!(windows) {
+        names.extend([
+            format!("{cli}.exe"),
+            format!("{cli}.cmd"),
+            format!("{cli}.bat"),
+            format!("{cli}.com"),
+        ]);
+    }
+    for dir in std::env::split_paths(&path_var) {
+        for name in &names {
+            let full = if dir.as_os_str().is_empty() {
+                PathBuf::from(name)
+            } else {
+                dir.join(name)
+            };
+            if full.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Dispatches named tool calls against a workspace + terminal runner.
 pub struct ToolManager {
     workspace: Workspace,
@@ -1576,6 +1677,9 @@ pub struct ToolManager {
     /// Embedding model name to pass to `embedder` (usually the chat model;
     /// a provider may map it to its embedding model).
     embed_model: Option<String>,
+    /// Which platform CLIs are on PATH, detected once and reused across
+    /// `all_tool_specs` calls (every model round trip requests the list).
+    available_clis: OnceLock<HashSet<String>>,
 }
 
 /// Tools that only observe state (files, git history, background task
@@ -1677,6 +1781,7 @@ impl ToolManager {
             repo: None,
             embedder: None,
             embed_model: None,
+            available_clis: OnceLock::new(),
         }
     }
 
@@ -1730,7 +1835,8 @@ impl ToolManager {
     /// plugin (`plugin__<plugin>__<tool>`). This is what the agent loop
     /// should advertise to the model — not `builtin_tool_specs()` alone.
     pub fn all_tool_specs(&self) -> Vec<ToolSpec> {
-        let mut specs = builtin_tool_specs();
+        let mut specs = core_tool_specs();
+        specs.extend(self.available_platform_tool_specs());
         for client in &self.mcp_clients {
             for tool in client.tools() {
                 specs.push(ToolSpec {
@@ -1750,6 +1856,15 @@ impl ToolManager {
             }
         }
         specs
+    }
+
+    /// Platform-CLI tools whose CLI binary is actually on PATH. Detected once
+    /// and cached (`all_tool_specs` is called on every model round trip; a
+    /// PATH re-scan per call would reintroduce the per-iteration overhead
+    /// this filtering exists to remove).
+    fn available_platform_tool_specs(&self) -> Vec<ToolSpec> {
+        let present = self.available_clis.get_or_init(detect_platform_clis);
+        filter_platform_specs(platform_tool_specs(), present)
     }
 
     /// Read-only subset of `all_tool_specs` — used for a `delegate`d
@@ -4018,6 +4133,90 @@ mod tests {
             Vec::new(),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn platform_cli_for_maps_every_platform_tool_to_a_cli() {
+        // Every platform tool must map to the CLI it needs; a `None` here
+        // means `filter_platform_specs` would let a platform tool through
+        // unconditionally, silently defeating the whole point of the gate.
+        for spec in platform_tool_specs() {
+            assert!(
+                platform_cli_for(&spec.name).is_some(),
+                "platform tool '{}' has no CLI mapping — add it to `platform_cli_for`",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn core_tools_survive_platform_filter_regardless_of_clis() {
+        // Core tools have no CLI mapping and must always be advertised, even
+        // when no platform CLI is present at all.
+        let present = HashSet::new();
+        let kept: Vec<String> = filter_platform_specs(core_tool_specs(), &present)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        for name in ["read", "write", "edit", "bash", "git_status", "grep"] {
+            assert!(kept.contains(&name.to_string()), "core tool '{name}' was filtered");
+        }
+        assert_eq!(kept.len(), core_tool_specs().len());
+    }
+
+    #[test]
+    fn platform_tools_filtered_by_cli_presence() {
+        // No CLIs present -> no platform tools advertised.
+        let none = filter_platform_specs(platform_tool_specs(), &HashSet::new());
+        assert_eq!(none.len(), 0, "no CLIs present but {} platform tools advertised", none.len());
+
+        // Only `gh` present -> gh tools survive, everything else is dropped.
+        let mut present = HashSet::new();
+        present.insert("gh".to_string());
+        let kept = filter_platform_specs(platform_tool_specs(), &present);
+        assert!(
+            kept.iter().all(|s| s.name.starts_with("gh_")),
+            "unexpected non-gh tool kept: {:?}",
+            kept.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            kept.iter().any(|s| s.name == "gh_issue_list"),
+            "expected gh_issue_list to survive"
+        );
+        assert!(
+            !kept.iter().any(|s| s.name == "supabase_projects_list"),
+            "supabase tools advertised without supabase on PATH"
+        );
+    }
+
+    #[test]
+    fn all_tool_specs_omits_platform_tools_whose_cli_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        let specs = tm.all_tool_specs();
+
+        // Every advertised platform tool maps to a CLI that must exist on PATH
+        // in this test environment (this runs on the developer's machine, so
+        // which CLIs are present varies — the invariant is the important part).
+        let present = detect_platform_clis();
+        for spec in &specs {
+            if let Some(cli) = platform_cli_for(&spec.name) {
+                assert!(
+                    present.contains(cli),
+                    "advertised platform tool '{}' requires '{cli}' which is not on PATH",
+                    spec.name
+                );
+            }
+        }
+
+        // Core tools must still be advertised unconditionally.
+        for name in ["read", "write", "edit", "bash", "grep"] {
+            assert!(
+                specs.iter().any(|s| s.name == name),
+                "core tool '{name}' missing from all_tool_specs"
+            );
+        }
     }
 
     #[test]

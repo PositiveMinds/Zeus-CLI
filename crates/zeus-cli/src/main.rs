@@ -1002,7 +1002,7 @@ async fn build_agent_with_provider(
         state,
         AgentOptions {
             model,
-            max_tool_iterations: 8,
+            max_tool_iterations: 16,
             temperature: config.settings.model.temperature,
             // Bounds worst-case reply latency — otherwise an ungrounded
             // ramble (especially on slow CPU-bound local inference) keeps
@@ -1598,7 +1598,7 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "suggest",
-        "read-only next-feature recommendations grounded in what already exists",
+        "read-only next-feature recommendations grounded in what exists (/suggest [context])",
     ),
     (
         "workflow",
@@ -2195,7 +2195,10 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                 }
                 "suggest" => {
                     print_turn_header();
-                    if let Err(e) = agent.suggest_turn(print_agent_event, approver(yes)).await {
+                    if let Err(e) = agent
+                        .suggest_turn(arg, print_agent_event, approver(yes))
+                        .await
+                    {
                         eprintln!(
                             "\n{}",
                             ui::styled(ui::error_style(), &format!("suggest failed: {e:#}"))

@@ -33,7 +33,13 @@ const MAX_DEGENERATE_RETRIES: usize = 2;
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
     pub model: String,
-    /// Safety valve against a runaway tool-call loop.
+    /// Soft tool-call budget for a single turn. The budget adapts at runtime:
+    /// while the model keeps making *novel* tool calls it extends in chunks up
+    /// to `3×` this value, and a repeated identical call stops the turn early —
+    /// so this is a safety valve against a runaway loop, not a hard limit on
+    /// legitimate work (a large multi-folder scaffold can need 30+ rounds).
+    /// Degenerate empty replies are caught separately by
+    /// `MAX_DEGENERATE_RETRIES`.
     pub max_tool_iterations: usize,
     pub temperature: Option<f32>,
     /// Caps how many tokens a single reply may generate — bounds worst-case
@@ -57,7 +63,7 @@ impl Default for AgentOptions {
     fn default() -> Self {
         Self {
             model: "llama3.2".into(),
-            max_tool_iterations: 8,
+            max_tool_iterations: 16,
             temperature: None,
             max_tokens: None,
             max_parallel_read_steps: 2,
@@ -724,8 +730,14 @@ impl Agent {
     /// implement next, ranked by fit and effort. Always grounded in what
     /// already exists (the persistent map + probe) so suggestions stay
     /// project-specific rather than generic. Emits `FeaturesSuggested`.
+    /// Suggest what to build next: a read-only pass that scans the repo and
+    /// asks the model for the 3-5 most valuable next features, grounded in
+    /// what already exists. `context` (optional, e.g. "just finished a basic
+    /// login page") anchors the recommendation to the work that was just
+    /// done; an empty string keeps it purely repo-driven.
     pub async fn suggest_turn<E, A>(
         &mut self,
+        context: &str,
         mut on_event: E,
         mut approver: A,
     ) -> Result<TurnResult>
@@ -735,15 +747,25 @@ impl Agent {
     {
         let _ = self.cancel_tx.send(false);
         let report = self.repo_context("next features to implement", &mut on_event);
+        let context_line = if context.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nJust finished: {context}\n\
+                 Treat that as the current head of the work — the next step should continue\n\
+                 from it, not restart it.\n"
+            )
+        };
         let prompt = format!(
             "Recommend the 3-5 most valuable features to build NEXT in this project, \
-             grounded strictly in what already EXISTS here.\n\n\
+             grounded strictly in what already EXISTS here.{context_line}\n\
              For each feature give:\n\
              - name and the real file/module it would extend or add\n\
              - why it is the natural next step given the current implementation\n\
              - what depends on it or blocks it\n\
              - rough effort size (S/M/L)\n\
              Rank by impact-to-effort. Skip anything the repo already has. Do NOT modify files.\n\n{report}",
+            context_line = context_line,
             report = report
         );
         self.state.messages.push(Message::user(prompt));
@@ -1725,7 +1747,41 @@ impl Agent {
         let mut total_tool_calls = 0usize;
         let mut total_usage = TokenUsage::default();
 
-        for _ in 0..self.options.max_tool_iterations {
+        // Signature of the previous iteration's tool calls (name + argument
+        // JSON per call), to detect a stuck model repeating itself before it
+        // burns the whole budget. `None` before the first tool-call round.
+        let mut last_call_sigs: Option<Vec<String>> = None;
+        // Set when we stopped because the model repeated an identical tool
+        // call — a stuck loop. Distinct from a productive run that merely ran
+        // out of budget (which gets a forced-conclusion pass instead).
+        let mut repeated_run = false;
+
+        // Adaptive tool-call budget. The *right* number of tool calls for a
+        // task can't be known up front — it emerges as the model reads the
+        // repo and reacts to what it finds (a big multi-folder scaffold can
+        // legitimately need 30+ rounds, far past a fixed 8 or even 16). So
+        // instead of one static cap the budget grows on demand and shrinks on
+        // failure:
+        //   - A *novel* round (tool calls that differ from the previous
+        //     round) at the current budget extends it by `TOOL_ITERATION_EXTENSION`
+        //     up to `hard_ceiling`, so productive work is never cut off
+        //     mid-task.
+        //   - A *repeated* identical round breaks out immediately (stuck
+        //     loop) above, so a failing model never eats the whole budget.
+        //   - Converging to a final text answer returns inside the loop.
+        //   - Hitting the hard ceiling still working falls through to the
+        //     forced-conclusion pass below.
+        const TOOL_ITERATION_EXTENSION: usize = 8;
+        let soft_budget = self.options.max_tool_iterations;
+        // Hard ceiling guards the pathological case (a model that keeps
+        // finding novel-looking work forever); the forced-conclusion pass then
+        // ends the turn gracefully instead of erroring.
+        let hard_ceiling = soft_budget * 3;
+        let mut budget = soft_budget;
+        let mut iterations = 0usize;
+
+        while iterations < budget {
+            iterations += 1;
             if *self.cancel_rx.borrow() {
                 on_event(AgentEvent::Cancelled);
                 self.persist()?;
@@ -1910,6 +1966,25 @@ impl Agent {
                 });
             }
 
+            // Stuck-loop guard: if this iteration's tool calls are identical
+            // to the previous iteration's (same tool names + same argument
+            // JSON), the model is repeating itself rather than progressing.
+            // Stop before burning another round trip executing them; the
+            // post-loop path reports it as a stuck loop instead of silently
+            // iterating until the budget is gone.
+            let sigs: Vec<String> = call_order
+                .iter()
+                .map(|id| {
+                    let (name, arguments, _) = calls.get(id).unwrap();
+                    format!("{}:{arguments}", name.clone().unwrap_or_default())
+                })
+                .collect();
+            if last_call_sigs.as_deref() == Some(&sigs[..]) {
+                repeated_run = true;
+                break;
+            }
+            last_call_sigs = Some(sigs);
+
             // Assistant message carrying the requested tool calls, then one
             // tool-result message per call — appended immediately after, so
             // the pairing invariant `ContextManager` relies on always holds.
@@ -2002,33 +2077,114 @@ impl Agent {
             }
 
             self.persist()?;
+
+            // Extend the budget if this round hit it while still making novel
+            // progress. A repeated round would have broken out above, so
+            // reaching here at the budget means this was productive work —
+            // exactly the case a static cap used to cut off with a "no final
+            // answer" failure on a large multi-file task.
+            if iterations >= budget && iterations < hard_ceiling {
+                budget = (budget + TOOL_ITERATION_EXTENSION).min(hard_ceiling);
+            }
         }
 
-        // Not a system failure — the model (often a small/local one) just
-        // didn't converge to a final answer within the iteration budget,
-        // e.g. by repeating the same tool call. This used to be a hard
-        // `Err`, which crashed the entire REPL session on a single
-        // unlucky turn instead of just failing that turn — fixed to behave
-        // like a normal (if apologetic) reply instead, through the same
-        // TextDelta/Done event path a real answer would use, so no caller
-        // needs special-case handling.
-        let fallback_text = format!(
-            "(no final answer after {} tool call(s) across {} iterations — the model may be stuck, \
-             e.g. repeating the same tool call. Try rephrasing, or breaking the request into \
-             smaller steps.)",
-            total_tool_calls, self.options.max_tool_iterations
-        );
-        on_event(AgentEvent::TextDelta(fallback_text.clone()));
+        // Two ways to land here: a stuck loop (model repeated an identical
+        // tool call — `repeated_run`), or a productive run that exhausted the
+        // tool-call budget while still mid-tool-work. Both used to hard-fail
+        // with a "no final answer" error; now they end the turn gracefully.
+        if repeated_run {
+            // The model never progressed — report it and stop. (This used to
+            // be a hard `Err`, which crashed the whole REPL session on a
+            // single unlucky turn instead of just failing that turn — it now
+            // behaves like a normal reply through the same TextDelta/Done
+            // event path, so no caller needs special-case handling.)
+            let fallback_text = format!(
+                "(stopped early: the model repeated the same tool call(s) instead of making \
+                 progress — {} tool call(s) executed. Try rephrasing, or breaking the request \
+                 into smaller steps.)",
+                total_tool_calls
+            );
+            on_event(AgentEvent::TextDelta(fallback_text.clone()));
+            self.state
+                .messages
+                .push(Message::assistant(fallback_text.clone()));
+            self.persist()?;
+            on_event(AgentEvent::Done);
+            self.tools
+                .hooks()
+                .run_on_stop(&self.state.session_id, "stuck: repeated tool call");
+            return Ok(TurnResult {
+                final_text: fallback_text,
+                tool_calls: total_tool_calls,
+                cancelled: false,
+                usage: total_usage,
+            });
+        }
+
+        // The budget ran out while the model was still doing legitimate tool
+        // work. It has usually finished (or gotten most of the way through)
+        // the actual task — what it never got to do is write its closing
+        // summary, because every round trip went to a tool call. Give it
+        // exactly one more pass with tools DISABLED so it must answer in
+        // prose instead of making another tool call (which would just eat
+        // another iteration and land here again).
+        let conclude_prompt = "\n\nThe tool-call budget for this turn is exhausted and the \
+            remaining work should be complete or as far along as possible. Do NOT call any more \
+            tools. Write your final answer now: summarize what you did, list the files changed \
+            (if any), and tell the user how to run/verify the result.";
         self.state
             .messages
-            .push(Message::assistant(fallback_text.clone()));
+            .push(Message::user(conclude_prompt.to_string()));
+        let request = ChatRequest {
+            model: self.options.model.clone(),
+            messages: self.state.messages.clone(),
+            tools: Vec::new(),
+            temperature: self.options.temperature,
+            max_tokens: self.options.max_tokens,
+            cancel: Some(self.cancel_rx.clone()),
+        };
+        let mut stream = self
+            .provider
+            .stream(request)
+            .await
+            .map_err(AgentError::Provider)?;
+        let mut conclude_text = String::new();
+        let mut conclude_usage = TokenUsage::default();
+        while let Some(ev) = stream.next().await {
+            match ev.map_err(AgentError::Provider)? {
+                StreamEvent::TextDelta { text: t } => {
+                    conclude_text.push_str(&t);
+                    on_event(AgentEvent::TextDelta(t));
+                }
+                StreamEvent::ToolCallDelta { .. } => {
+                    // Tools are disabled for this pass; ignore stray calls.
+                }
+                StreamEvent::Done { usage, .. } => {
+                    conclude_usage = usage;
+                }
+            }
+        }
+        total_usage.prompt_tokens += conclude_usage.prompt_tokens;
+        total_usage.completion_tokens += conclude_usage.completion_tokens;
+        total_usage.total_tokens += conclude_usage.total_tokens;
+        if conclude_text.trim().is_empty() {
+            conclude_text =
+                "(the model finished its tool work but returned nothing when asked to summarize.)"
+                    .to_string();
+        }
+        self.state
+            .messages
+            .push(Message::assistant(conclude_text.clone()));
         self.persist()?;
         on_event(AgentEvent::Done);
         self.tools
             .hooks()
-            .run_on_stop(&self.state.session_id, "max tool iterations exceeded");
+            .run_on_stop(
+                &self.state.session_id,
+                &format!("turn finished: {total_tool_calls} tool call(s), forced conclusion"),
+            );
         Ok(TurnResult {
-            final_text: fallback_text,
+            final_text: conclude_text,
             tool_calls: total_tool_calls,
             cancelled: false,
             usage: total_usage,
@@ -2057,6 +2213,16 @@ impl Agent {
     }
 
     async fn maybe_compact_inner(&mut self, force: bool) -> Result<Option<CompactResult>> {
+        // Cheap gate first: when auto-compaction is disabled the rest of this
+        // is moot, and bailing here avoids paying a provider token-count call
+        // on *every* turn just to discover that. `count_tokens` is a real
+        // model round trip, so this ordering is a meaningful latency win on
+        // simple tasks (a few file writes with a small context shouldn't burn
+        // an extra API call each turn).
+        if !force && !self.auto_compact() {
+            return Ok(None);
+        }
+
         let count = self
             .provider
             .count_tokens(TokenCountRequest {
@@ -2066,10 +2232,6 @@ impl Agent {
             })
             .await
             .map_err(AgentError::Provider)?;
-
-        if !force && !self.auto_compact() {
-            return Ok(None);
-        }
 
         if !force && !self.context.should_compact(count.tokens) {
             return Ok(None);
@@ -2421,6 +2583,7 @@ mod tests {
     use crate::{BackgroundTaskRegistry, ContextManager, HookRunner, TerminalRunner, ToolManager};
     use std::collections::VecDeque;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use zeus_config::{AgentSettings, Config, GlobalPaths, ProvidersFile};
@@ -2465,12 +2628,17 @@ mod tests {
     #[derive(Debug, Clone)]
     struct MockProvider {
         script: Arc<Mutex<VecDeque<MockReply>>>,
+        /// Set to `true` the first time `stream` sees a request with an empty
+        /// tool list — the forced-conclusion pass sends exactly that, so tests
+        /// can tell it apart from a normal converging round.
+        saw_empty_tools_request: Arc<AtomicBool>,
     }
 
     impl MockProvider {
         fn new(replies: Vec<MockReply>) -> Self {
             Self {
                 script: Arc::new(Mutex::new(VecDeque::from(replies))),
+                saw_empty_tools_request: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -2525,8 +2693,11 @@ mod tests {
 
         async fn stream(
             &self,
-            _request: ChatRequest,
+            request: ChatRequest,
         ) -> zeus_provider::Result<zeus_provider::ChatStream> {
+            if request.tools.is_empty() {
+                self.saw_empty_tools_request.store(true, Ordering::SeqCst);
+            }
             let reply = self.next();
             let mut events: Vec<StreamEvent> = Vec::new();
             match &reply {
@@ -2696,6 +2867,171 @@ mod tests {
         assert!(read_result.contains("content 42"));
     }
 
+    #[tokio::test]
+    async fn run_turn_stops_early_on_repeated_tool_call() {
+        // The model issues the *same* tool call twice in a row. The stuck-loop
+        // guard must stop after the first execution instead of burning the
+        // whole 8-iteration budget, and report it as a stuck loop — not a
+        // "no final answer" failure after a wasted full budget.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "content 42").unwrap();
+        let repeat: Vec<(String, String, String, Option<serde_json::Value>)> = vec![(
+            "call-read".into(),
+            "read".into(),
+            r#"{"path":"a.txt"}"#.into(),
+            None,
+        )];
+        let mut agent = test_agent(
+            root,
+            MockProvider::new(vec![
+                MockReply::ToolCalls(repeat.clone()),
+                MockReply::ToolCalls(repeat.clone()),
+                // If the guard worked, the budget is never touched and the
+                // turn stops before consuming these.
+                MockReply::Text("should never be reached".into()),
+            ]),
+        );
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let result = agent
+            .run_turn("read a.txt", |ev| events.push(ev), approve)
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_calls, 1, "repeated call must not be executed again");
+        assert!(
+            result.final_text.contains("repeated the same tool call"),
+            "expected stuck-loop message, got: {}",
+            result.final_text
+        );
+        assert!(!result.cancelled);
+    }
+
+    #[tokio::test]
+    async fn run_turn_forced_conclusion_when_budget_exhausted() {
+        // A productive run (each iteration a *different* read) keeps extending
+        // the adaptive budget until the hard ceiling (`max_tool_iterations * 3`
+        // = 24 for the test agent), at which point the forced-conclusion pass
+        // runs with tools DISABLED so the model can write its closing summary.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for i in 0..24 {
+            std::fs::write(root.join(format!("a{i}.txt")), "content").unwrap();
+        }
+        // 24 distinct tool calls (one per ceiling round), then a prose reply
+        // for the forced-conclusion pass.
+        let mut script = Vec::new();
+        for i in 0..24 {
+            script.push(MockReply::ToolCalls(vec![(
+                format!("call-{i}"),
+                "read".into(),
+                format!(r#"{{"path":"a{i}.txt"}}"#),
+                None,
+            )]));
+        }
+        script.push(MockReply::Text("done: summarized the work here".into()));
+
+        let provider = MockProvider::new(script);
+        let mut agent = test_agent(root, provider.clone());
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let result = agent
+            .run_turn("read all files", |ev| events.push(ev), approve)
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_calls, 24);
+        assert_eq!(result.final_text, "done: summarized the work here");
+        assert!(!result.cancelled);
+        // The final summary must have come from the forced-conclusion pass
+        // (an empty-tools request), not an ordinary converging round.
+        assert!(
+            provider.saw_empty_tools_request.load(Ordering::SeqCst),
+            "expected the forced-conclusion pass to run with tools disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_auto_extends_budget_for_large_novel_tasks() {
+        // A genuinely large task that still needs a few more rounds past the
+        // soft budget must get them via extension — NOT a forced conclusion
+        // that cuts it off mid-work. Here the soft budget is 8 and the task
+        // needs 12 novel rounds before converging; the final round must be an
+        // ordinary converging round (tools still enabled).
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for i in 0..12 {
+            std::fs::write(root.join(format!("b{i}.txt")), "content").unwrap();
+        }
+        let mut script = Vec::new();
+        for i in 0..12 {
+            script.push(MockReply::ToolCalls(vec![(
+                format!("call-{i}"),
+                "read".into(),
+                format!(r#"{{"path":"b{i}.txt"}}"#),
+                None,
+            )]));
+        }
+        script.push(MockReply::Text("done: summarized the work here".into()));
+
+        let provider = MockProvider::new(script);
+        let mut agent = test_agent(root, provider.clone());
+        let result = agent
+            .run_turn("read all files", |_| {}, approve)
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_calls, 12);
+        assert_eq!(result.final_text, "done: summarized the work here");
+        assert!(
+            !provider.saw_empty_tools_request.load(Ordering::SeqCst),
+            "large novel task was cut off by a forced conclusion instead of getting an extension"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_repeated_then_progress_is_not_stuck() {
+        // A read → edit → read-again rhythm (two identical reads *not*
+        // consecutive) must not trip the stuck-loop guard.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "content 42").unwrap();
+        let read_repeat: Vec<(String, String, String, Option<serde_json::Value>)> = vec![(
+            "call-read".into(),
+            "read".into(),
+            r#"{"path":"a.txt"}"#.into(),
+            None,
+        )];
+        let mut agent = test_agent(
+            root,
+            MockProvider::new(vec![
+                MockReply::ToolCalls(vec![(
+                    "call-write".into(),
+                    "write".into(),
+                    r#"{"path":"b.txt","content":"x"}"#.into(),
+                    None,
+                )]),
+                MockReply::ToolCalls(read_repeat.clone()),
+                MockReply::ToolCalls(vec![(
+                    "call-edit".into(),
+                    "write".into(),
+                    r#"{"path":"c.txt","content":"y"}"#.into(),
+                    None,
+                )]),
+                MockReply::ToolCalls(read_repeat),
+                MockReply::Text("all done".into()),
+            ]),
+        );
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let result = agent
+            .run_turn("work through the files", |ev| events.push(ev), approve)
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_calls, 4);
+        assert_eq!(result.final_text, "all done");
+        assert!(!result.cancelled);
+    }
+
     /// Gemini (3.1+) returns `extra_content.google.thought_signature` on each
     /// tool call and 400s follow-ups that don't echo it. The agent must carry
     /// that metadata through the streamed tool-call into the recorded tool
@@ -2801,7 +3137,7 @@ mod tests {
         );
         let mut events: Vec<AgentEvent> = Vec::new();
         let result = agent
-            .suggest_turn(|ev| events.push(ev), approve)
+            .suggest_turn("", |ev| events.push(ev), approve)
             .await
             .unwrap();
 
@@ -2810,6 +3146,24 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, AgentEvent::FeaturesSuggested { report } if report.contains("auth"))
         ));
+    }
+
+    /// A non-empty context ("just finished X") must be threaded into the
+    /// prompt that drives the suggestion — the model's reply would otherwise
+    /// have no idea what the just-finished work was.
+    #[tokio::test]
+    async fn suggest_turn_threads_context_into_the_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let mut agent = test_agent(
+            tmp.path(),
+            MockProvider::new(vec![MockReply::Text("1. user sessions (M)".into())]),
+        );
+        let result = agent
+            .suggest_turn("just finished a basic login page", |_| {}, approve)
+            .await
+            .unwrap();
+        assert!(!result.cancelled);
+        assert_eq!(result.final_text, "1. user sessions (M)");
     }
 
     /// Approve everything except the lead-reviewer gate, so we can exercise

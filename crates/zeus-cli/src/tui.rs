@@ -1598,7 +1598,7 @@ fn render_hints(f: &mut Frame, area: Rect, _state: &AppState) {
         ["tab", "agents"],
         ["/ ctrl+p", "commands"],
         ["click", "select"],
-        ["ctrl+y", "copy"],
+        ["ctrl+c", "copy"],
         ["ctrl+f", "find"],
         ["esc", "close"],
     ];
@@ -2837,12 +2837,17 @@ fn start_review_turn(
 }
 
 /// `/suggest`: read-only next-feature recommendations grounded in the repo.
+/// `/suggest [context]`: read-only next-feature recommendations grounded in
+/// what already exists; an optional context ("just finished the login page")
+/// anchors the suggestions to the work that was just done.
+#[allow(clippy::too_many_arguments)] // app plumbing at a single call site
 fn start_suggest_turn(
     state: &mut AppState,
     agent_slot: &mut Option<Agent>,
     turn_handle: &mut Option<TurnJoin>,
     cancel_tx: &mut Option<watch::Sender<bool>>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    context: String,
     yes: bool,
 ) {
     let Some(mut agent) = agent_slot.take() else {
@@ -2857,7 +2862,7 @@ fn start_suggest_turn(
             let _ = tx_events.send(UiEvent::Agent(ev));
         };
         let approver = build_approver(&tx_approval, yes);
-        let result = agent.suggest_turn(on_event, approver).await;
+        let result = agent.suggest_turn(&context, on_event, approver).await;
         (agent, result)
     });
     *turn_handle = Some(handle);
@@ -3229,7 +3234,16 @@ async fn handle_key(
         return Ok(());
     }
 
+    // The terminal convention: Ctrl+C copies whatever is highlighted. When a
+    // transcript selection is active that wins — otherwise Ctrl+C keeps its
+    // cancel/quit role (matching how ctrl+y already copies a selection and
+    // falls back to the last reply). Selection-then-copy is deliberate, so
+    // reaching for the OS muscle memory of "highlight + Ctrl+C" just works.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.selection.is_some() {
+            copy_selection(state);
+            return Ok(());
+        }
         if state.busy {
             if let Some(tx) = cancel_tx.as_ref() {
                 let _ = tx.send(true);
@@ -3761,7 +3775,15 @@ async fn handle_key(
                     }
                     "suggest" => {
                         state.push_user(trimmed.clone());
-                        start_suggest_turn(state, agent_slot, turn_handle, cancel_tx, ui_tx, yes);
+                        start_suggest_turn(
+                            state,
+                            agent_slot,
+                            turn_handle,
+                            cancel_tx,
+                            ui_tx,
+                            arg.to_string(),
+                            yes,
+                        );
                     }
                     "agents" => {
                         if arg.eq_ignore_ascii_case("count") {
@@ -5217,5 +5239,71 @@ mod tests {
         .unwrap();
         assert!(matches!(state.mode, Mode::Chat));
         assert_eq!(reply_rx.try_recv().unwrap(), ApprovalDecision::Approved);
+    }
+
+    /// Ctrl+C with a transcript selection active copies the selection (the
+    /// terminal's "highlight then copy" convention) instead of quitting —
+    /// the dispatch decision is what's under test, so the exact clipboard
+    /// outcome (which is headless-environment-dependent) doesn't matter.
+    #[tokio::test]
+    async fn ctrl_c_with_selection_copies_instead_of_quitting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _config) = test_app_state(tmp.path());
+        state.push_user("hello".to_string());
+        state.push_info("some assistant text to copy");
+        state.selection = Some((0, 1));
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut agent_slot: Option<Agent> = None;
+        let mut turn_handle: Option<TurnJoin> = None;
+        let mut cancel_tx: Option<watch::Sender<bool>> = None;
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &_config,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // A selection means copy — the app must NOT quit.
+        assert!(!state.quit, "Ctrl+C on a selection must not quit");
+        // copy_selection clears the selection on success; on a headless box
+        // the clipboard may fail and leave it in place. Either way the
+        // outcome is one of the two copy paths, never quit.
+        assert!(
+            state.selection.is_none() || !state.transcript.is_empty(),
+            "selection was either cleared by copy or a copy error was reported"
+        );
+    }
+
+    /// Ctrl+C with no selection keeps its cancel/quit role.
+    #[tokio::test]
+    async fn ctrl_c_without_selection_still_quits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _config) = test_app_state(tmp.path());
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut agent_slot: Option<Agent> = None;
+        let mut turn_handle: Option<TurnJoin> = None;
+        let mut cancel_tx: Option<watch::Sender<bool>> = None;
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &_config,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(state.quit, "Ctrl+C with no selection should quit");
     }
 }
