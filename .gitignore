@@ -43,3 +43,11 @@ tmp-ranked.ps1
 # binary into each of these right before `npm publish`; never checked in.
 npm/zeus-code-*/bin/zeus
 npm/zeus-code-*/bin/zeus.exe
+
+# Internal design docs — kept out ahead of the repo going public. Note:
+# removing these from the tree doesn't scrub them from existing git history;
+# a full history rewrite would be needed for that.
+AI_Coding_Agent_Blueprint_Database_Free.md
+AI_Coding_Agent_Design_Tension_Analysis.md
+AI_Coding_Agent_Unique_Premium_Features.md
+AI_Multi_Agent_Company_Architecture.md

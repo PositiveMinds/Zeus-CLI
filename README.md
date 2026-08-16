@@ -3,8 +3,6 @@
 Database-free AI coding agent. **The filesystem is the source of truth.**
 Published on npm as [`zeus-code`](https://www.npmjs.com/package/zeus-code).
 
-Built from [AI_Coding_Agent_Blueprint_Database_Free.md](./AI_Coding_Agent_Blueprint_Database_Free.md).
-
 ## Features
 
 - **Terminal-native TUI** — a full ratatui chat interface: streaming replies,
@@ -176,8 +174,7 @@ failing at runtime.
 ## Multi-agent orchestration
 
 `/plan` breaks a goal into subtasks and dispatches each to a specialist
-`Persona` (an Architect, Backend, QA, … from the "AI company" model in
-[`AI_Multi_Agent_Company_Architecture.md`](./AI_Multi_Agent_Company_Architecture.md)).
+`Persona` (an Architect, Backend, QA, … modeled loosely on an "AI company").
 After the steps complete, a matching **reviewer** persona runs one read-only
 review pass over the combined result.
 
