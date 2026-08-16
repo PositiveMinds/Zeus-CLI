@@ -1,6 +1,6 @@
 {
   "name": "zeus-code-darwin-x64",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Prebuilt zeus binary for macOS x64 (Intel) — an optional dependency of zeus-code, not meant to be installed directly.",
   "license": "MIT",
   "repository": {
