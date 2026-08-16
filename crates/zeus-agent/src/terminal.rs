@@ -732,6 +732,7 @@ struct ProcessEntry32W {
     sz_exe_file: [u16; 260],
 }
 
+#[cfg(windows)]
 impl Default for ProcessEntry32W {
     fn default() -> Self {
         Self {
