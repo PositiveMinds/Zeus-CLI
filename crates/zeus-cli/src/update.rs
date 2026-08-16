@@ -10,6 +10,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// The prebuilt binaries are mirrored to a separate public repo (see
@@ -58,6 +59,7 @@ struct GhRelease {
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(format!("zeus-cli/{}", current_version()))
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .context("build http client")
 }
@@ -217,7 +219,11 @@ fn self_replace(new_binary: &Path) -> Result<()> {
 }
 
 /// Downloads the release asset for this platform/version, extracts it, and
-/// self-replaces the running binary with what's inside.
+/// self-replaces the running binary with what's inside. The download uses the
+/// provider crate's parallel, resumable downloader (with retries and resume
+/// via HTTP `Range`), so a dropped connection re-fetches only the missing
+/// chunk rather than forcing the whole archive to restart — keeping updates
+/// quick even on flaky links.
 async fn self_update(version: &str) -> Result<()> {
     let asset = platform_asset_name()?;
     let tmp_dir = std::env::temp_dir().join(format!("zeus-update-{version}"));
@@ -227,18 +233,26 @@ async fn self_update(version: &str) -> Result<()> {
     let url = format!(
         "https://github.com/{RELEASES_OWNER}/{RELEASES_REPO}/releases/download/v{version}/{asset}"
     );
-    let bytes = http_client()?
-        .get(&url)
-        .send()
-        .await
-        .context("download the release asset")?
-        .error_for_status()
-        .context("download failed — is this platform's asset actually published?")?
-        .bytes()
-        .await
-        .context("read the downloaded asset")?;
-    let archive_path = tmp_dir.join(asset);
-    std::fs::write(&archive_path, &bytes).context("save the downloaded archive")?;
+    let archive_path = tmp_dir.join(&asset);
+    let version_owned = version.to_owned();
+    zeus_provider::download_asset(&url, &archive_path, move |done, total| {
+        match total {
+            Some(t) if t > 0 => {
+                eprint!(
+                    "\r\x1b[Kdownloading v{version_owned}... {done}/{t} bytes ({:.0}%)",
+                    done as f64 * 100.0 / t as f64
+                );
+            }
+            _ => {
+                eprint!("\r\x1b[Kdownloading v{version_owned}... {done} bytes");
+            }
+        }
+        let _ = io::stderr().flush();
+    })
+    .await
+    .context("download the release asset")?;
+    eprintln!();
+    let _ = io::stderr().flush();
 
     extract_archive(&archive_path, &tmp_dir)?;
 
@@ -253,7 +267,12 @@ async fn self_update(version: &str) -> Result<()> {
 }
 
 /// `zeus update [--check]`: report on / apply the latest release.
-pub async fn cmd_update(check_only: bool) -> Result<()> {
+///
+/// `notify_on_completion` is the user's persisted display setting; when set,
+/// a successful install rings the terminal bell (BEL) so the user is alerted
+/// that the update finished, not just that it started.
+pub async fn cmd_update(check_only: bool, notify_on_completion: bool) -> Result<()> {
+    crate::tui::theme::set_notify_on_completion(notify_on_completion);
     let current = current_version();
     println!("current version: {current}");
 
@@ -284,6 +303,11 @@ pub async fn cmd_update(check_only: bool) -> Result<()> {
             println!("downloading v{latest} for this platform...");
             self_update(&latest).await?;
             println!("updated to {latest}. Restart zeus to use it.");
+            if crate::tui::theme::notify_on_completion() {
+                use std::io::Write as _;
+                let _ = write!(io::stdout(), "\x07");
+                let _ = io::stdout().flush();
+            }
         }
     }
     Ok(())

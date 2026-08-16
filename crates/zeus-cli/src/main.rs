@@ -136,7 +136,9 @@ async fn run() -> Result<()> {
             .await
         }
         Some(Commands::Sessions) => cmd_sessions(&config),
-        Some(Commands::Update { check }) => update::cmd_update(check).await,
+        Some(Commands::Update { check }) => {
+            update::cmd_update(check, config.settings.notify_on_completion).await
+        }
         Some(Commands::Key { action }) => cmd_key(&config, action),
         Some(Commands::Tokens {
             message,

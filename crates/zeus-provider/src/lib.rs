@@ -26,7 +26,7 @@ mod unconfigured;
 
 pub use anthropic::AnthropicProvider;
 pub use detect::{detect_local_provider, is_provider_reachable, is_reachable};
-pub use download::download_hf_file;
+pub use download::{download_asset, download_hf_file};
 pub use error::{ProviderError, Result};
 pub use llamacpp::{
     ensure_model_file, ensure_server_binary, find_on_path, locate_server_binary,
