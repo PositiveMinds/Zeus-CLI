@@ -3723,7 +3723,17 @@ async fn handle_key(
                 // it now — otherwise this has always just been a no-op, so
                 // there's nothing existing to conflict with.
                 if let Some(goal) = state.pending_plan_goal.take() {
-                    state.push_info(format!("running plan: {goal}"));
+                    // `start_orchestrate_turn` runs the plan-then-execute-
+                    // then-review pipeline straight through with no
+                    // per-step approval stops — that's Auto mode's actual
+                    // behavior, not Build's, so the mode indicator has to
+                    // flip to Auto here or the pill keeps showing "Plan"
+                    // while an autonomous run is already underway under it.
+                    state.agent_mode = AgentMode::Auto;
+                    if let Some(agent) = agent_slot.as_ref() {
+                        apply_agent_mode(agent, AgentMode::Auto);
+                    }
+                    state.push_info(format!("switched to Auto mode — running plan: {goal}"));
                     start_orchestrate_turn(
                         state,
                         agent_slot,
@@ -4918,7 +4928,7 @@ async fn run_app<B: Backend>(
                                     state.pending_plan_goal = None;
                                 } else if let Some(goal) = &state.pending_plan_goal {
                                     state.push_info(format!(
-                                        "plan ready for \"{goal}\" — press Enter now to run it, Esc to dismiss, or type a message to keep going instead"
+                                        "plan ready for \"{goal}\" — press Enter now to switch to Auto mode and run it, Esc to dismiss, or type a message to keep going instead"
                                     ));
                                 }
                             }

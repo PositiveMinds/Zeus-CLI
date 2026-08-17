@@ -52,6 +52,24 @@ fn map_reqwest_err(e: reqwest::Error) -> ProviderError {
     ProviderError::Transport(e.to_string())
 }
 
+/// The caller-supplied progress callback, shared across every concurrently
+/// running chunk task. `Arc<Mutex<..>>` rather than a channel — chunks call
+/// it directly and infrequently (once per completed chunk), so a shared lock
+/// is simpler than plumbing a channel + a separate aggregator task for the
+/// same effect.
+type ProgressCb = Arc<std::sync::Mutex<Box<dyn FnMut(u64, Option<u64>) + Send>>>;
+
+/// One chunk's byte range and where it's being written — grouped so
+/// `fetch_chunk` takes one value instead of four separate positional
+/// `u64`/`PathBuf` args that are easy to transpose by accident at the call
+/// site.
+struct ChunkSpec {
+    start: u64,
+    end: u64,
+    part_path: PathBuf,
+    total: u64,
+}
+
 /// Parse a `Content-Range` header like `bytes 0-1023/4096` into
 /// `(start, total)`, returning `None` for the unknown-total `bytes */N` form.
 fn parse_content_range(value: &str) -> Option<(u64, Option<u64>)> {
@@ -274,13 +292,16 @@ async fn fetch_chunk_attempt(
 async fn fetch_chunk(
     client: &reqwest::Client,
     url: &str,
-    start: u64,
-    end: u64,
-    part_path: PathBuf,
-    total: u64,
+    spec: ChunkSpec,
     done: Arc<AtomicU64>,
-    progress: Arc<std::sync::Mutex<Box<dyn FnMut(u64, Option<u64>) + Send>>>,
+    progress: ProgressCb,
 ) -> Result<()> {
+    let ChunkSpec {
+        start,
+        end,
+        part_path,
+        total,
+    } = spec;
     let want = end - start;
     for attempt in 0..MAX_ATTEMPTS {
         let have = tokio::fs::metadata(&part_path)
@@ -386,21 +407,24 @@ pub async fn download_asset(
             .map_err(|e| ProviderError::Api(format!("write parts meta: {e}")))?;
     }
 
-    let chunks = (total + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let chunks = total.div_ceil(CHUNK_SIZE);
     let done = Arc::new(AtomicU64::new(0));
-    let progress: Arc<std::sync::Mutex<Box<dyn FnMut(u64, Option<u64>) + Send>>> =
-        Arc::new(std::sync::Mutex::new(Box::new(on_progress)));
+    let progress: ProgressCb = Arc::new(std::sync::Mutex::new(Box::new(on_progress)));
 
     let mut tasks = Vec::new();
     for i in 0..chunks {
         let start = i * CHUNK_SIZE;
         let end = (start + CHUNK_SIZE).min(total);
-        let part = parts.join(format!("{i:04}"));
+        let part_path = parts.join(format!("{i:04}"));
         let done = done.clone();
         let progress = progress.clone();
-        tasks.push(fetch_chunk(
-            &client, url, start, end, part, total, done, progress,
-        ));
+        let spec = ChunkSpec {
+            start,
+            end,
+            part_path,
+            total,
+        };
+        tasks.push(fetch_chunk(&client, url, spec, done, progress));
     }
     futures::stream::iter(tasks)
         .buffer_unordered(MAX_PARALLEL)

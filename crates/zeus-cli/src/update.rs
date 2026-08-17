@@ -233,7 +233,7 @@ async fn self_update(version: &str) -> Result<()> {
     let url = format!(
         "https://github.com/{RELEASES_OWNER}/{RELEASES_REPO}/releases/download/v{version}/{asset}"
     );
-    let archive_path = tmp_dir.join(&asset);
+    let archive_path = tmp_dir.join(asset);
     let version_owned = version.to_owned();
     zeus_provider::download_asset(&url, &archive_path, move |done, total| {
         match total {

@@ -1614,7 +1614,7 @@ fn filter_platform_specs(
 ) -> Vec<ToolSpec> {
     specs
         .into_iter()
-        .filter(|s| platform_cli_for(&s.name).map_or(true, |cli| present.contains(cli)))
+        .filter(|s| platform_cli_for(&s.name).is_none_or(|cli| present.contains(cli)))
         .collect()
 }
 
