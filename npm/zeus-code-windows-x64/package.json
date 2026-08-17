@@ -1,6 +1,6 @@
 {
   "name": "zeus-code-windows-x64",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Prebuilt zeus binary for Windows x64 — an optional dependency of zeus-code, not meant to be installed directly.",
   "license": "MIT",
   "repository": {

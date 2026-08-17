@@ -51,7 +51,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tui_text::*;
 use zeus_agent::{
-    personas_by_department, Agent, AgentEvent, SessionStore, TurnResult,
+    personas_by_department, Agent, AgentEvent, BackgroundTaskRegistry, SessionStore, TurnResult,
 };
 use zeus_config::{Config, KeysFile};
 use zeus_fs::{ApprovalDecision, PermissionRequest};
@@ -117,6 +117,11 @@ enum UiEvent {
     /// release than `update::current_version()`. Carries the latest version
     /// string, shown as a small dim notice — never auto-installed.
     UpdateAvailable(String),
+    /// `/mouse on|off` — toggles the terminal's mouse-tracking mode itself
+    /// (not just how Zeus reacts to events), so `run_app`'s event loop is
+    /// the one that has to handle it: it owns `stdout` and is the only place
+    /// that can call `execute!(..., EnableMouseCapture/DisableMouseCapture)`.
+    SetMouseCapture(bool),
 }
 
 enum Mode {
@@ -317,6 +322,148 @@ fn apply_provider_picker_choice(
         state.cursor = 0;
         state.mode = Mode::KeyEntry { provider: name };
     }
+}
+
+/// A live background task's log can grow to megabytes — the transcript is
+/// one flattened `Text` re-wrapped on every keystroke (see
+/// `transcript_layout`), so dumping a whole log in would make every future
+/// render pay for it. `/bg output` tails instead, same principle as
+/// `code_refs`'s match cap.
+const BG_OUTPUT_TAIL_CHARS: usize = 4000;
+
+/// Keeps only the last `max` chars of `s`, with a note when it truncated —
+/// split out from `handle_bg_subcommand` so it's unit-testable without
+/// spawning a real background process.
+fn tail_chars(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let skip = total - max;
+    format!(
+        "[…truncated, showing the last {max} chars…]\n{}",
+        s.chars().skip(skip).collect::<String>()
+    )
+}
+
+/// Builds the background-task registry for the current project — the same
+/// `.agent/background` directory a separate `zeus bg <cmd>` shell invocation
+/// and `spawn_bg_orchestrate` use, so a task started from inside the TUI or
+/// from a separate terminal shows up identically either way.
+fn bg_registry(config: &Config) -> anyhow::Result<BackgroundTaskRegistry> {
+    let ws = crate::config::workspace(config)?;
+    Ok(BackgroundTaskRegistry::new(
+        ws.project_root.join(".agent/background"),
+    ))
+}
+
+/// `/bg list|output <id>|pause <id>|resume <id>|stop <id>`, handled directly
+/// inside the TUI. Every one of these used to just print a message telling
+/// the user to run a *separate* `zeus bg ...` shell command — a task spawned
+/// from inside a session had zero in-session visibility beyond that
+/// redirect, with no way to even check whether it was still running without
+/// leaving the TUI.
+fn handle_bg_subcommand(state: &mut AppState, config: &Config, sub: &str, id_arg: &str) {
+    let registry = match bg_registry(config) {
+        Ok(r) => r,
+        Err(e) => {
+            state.push_error(format!(
+                "couldn't reach the background task registry: {e:#}"
+            ));
+            return;
+        }
+    };
+    if sub == "list" {
+        match registry.list() {
+            Ok(tasks) if tasks.is_empty() => state.push_info("(no background tasks)"),
+            Ok(tasks) => {
+                let text = tasks
+                    .into_iter()
+                    .map(|(t, status)| {
+                        format!("{}  {status:?}  pid={}  {}", t.id, t.pid, t.command)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                state.push_info(text);
+            }
+            Err(e) => state.push_error(format!("couldn't list background tasks: {e}")),
+        }
+        return;
+    }
+    let Ok(id) = id_arg.parse::<u64>() else {
+        state.push_error(format!("usage: /bg {sub} <id>"));
+        return;
+    };
+    match sub {
+        "output" => {
+            let (stdout, stderr) = registry.output(id);
+            state.push_info(format!(
+                "--- stdout ---\n{}--- stderr ---\n{}",
+                tail_chars(&stdout, BG_OUTPUT_TAIL_CHARS),
+                tail_chars(&stderr, BG_OUTPUT_TAIL_CHARS)
+            ));
+        }
+        "stop" => match registry.stop(id) {
+            Ok(()) => state.push_info(format!("stopped background task {id}")),
+            Err(e) => state.push_error(format!("{e}")),
+        },
+        "pause" => match registry.pause(id) {
+            Ok(()) => state.push_info(format!("paused background task {id}")),
+            Err(e) => state.push_error(format!("{e}")),
+        },
+        "resume" => match registry.resume(id) {
+            Ok(()) => state.push_info(format!("resumed background task {id}")),
+            Err(e) => state.push_error(format!("{e}")),
+        },
+        _ => unreachable!("guarded by the caller's matches! on the same set of subcommands"),
+    }
+}
+
+/// Classifies a turn-failure error message so an auth or rate-limit failure
+/// points straight at the fix instead of leaving a raw provider error dumped
+/// with no next step — the pre-send "no provider connected yet" path already
+/// does this proactively (see `open_provider_picker`'s callers); this is the
+/// same idea applied after a turn actually fails.
+fn provider_trouble_hint(err_text: &str) -> Option<&'static str> {
+    let lower = err_text.to_lowercase();
+    let is_auth = lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("invalid_api_key")
+        || lower.contains("authentication");
+    let is_rate_limited = lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests");
+    if is_auth {
+        Some("this looks like an authentication failure — run /provider to check or update the key")
+    } else if is_rate_limited {
+        Some("this looks like a rate limit — run /provider to switch providers/models, or wait and retry")
+    } else {
+        None
+    }
+}
+
+/// TUI-only mouse/keyboard reference — `print_repl_help_lines` is shared
+/// with the plain (non-TUI) REPL, which has no mouse/click features at all,
+/// so this stays a separate block appended only by the TUI's own `/help`
+/// rather than folded into the shared list. Previously none of this was
+/// documented anywhere in-app — the bottom hint row is the only other place
+/// any of it surfaces, and it drops entries on a narrow terminal.
+fn tui_mouse_and_keys_help() -> String {
+    [
+        "Mouse & keyboard (TUI only):",
+        "  click                 select a transcript block",
+        "  shift+click / drag    extend the selection",
+        "  ctrl+c / ctrl+y       copy the selection (or the last reply if none)",
+        "  ctrl+f                find in the transcript",
+        "  ctrl+p                open the command palette (seeds \"/\")",
+        "  tab                   cycle agent mode (build/plan/auto)",
+        "  esc                   cancel a turn, clear input/selection, or close a picker",
+        "  alt+1 / alt+2 / alt+3 fill an example chip (empty-state screen only)",
+        "  /mouse off            disable mouse capture for native terminal text selection",
+    ]
+    .join("\n")
 }
 
 /// Opens the `/provider` picker popup — shared by the `/provider` command
@@ -644,11 +791,14 @@ struct AppState {
     /// same pattern as `model_picker_area`/`provider_picker_area`.
     session_picker_area: Option<Rect>,
     /// In-flight tool calls: id → (start time, path touched if this is a
-    /// mutating file op). Populated on `ToolCallStarted`, drained on
-    /// `ToolCallFinished` to compute a duration and, on success, feed
-    /// `files_touched` — `AgentEvent::ToolCallFinished` carries no
-    /// arguments of its own, so the path has to be captured up front.
-    tool_call_meta: std::collections::HashMap<String, (std::time::Instant, Option<String>)>,
+    /// mutating file op, tool name). Populated on `ToolCallStarted`, drained
+    /// on `ToolCallFinished` to compute a duration and, on success, feed
+    /// `files_touched` — `AgentEvent::ToolCallFinished` carries no arguments
+    /// of its own, so the path has to be captured up front. The name is kept
+    /// too so the busy spinner can say "running bash…" instead of a generic
+    /// "thinking…" that looks identical whether the model is generating or a
+    /// tool is mid-run (see `running_tool_name`).
+    tool_call_meta: std::collections::HashMap<String, (std::time::Instant, Option<String>, String)>,
     /// Start time of the currently-active orchestrated plan step, keyed by
     /// its description (same key `PlanStepStarted`/`PlanStepDone` already
     /// use to find the matching `TodoItem`) — lets `PlanStepDone` report how
@@ -667,6 +817,16 @@ struct AppState {
     /// The block where a mouse press started, so drag / shift-click extends
     /// the selection from a fixed end instead of replacing it.
     selection_anchor: Option<usize>,
+    /// Whether the terminal's own mouse-tracking mode is currently on.
+    /// Zeus's click-to-select/scroll/chip-click all depend on it, but the
+    /// same shift-click/drag Zeus uses to extend a block selection is also
+    /// the conventional escape hatch many terminal emulators use to bypass
+    /// an app's mouse capture for *native* OS text selection — since Zeus
+    /// claims that convention for its own selection instead, `/mouse off`
+    /// (see the slash-command handler) is the actual way out: it disables
+    /// mouse-tracking mode at the terminal level via `UiEvent::SetMouseCapture`
+    /// so the terminal emulator's native click-drag selection works again.
+    mouse_capture_enabled: bool,
 }
 
 /// Transcript search — an overlay on top of `Mode::Chat`, not a `Mode`
@@ -761,6 +921,7 @@ impl AppState {
             files_touched: Vec::new(),
             selection: None,
             selection_anchor: None,
+            mouse_capture_enabled: true,
         };
         state
     }
@@ -854,7 +1015,7 @@ impl AppState {
                 self.flush_current_reply();
                 let path = touched_path(&name, &arguments);
                 self.tool_call_meta
-                    .insert(id, (std::time::Instant::now(), path));
+                    .insert(id, (std::time::Instant::now(), path, name.clone()));
                 self.transcript
                     .push(Block_::new(Role::Tool, format!("{name} {arguments}")));
             }
@@ -866,7 +1027,7 @@ impl AppState {
             } => {
                 self.flush_current_reply();
                 let (elapsed, path) = match self.tool_call_meta.remove(&id) {
-                    Some((start, path)) => (Some(start.elapsed()), path),
+                    Some((start, path, _name)) => (Some(start.elapsed()), path),
                     None => (None, None),
                 };
                 let role = if is_error {
@@ -1320,22 +1481,67 @@ fn copy_last_response(state: &mut AppState) {
     }
 }
 
+/// If `text` contains exactly one fenced code block (```` ```lang\n...\n``` ````
+/// or ```` ```\n...\n``` ````), its body with the fence markers and language
+/// tag stripped — `None` when there are zero or two-or-more fences. With two
+/// or more, which one the user actually meant is a guess this shouldn't make
+/// silently, so it falls back to the whole block. Used by `copy_selection`
+/// so copying a single reply that's mostly one code snippet grabs just the
+/// snippet instead of the prose + fence markers around it — there was
+/// previously no way to get just the code out of a long reply short of
+/// retyping it.
+fn single_fenced_code_block(text: &str) -> Option<&str> {
+    let mut fences = text.match_indices("```").map(|(i, _)| i);
+    let open = fences.next()?;
+    let close = fences.next()?;
+    if fences.next().is_some() {
+        return None;
+    }
+    let after_open = open + 3;
+    // The first newline after the opening fence ends its (optional)
+    // language-tag line, e.g. "```rust\n" — the body starts right after it.
+    let body_start = after_open + text[after_open..close].find('\n')? + 1;
+    Some(text[body_start..close].trim_end_matches('\n'))
+}
+
+/// What `copy_selection` would put on the clipboard for the current
+/// selection, and whether that's a code-only extraction rather than the
+/// whole selected text — split out (same reasoning as `selection_plain_text`)
+/// so the decision is unit-testable without touching the system clipboard,
+/// which can genuinely fail in a headless/SSH session with no display server.
+fn selection_copy_payload(
+    transcript: &[Block_],
+    selection: Option<(usize, usize)>,
+) -> Option<(String, bool)> {
+    let text = selection_plain_text(transcript, selection)?;
+    let single_block = matches!(selection, Some((a, b)) if a == b);
+    match single_block.then(|| single_fenced_code_block(&text)).flatten() {
+        Some(code) => Some((code.to_string(), true)),
+        None => Some((text, false)),
+    }
+}
+
 /// Copy the currently selected transcript blocks (inclusive `selection`
-/// range) as one joined text blob. Clears the selection once copied, since
-/// the highlight's job — pointing at the blocks to copy — is done.
+/// range) as one joined text blob — or, when exactly one block is selected
+/// and it contains exactly one unambiguous fenced code block, just that
+/// snippet (see `single_fenced_code_block`/`selection_copy_payload`). Clears
+/// the selection once copied, since the highlight's job — pointing at what
+/// to copy — is done.
 fn copy_selection(state: &mut AppState) {
-    let Some(text) = selection_plain_text(&state.transcript, state.selection) else {
+    let Some((to_copy, is_code_only)) = selection_copy_payload(&state.transcript, state.selection)
+    else {
         return;
     };
-    let count = text.chars().count();
+    let count = to_copy.chars().count();
     let len = state
         .selection
         .map(|(a, b)| b.saturating_sub(a) + 1)
         .unwrap_or(0);
-    match super::clipboard::copy(&text) {
+    match super::clipboard::copy(&to_copy) {
         Ok(()) => {
+            let suffix = if is_code_only { " (code block only)" } else { "" };
             state.push_info(format!(
-                "copied {count} char(s) from {len} block(s) to clipboard"
+                "copied {count} char(s) from {len} block(s) to clipboard{suffix}"
             ));
             state.selection = None;
             state.selection_anchor = None;
@@ -1370,9 +1576,9 @@ fn selection_plain_text(
 }
 
 /// Map a mouse position over the transcript back to the block under it, in
-/// the same wrapped-row space `transcript_block_rows` / `transcript_text`
-/// render and `transcript_applied_scroll` scrolls in. `None` when the click
-/// is outside the transcript pane or over the separator gap between blocks.
+/// the same wrapped-row space `transcript_layout` renders and
+/// `transcript_applied_scroll` scrolls in. `None` when the click is outside
+/// the transcript pane or over the separator gap between blocks.
 fn transcript_block_at(
     col: u16,
     row: u16,
@@ -1484,9 +1690,13 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
         // on newlines exactly like the empty-state composer already does.
         Text::from(state.input.clone())
     } else if state.busy {
+        let doing = match running_tool_name(state) {
+            Some(name) => format!("running {name}"),
+            None => "zeus is working".to_string(),
+        };
         Text::from(Line::from(Span::styled(
             format!(
-                "{} zeus is working… (you can type the next message)",
+                "{} {doing}… (you can type the next message)",
                 spinner_glyph(state)
             ),
             placeholder_style(),
@@ -1617,28 +1827,64 @@ fn spinner_frames() -> &'static [char] {
 
 fn spinner_glyph(state: &AppState) -> char {
     let frames = spinner_frames();
+    if theme::reduced_motion() {
+        return frames[0];
+    }
     frames[(state.started.elapsed().as_millis() / 100) as usize % frames.len()]
 }
 
-fn transcript_text(state: &AppState, width: u16) -> Text<'static> {
+/// Name of the most recently started in-flight tool call, if any — lets the
+/// busy spinner distinguish "a tool is actually running" from "the model is
+/// still generating," which previously both rendered as the same generic
+/// "thinking…" with no way to tell a long shell command from normal latency.
+fn running_tool_name(state: &AppState) -> Option<&str> {
+    state
+        .tool_call_meta
+        .values()
+        .max_by_key(|(start, _, _)| *start)
+        .map(|(_, _, name)| name.as_str())
+}
+
+/// Builds the transcript's flattened `Text` and the wrapped-row `[start,
+/// end)` range for each block together, in one pass — these used to be two
+/// separate functions (`transcript_text` and `transcript_block_rows`) each
+/// independently calling `Block_::to_lines(width)` per block, so every
+/// render (i.e. every keystroke) redid that work — a real syntax-highlight/
+/// wrap pass, not free — twice for identical output (`to_lines` is a pure
+/// function of `(block, width)`). Sharing the one `to_lines` call here cuts
+/// that duplication; the per-block `Paragraph::line_count` pass right after
+/// it is a different, still-necessary wrap — a bubble line's raw `to_lines`
+/// output can still be wider than `width` and wrap further inside the real
+/// `Paragraph` (the same reason the whole-text scroll-math `line_count` call
+/// in `render_chat_column` exists), and click-to-select needs those actual
+/// wrapped ranges, not the pre-wrap line count, to map a click back to the
+/// right block.
+fn transcript_layout(state: &AppState, width: u16) -> (Text<'static>, Vec<(u16, u16)>) {
     let selection = state.selection;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut block_rows = Vec::with_capacity(state.transcript.len());
+    let mut row: u16 = 0;
     for (i, block) in state.transcript.iter().enumerate() {
+        let block_lines = block.to_lines(width);
+        let wrapped = Paragraph::new(Text::from(block_lines.clone())).line_count(width) as u16;
+        block_rows.push((row, row + wrapped));
+        row += wrapped + 1; // +1 for the blank separator line after each block
+
         let selected = selection.is_some_and(|(a, b)| i >= a && i <= b);
         if selected {
-            lines.extend(block.to_lines(width).into_iter().map(style_selected));
+            lines.extend(block_lines.into_iter().map(style_selected));
             // Solid fill under the whole selected run so the highlight reads
             // as one contiguous bar across block boundaries (the blank
             // separator row between messages gets the same background). This
-            // is still exactly one row, so `transcript_block_rows`'s
-            // `wrapped + 1` math stays valid and click/scroll mapping
-            // doesn't drift when a selection is active.
+            // is still exactly one row, so the `wrapped + 1` math above
+            // stays valid and click/scroll mapping doesn't drift when a
+            // selection is active.
             lines.push(Line::from(vec![Span::styled(
                 " ".repeat(width as usize),
                 Style::default().bg(theme::selected_bg()),
             )]));
         } else {
-            lines.extend(block.to_lines(width));
+            lines.extend(block_lines);
             lines.push(Line::from(""));
         }
     }
@@ -1646,17 +1892,21 @@ fn transcript_text(state: &AppState, width: u16) -> Text<'static> {
         let streaming = Block_::new(Role::Assistant, state.current_reply.clone());
         lines.extend(streaming.to_lines(width));
     } else if state.busy {
+        let label = match running_tool_name(state) {
+            Some(name) => format!("running {name}…"),
+            None => "thinking…".to_string(),
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{} ", spinner_glyph(state)),
                 theme::violet().add_modifier(Modifier::BOLD),
             ),
-            Span::styled("thinking…", theme::dim()),
+            Span::styled(label, theme::dim()),
         ]));
     }
     // `state.transcript.is_empty() && !state.busy` never reaches here — that
     // case renders `render_empty_state` instead of the chat column at all.
-    Text::from(lines)
+    (Text::from(lines), block_rows)
 }
 
 /// Re-style a transcript line so every span carries the selection
@@ -1671,24 +1921,6 @@ fn style_selected(line: Line<'static>) -> Line<'static> {
             .map(|s| Span::styled(s.content, s.style.bg(theme::selected_bg())))
             .collect::<Vec<_>>(),
     )
-}
-
-/// Wrapped-row `[start, end)` range for each transcript block, in the same
-/// coordinate space `transcript_text`'s `Paragraph` renders/scrolls in (its
-/// wrapped `line_count`, not each block's raw pre-wrap `Vec<Line>` length —
-/// a long or wide highlighted line can wrap further inside the `Paragraph`
-/// than `Block_::to_lines` alone produced, the same reason the auto-scroll
-/// math below already uses `line_count` over a raw count). Used to map a
-/// mouse click back to "which message did they click on" for click-to-copy.
-fn transcript_block_rows(state: &AppState, width: u16) -> Vec<(u16, u16)> {
-    let mut out = Vec::with_capacity(state.transcript.len());
-    let mut row: u16 = 0;
-    for block in &state.transcript {
-        let wrapped = Paragraph::new(Text::from(block.to_lines(width))).line_count(width) as u16;
-        out.push((row, row + wrapped));
-        row += wrapped + 1; // +1 for the blank separator line after each block
-    }
-    out
 }
 
 /// Transcript search bar — a small floating box in the top-right corner of
@@ -1829,7 +2061,7 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     ])
     .split(area);
 
-    let text = transcript_text(state, rows[0].width);
+    let (text, block_rows) = transcript_layout(state, rows[0].width);
     let visible = rows[0].height;
     let para = Paragraph::new(text).wrap(Wrap { trim: false });
     // `Paragraph::scroll` counts rows *after* `Wrap` has reflowed the text
@@ -1860,7 +2092,7 @@ fn render_chat_column(f: &mut Frame, area: Rect, state: &mut AppState) {
     f.render_widget(para, rows[0]);
     state.transcript_area = Some(rows[0]);
     state.transcript_applied_scroll = scroll;
-    state.transcript_block_rows = transcript_block_rows(state, rows[0].width);
+    state.transcript_block_rows = block_rows;
 
     render_input_box(f, rows[2], state, input_text_h);
     render_hints(f, rows[3], state);
@@ -2346,7 +2578,13 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     // below invited a task that would only fail with an error after Enter,
     // instead of pointing straight at `/model`/`/provider` up front.
     let ready = provider_status_ok(config, &state.provider);
-    let pulse = 0.5 + 0.5 * (t_ms * 0.0024).sin();
+    // Reduced-motion: skip the sine pulse and hold the dot steady-bright,
+    // same principle as `spinner_glyph` freezing on its first frame.
+    let pulse = if theme::reduced_motion() {
+        1.0
+    } else {
+        0.5 + 0.5 * (t_ms * 0.0024).sin()
+    };
     let dot_color = if ready {
         theme::teal_color()
     } else {
@@ -2497,7 +2735,7 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     y += CHIPS_H + GAP;
 
     // Hint row.
-    let hint = "Enter to start  ·  Esc to clear";
+    let hint = "Enter to start  ·  Esc to clear  ·  alt+1/2/3 for a chip";
     let hint_area = centered_row(area, y, HINT_H, hint.chars().count() as u16 + 2);
     opaque(f, hint_area);
     f.render_widget(
@@ -2517,8 +2755,44 @@ fn render_empty_state(f: &mut Frame, area: Rect, state: &mut AppState, config: &
     });
 }
 
+/// Floor below which the normal layout (topbar + chat column + composer, or
+/// the empty-state splash) has no room left to be legible. Below this, every
+/// downstream `Constraint`/`saturating_sub` degrades to zero-size boxes
+/// rather than panicking, but the result is silent blank space with no clue
+/// why — a friendly "resize" notice is a lot more useful than that.
+const MIN_TERMINAL_W: u16 = 34;
+const MIN_TERMINAL_H: u16 = 8;
+
+fn render_too_small(f: &mut Frame, area: Rect) {
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::void())),
+        area,
+    );
+    if area.height == 0 {
+        return;
+    }
+    let msg = format!("terminal too small — resize to at least {MIN_TERMINAL_W}x{MIN_TERMINAL_H}");
+    let row = Rect {
+        x: area.x,
+        y: area.y + area.height / 2,
+        width: area.width,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(msg, theme::muted())))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        row,
+    );
+}
+
 fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
     let area = f.area();
+
+    if area.width < MIN_TERMINAL_W || area.height < MIN_TERMINAL_H {
+        render_too_small(f, area);
+        return;
+    }
 
     if state.showing_empty_state() {
         render_empty_state(f, area, state, config);
@@ -3299,6 +3573,26 @@ async fn handle_key(
         return Ok(());
     }
 
+    // Empty-state example chips: Alt+1/2/3 fill the composer the same way a
+    // mouse click on a chip does. The chips were otherwise mouse-only, with
+    // no way to use them over SSH/tmux without a mouse. Alt (not a bare
+    // digit) so it can't be confused with actually typing "1" as input.
+    if state.showing_empty_state() && key.modifiers.contains(KeyModifiers::ALT) {
+        let idx = match key.code {
+            KeyCode::Char('1') => Some(0),
+            KeyCode::Char('2') => Some(1),
+            KeyCode::Char('3') => Some(2),
+            _ => None,
+        };
+        if let Some(idx) = idx {
+            if let Some(label) = EXAMPLE_CHIPS.get(idx) {
+                state.input = label.to_string();
+                state.cursor = char_count(&state.input);
+            }
+            return Ok(());
+        }
+    }
+
     // ESC acts as the universal pause/cancel: during an in-flight turn it
     // stops the agent loop and any running bash tool (same path as Ctrl-C);
     // at idle it clears the current input instead of accidental quit.
@@ -3460,7 +3754,10 @@ async fn handle_key(
                 let cmd = parts.next().unwrap_or("");
                 let arg = parts.next().unwrap_or("").trim();
                 match cmd {
-                    "help" => state.push_info(print_repl_help_lines()),
+                    "help" => {
+                        state.push_info(print_repl_help_lines());
+                        state.push_info(tui_mouse_and_keys_help());
+                    }
                     "clear" => {
                         let agent = build_agent_repl_with(
                             config,
@@ -3632,6 +3929,33 @@ async fn handle_key(
                             _ => state.push_error(
                                 "usage: /settings [reduced_motion on|off] [notify on|off] [accent <#hex>|reset]",
                             ),
+                        }
+                    }
+                    "mouse" => {
+                        // Zeus's own click-select/drag-extend claims the
+                        // shift-click/drag gesture many terminal emulators
+                        // reserve as the bypass for native OS text
+                        // selection. `/mouse off` is the actual way out —
+                        // it disables mouse-tracking mode at the terminal
+                        // level (not just inside Zeus), so a normal
+                        // click-drag selects text the terminal's own way;
+                        // `/mouse on` restores click-to-select/scroll/chips.
+                        match arg.trim() {
+                            "off" => {
+                                let _ = ui_tx.send(UiEvent::SetMouseCapture(false));
+                                state.push_info(
+                                    "mouse capture off — your terminal's native click-drag text selection works now; /mouse on to restore Zeus's click/scroll/chip handling",
+                                );
+                            }
+                            "on" => {
+                                let _ = ui_tx.send(UiEvent::SetMouseCapture(true));
+                                state.push_info("mouse capture on");
+                            }
+                            "" => state.push_info(format!(
+                                "mouse capture: {}",
+                                if state.mouse_capture_enabled { "on" } else { "off" }
+                            )),
+                            _ => state.push_error("usage: /mouse [on|off]"),
                         }
                     }
                     "theme" => {
@@ -3898,21 +4222,30 @@ async fn handle_key(
                         }
                     }
                     "bg" => {
-                        let mut parts = arg.splitn(2, char::is_whitespace);
-                        let rest = parts.next().unwrap_or("").trim();
-                        if rest.is_empty() {
+                        // `first_word` alone decides which of list/output/
+                        // stop/pause/resume/spawn this is; `sub_arg` (the
+                        // id, for the management subcommands) is everything
+                        // after that first word. Spawning uses the *full*
+                        // trimmed `arg`, not `first_word` — a goal almost
+                        // always has more than one word ("build a login
+                        // page"), and taking only the first word here used
+                        // to silently spawn an orchestration for just
+                        // "build", discarding the rest of the goal.
+                        let full_arg = arg.trim();
+                        let mut parts = full_arg.splitn(2, char::is_whitespace);
+                        let first_word = parts.next().unwrap_or("");
+                        let sub_arg = parts.next().unwrap_or("").trim();
+                        if full_arg.is_empty() {
                             state.push_error(
-                                "usage: /bg <goal> — run an orchestrated plan in the background"
+                                "usage: /bg <goal> — run an orchestrated plan in the background, or /bg list | output <id> | pause <id> | resume <id> | stop <id>"
                                     .to_string(),
                             );
-                        } else if matches!(rest, "list" | "output" | "stop" | "pause" | "resume") {
-                            state.push_info(
-                                "manage background tasks with the `zeus bg` subcommand: zeus bg list · zeus bg output <id> · zeus bg pause <id> · zeus bg resume <id> · zeus bg stop <id>".to_string(),
-                            );
+                        } else if matches!(first_word, "list" | "output" | "stop" | "pause" | "resume") {
+                            handle_bg_subcommand(state, config, first_word, sub_arg);
                         } else {
-                            let (goal, workflow) = match rest.rsplit_once("@@workflow:") {
+                            let (goal, workflow) = match full_arg.rsplit_once("@@workflow:") {
                                 Some((g, name)) => (g.trim(), Some(name.trim())),
-                                None => (rest, None),
+                                None => (full_arg, None),
                             };
                             match crate::spawn_bg_orchestrate(config, goal, workflow, None) {
                                 Ok(id) => {
@@ -3920,7 +4253,7 @@ async fn handle_key(
                                         "● background orchestration started id={id}"
                                     ));
                                     state.push_info(format!(
-                                        "follow: zeus bg output {id}   |   stop: zeus bg stop {id}"
+                                        "/bg output {id} to check progress   |   /bg stop {id} to cancel"
                                     ));
                                 }
                                 Err(e) => {
@@ -4506,6 +4839,20 @@ async fn run_app<B: Backend>(
                     UiEvent::UpdateAvailable(latest) => {
                         state.update_available = Some(latest);
                     }
+                    UiEvent::SetMouseCapture(on) => {
+                        let mut stdout = io::stdout();
+                        let toggled = if on {
+                            execute!(stdout, EnableMouseCapture)
+                        } else {
+                            execute!(stdout, DisableMouseCapture)
+                        };
+                        match toggled {
+                            Ok(()) => state.mouse_capture_enabled = on,
+                            Err(e) => state.push_error(format!(
+                                "couldn't change mouse capture: {e}"
+                            )),
+                        }
+                    }
                 }
             }
             res = async { turn_handle.as_mut().unwrap().await }, if turn_handle.is_some() => {
@@ -4577,7 +4924,11 @@ async fn run_app<B: Backend>(
                             }
                             Err(e) => {
                                 state.pending_plan_goal = None;
-                                state.push_error(format!("turn failed: {e:#}"));
+                                let msg = format!("{e:#}");
+                                if let Some(hint) = provider_trouble_hint(&msg) {
+                                    state.push_info(hint);
+                                }
+                                state.push_error(format!("turn failed: {msg}"));
                             }
                         }
                     }
@@ -4614,8 +4965,12 @@ async fn run_app<B: Backend>(
 /// Whether the animated tick's redraw is worth paying for right now — the
 /// empty-state splash's pulsing status dot and the busy spinner are the
 /// only things that change without a user/agent event driving a redraw.
+/// Reduced-motion freezes both to a single static frame (`spinner_glyph`,
+/// the empty-state pulse above), so there's nothing left to animate and the
+/// tick would just burn CPU re-painting an unchanged frame.
 fn wants_animation(state: &AppState) -> bool {
-    state.showing_empty_state() || state.busy || state.fetching_providers
+    !theme::reduced_motion()
+        && (state.showing_empty_state() || state.busy || state.fetching_providers)
 }
 
 /// Current git branch for the side-panel footer. Best-effort — any failure
@@ -4729,6 +5084,27 @@ mod tests {
         let terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let guard = TerminalGuard { terminal };
         drop(guard);
+    }
+
+    #[test]
+    fn provider_trouble_hint_classifies_auth_and_rate_limit_errors() {
+        assert!(provider_trouble_hint("HTTP 401 Unauthorized").is_some());
+        assert!(provider_trouble_hint("error: invalid_api_key provided").is_some());
+        assert!(provider_trouble_hint("429 Too Many Requests").is_some());
+        assert!(provider_trouble_hint("rate limit exceeded, try again later").is_some());
+        assert!(provider_trouble_hint("connection reset by peer").is_none());
+        assert!(provider_trouble_hint("tool 'bash' exited with status 1").is_none());
+    }
+
+    #[test]
+    fn too_small_terminal_does_not_panic_at_any_size() {
+        for (w, h) in [(0u16, 0u16), (1, 1), (10, 3), (33, 7), (34, 8)] {
+            let backend = ratatui::backend::TestBackend::new(w.max(1), h.max(1));
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| render_too_small(f, f.area()))
+                .unwrap();
+        }
     }
 
     #[test]
@@ -4858,6 +5234,62 @@ mod tests {
         assert_eq!(selection_plain_text(&transcript, None), None);
         // Empty range (start beyond transcript) yields nothing.
         assert_eq!(selection_plain_text(&transcript, Some((10, 12))), None);
+    }
+
+    #[test]
+    fn single_fenced_code_block_extracts_the_one_snippet() {
+        let text = "here's the fix:\n\n```rust\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n```\n\nlet me know if that works.";
+        assert_eq!(
+            single_fenced_code_block(text).unwrap(),
+            "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}"
+        );
+    }
+
+    #[test]
+    fn single_fenced_code_block_handles_no_language_tag() {
+        let text = "```\nplain snippet\n```";
+        assert_eq!(single_fenced_code_block(text).unwrap(), "plain snippet");
+    }
+
+    #[test]
+    fn single_fenced_code_block_none_when_zero_or_multiple_fences() {
+        assert_eq!(single_fenced_code_block("just prose, no code"), None);
+        let two = "```rust\nfn a() {}\n```\nand also\n```rust\nfn b() {}\n```";
+        assert_eq!(single_fenced_code_block(two), None);
+    }
+
+    #[test]
+    fn selection_copy_payload_prefers_the_single_code_block_when_unambiguous() {
+        let text = "explanation\n\n```py\nprint('hi')\n```\n\nmore text";
+        let transcript = vec![Block_::new(Role::Assistant, text.to_string())];
+        let (copied, is_code_only) =
+            selection_copy_payload(&transcript, Some((0, 0))).unwrap();
+        assert!(is_code_only);
+        assert_eq!(copied, "print('hi')");
+    }
+
+    #[test]
+    fn selection_copy_payload_falls_back_to_whole_block_with_multiple_code_blocks() {
+        let text = "```py\nprint(1)\n```\n```py\nprint(2)\n```";
+        let transcript = vec![Block_::new(Role::Assistant, text.to_string())];
+        let (copied, is_code_only) =
+            selection_copy_payload(&transcript, Some((0, 0))).unwrap();
+        assert!(!is_code_only);
+        assert_eq!(copied, text);
+    }
+
+    #[test]
+    fn selection_copy_payload_never_extracts_code_across_multiple_selected_blocks() {
+        // Two blocks, each with its own single code fence: joined together
+        // that reads as two fences, so the ambiguity guard must still apply
+        // even though each individual block was unambiguous on its own.
+        let transcript = vec![
+            Block_::new(Role::Assistant, "```py\nprint(1)\n```".to_string()),
+            Block_::new(Role::Assistant, "```py\nprint(2)\n```".to_string()),
+        ];
+        let (_copied, is_code_only) =
+            selection_copy_payload(&transcript, Some((0, 1))).unwrap();
+        assert!(!is_code_only);
     }
 
     #[test]
@@ -5048,6 +5480,49 @@ mod tests {
         let narrow_text = join(&narrow);
         assert!(narrow_text.starts_with("tab agents"));
         assert!(!narrow_text.contains("esc close"));
+    }
+
+    #[test]
+    fn bg_subcommand_list_reports_none_on_a_fresh_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, config) = test_app_state(tmp.path());
+        handle_bg_subcommand(&mut state, &config, "list", "");
+        let last = state.transcript.last().unwrap();
+        assert_eq!(last.plain_text(), "(no background tasks)");
+    }
+
+    #[test]
+    fn bg_subcommand_rejects_a_non_numeric_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, config) = test_app_state(tmp.path());
+        handle_bg_subcommand(&mut state, &config, "output", "not-a-number");
+        let last = state.transcript.last().unwrap();
+        assert!(matches!(last.role, Role::Error));
+        assert!(last.plain_text().contains("usage: /bg output <id>"));
+    }
+
+    #[test]
+    fn bg_subcommand_stop_on_unknown_id_reports_an_error_not_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, config) = test_app_state(tmp.path());
+        handle_bg_subcommand(&mut state, &config, "stop", "999999");
+        let last = state.transcript.last().unwrap();
+        assert!(matches!(last.role, Role::Error));
+    }
+
+    #[test]
+    fn tail_chars_passes_short_strings_through_unchanged() {
+        assert_eq!(tail_chars("hello", 10), "hello");
+        assert_eq!(tail_chars("", 10), "");
+    }
+
+    #[test]
+    fn tail_chars_truncates_and_keeps_only_the_end() {
+        let long = "a".repeat(50) + "TAIL";
+        let out = tail_chars(&long, 4);
+        assert!(out.ends_with("TAIL"));
+        assert!(out.contains("truncated"));
+        assert!(!out.contains(&"a".repeat(50)));
     }
 
     /// The diff modal used to panic with `clamp(10, max_h)` whenever the

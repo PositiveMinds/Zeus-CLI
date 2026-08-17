@@ -325,9 +325,29 @@ pub fn init_runtime(
     }
     REDUCED_MOTION.store(reduced_motion, Ordering::Relaxed);
     NOTIFY_ON_COMPLETION.store(notify_on_completion, Ordering::Relaxed);
-    if let Some(kind) = theme.and_then(ThemeKind::from_label) {
+    let resolved = theme
+        .and_then(ThemeKind::from_label)
+        .or_else(|| no_color_fallback_theme(theme, std::env::var_os("NO_COLOR").is_some()));
+    if let Some(kind) = resolved {
         set_theme(kind);
     }
+}
+
+/// Pure decision behind NO_COLOR's fallback theme choice, factored out so
+/// it's unit-testable without mutating the real process environment (tests
+/// run in parallel in one process, so poking `std::env::set_var` from a test
+/// would be flaky). Previously `NO_COLOR` had zero effect on the ratatui TUI
+/// — only the plain-REPL fallback in `ui.rs` honored it — so a session with
+/// it set still got the full RGB `Dark` palette unless the user manually ran
+/// `/theme high-contrast`. This isn't a true monochrome mode (the presets
+/// are still RGB, just higher-contrast), but it at least gives the
+/// convention *some* effect here instead of none, without overriding a
+/// theme the user picked on purpose via config or `/theme`.
+fn no_color_fallback_theme(explicit: Option<&str>, no_color_set: bool) -> Option<ThemeKind> {
+    if explicit.is_some() {
+        return None;
+    }
+    no_color_set.then_some(ThemeKind::HighContrast)
 }
 
 fn parse_hex_color(s: &str) -> Option<Color> {
@@ -472,6 +492,17 @@ mod tests {
         // Restore the default so other tests see a clean slate.
         set_theme(ThemeKind::Dark);
         assert_eq!(current_theme(), ThemeKind::Dark);
+    }
+
+    #[test]
+    fn no_color_fallback_only_applies_when_nothing_was_chosen_explicitly() {
+        assert_eq!(
+            no_color_fallback_theme(None, true),
+            Some(ThemeKind::HighContrast)
+        );
+        assert_eq!(no_color_fallback_theme(None, false), None);
+        assert_eq!(no_color_fallback_theme(Some("dark"), true), None);
+        assert_eq!(no_color_fallback_theme(Some("bogus"), true), None);
     }
 
     #[test]

@@ -1569,6 +1569,10 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     ("theme", "switch color theme: dark, light, or high-contrast"),
     (
+        "mouse",
+        "TUI only: /mouse off disables mouse capture so your terminal's native click-drag text selection works; /mouse on restores click/scroll/chips",
+    ),
+    (
         "model",
         "switch model (opens a picker), or /model <name> directly",
     ),
@@ -1610,7 +1614,7 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "bg",
-        "run the workforce in the background (/bg <goal>); manage with `zeus bg ...`",
+        "run the workforce in the background (/bg <goal>); /bg list|output <id>|pause <id>|resume <id>|stop <id> to manage (TUI: in-session; plain REPL: via `zeus bg ...`)",
     ),
     ("session", "show the current session id"),
     (
@@ -2095,6 +2099,9 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                 "provider" => handle_provider_slash(arg, config, &mut agent).await,
                 "settings" => handle_settings_slash(arg, config),
                 "theme" => handle_theme_slash(arg, config),
+                "mouse" => println!(
+                    "mouse capture toggling only applies to the interactive TUI — this plain REPL session never enables it"
+                ),
                 "session" => println!("session={}", agent.session_id()),
                 "sessions" => match render_sessions(config) {
                     Ok(text) => println!("{text}"),
@@ -2270,19 +2277,28 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     // /bg <goal> [--workflow <name>] — run the workforce in the
                     // background: detach a headless `agent --auto` run so you
                     // keep your prompt while it plans, executes, and reviews.
-                    let mut parts = arg.splitn(2, char::is_whitespace);
-                    let rest = parts.next().unwrap_or("").trim();
-                    if rest.is_empty() {
+                    //
+                    // Only the *first word* of `arg` decides which case this
+                    // is (a bare "list"/"output"/"stop", vs. an actual goal);
+                    // the goal itself must come from the full trimmed `arg`,
+                    // not that first word alone — `splitn(2, ...).next()`
+                    // used to be used for both, which silently spawned an
+                    // orchestration for just "build" out of "build a login
+                    // page", discarding the rest of the goal.
+                    let full_arg = arg.trim();
+                    let mut parts = full_arg.splitn(2, char::is_whitespace);
+                    let first_word = parts.next().unwrap_or("");
+                    if full_arg.is_empty() {
                         eprintln!("usage: /bg <goal> — run an orchestrated plan in the background");
                         eprintln!("  /bg list | output <id> | stop <id>  manage background tasks");
                         eprintln!("  append `@@workflow:<name>` to run a named workflow");
-                    } else if matches!(rest, "list" | "output" | "stop") {
+                    } else if matches!(first_word, "list" | "output" | "stop") {
                         eprintln!("  for background tasks use the `zeus bg ...` subcommand:");
                         eprintln!("  zeus bg list · zeus bg output <id> · zeus bg stop <id>");
                     } else {
-                        let (goal, workflow) = match rest.rsplit_once("@@workflow:") {
+                        let (goal, workflow) = match full_arg.rsplit_once("@@workflow:") {
                             Some((g, name)) => (g.trim(), Some(name.trim())),
-                            None => (rest, None),
+                            None => (full_arg, None),
                         };
                         match spawn_bg_orchestrate(config, goal, workflow, None) {
                             Ok(id) => {
