@@ -21,7 +21,7 @@ use std::path::Path;
 use tree_sitter::{Language, Node, Parser};
 use tree_sitter_language::LanguageFn;
 
-use crate::codeint::Symbol;
+use crate::codeint::{CallEdge, Symbol};
 
 /// Which field carries the identifier for a symbol node.
 fn field_name<'t>(node: &Node<'t>) -> Option<Node<'t>> {
@@ -206,8 +206,117 @@ fn map_ruby(node: &Node, src: &[u8]) -> Option<(String, String)> {
     }
 }
 
+/// If `node` is a call expression in this language, the identifier of the
+/// thing being called — the last segment for a method/member call (`obj.foo()`
+/// or `Foo::bar()` both yield `"foo"`/`"bar"`), so callers/callees line up
+/// with the plain-identifier names the rest of the symbol index uses.
+fn call_target_rust(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let mut func = node.child_by_field_name("function")?;
+    if func.kind() == "generic_function" {
+        func = func.child_by_field_name("function")?;
+    }
+    match func.kind() {
+        "identifier" => text(&func, src),
+        "field_expression" => text(&func.child_by_field_name("field")?, src),
+        "scoped_identifier" => text(&func.child_by_field_name("name")?, src),
+        _ => None,
+    }
+}
+
+fn call_target_python(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    match func.kind() {
+        "identifier" => text(&func, src),
+        "attribute" => text(&func.child_by_field_name("attribute")?, src),
+        _ => None,
+    }
+}
+
+fn call_target_go(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    match func.kind() {
+        "identifier" => text(&func, src),
+        "selector_expression" => text(&func.child_by_field_name("field")?, src),
+        _ => None,
+    }
+}
+
+fn call_target_js(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    match func.kind() {
+        "identifier" => text(&func, src),
+        "member_expression" => text(&func.child_by_field_name("property")?, src),
+        _ => None,
+    }
+}
+
+fn call_target_c(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    if func.kind() == "identifier" {
+        text(&func, src)
+    } else {
+        None
+    }
+}
+
+fn call_target_cpp(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    match func.kind() {
+        "identifier" => text(&func, src),
+        "field_expression" => text(&func.child_by_field_name("field")?, src),
+        "qualified_identifier" => text(&func.child_by_field_name("name")?, src),
+        _ => None,
+    }
+}
+
+fn call_target_java(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "method_invocation" {
+        return None;
+    }
+    text(&node.child_by_field_name("name")?, src)
+}
+
+fn call_target_csharp(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "invocation_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    match func.kind() {
+        "identifier" => text(&func, src),
+        "member_access_expression" => text(&func.child_by_field_name("name")?, src),
+        _ => None,
+    }
+}
+
+fn call_target_ruby(node: &Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "call" {
+        return None;
+    }
+    text(&node.child_by_field_name("method")?, src)
+}
+
 /// A parsed AST node mapped to a `(name, kind)` symbol.
 type MappedSymbol = fn(&Node, &[u8]) -> Option<(String, String)>;
+/// A parsed AST node mapped to the identifier it calls, if it's a call site.
+type CallTarget = fn(&Node, &[u8]) -> Option<String>;
 
 /// One language's tree-sitter wiring.
 pub struct TsLang {
@@ -217,6 +326,8 @@ pub struct TsLang {
     language: LanguageFn,
     /// Node → `(name, kind)` extraction.
     map: MappedSymbol,
+    /// Node → called identifier, when the node is a call site.
+    call_target: CallTarget,
 }
 
 /// Languages with a wired tree-sitter grammar.
@@ -225,56 +336,67 @@ pub static TS_LANGS: &[TsLang] = &[
         exts: &["rs"],
         language: tree_sitter_rust::LANGUAGE,
         map: map_rust,
+        call_target: call_target_rust,
     },
     TsLang {
         exts: &["py"],
         language: tree_sitter_python::LANGUAGE,
         map: map_python,
+        call_target: call_target_python,
     },
     TsLang {
         exts: &["go"],
         language: tree_sitter_go::LANGUAGE,
         map: map_go,
+        call_target: call_target_go,
     },
     TsLang {
         exts: &["js", "jsx", "mjs", "cjs"],
         language: tree_sitter_javascript::LANGUAGE,
         map: map_js,
+        call_target: call_target_js,
     },
     TsLang {
         exts: &["ts"],
         language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         map: map_js,
+        call_target: call_target_js,
     },
     TsLang {
         exts: &["tsx"],
         language: tree_sitter_typescript::LANGUAGE_TSX,
         map: map_js,
+        call_target: call_target_js,
     },
     TsLang {
         exts: &["c", "h"],
         language: tree_sitter_c::LANGUAGE,
         map: map_c,
+        call_target: call_target_c,
     },
     TsLang {
         exts: &["cpp", "cc", "cxx", "hpp", "hh", "hxx"],
         language: tree_sitter_cpp::LANGUAGE,
         map: map_cpp,
+        call_target: call_target_cpp,
     },
     TsLang {
         exts: &["java"],
         language: tree_sitter_java::LANGUAGE,
         map: map_java,
+        call_target: call_target_java,
     },
     TsLang {
         exts: &["cs"],
         language: tree_sitter_c_sharp::LANGUAGE,
         map: map_csharp,
+        call_target: call_target_csharp,
     },
     TsLang {
         exts: &["rb"],
         language: tree_sitter_ruby::LANGUAGE,
         map: map_ruby,
+        call_target: call_target_ruby,
     },
 ];
 
@@ -320,6 +442,65 @@ pub fn extract_symbols_ts(rel: &str, lang: &TsLang, text: &str, out: &mut Vec<Sy
             if !cursor.goto_parent() {
                 return;
             }
+        }
+    }
+}
+
+/// Parse `text` with `lang` and append every call site to `out`, attributing
+/// each call to its nearest enclosing function/method by walking the same
+/// cursor with a `(depth, name)` scope stack: a function-like node pushes
+/// itself when visited, and pops once the walk returns to its own depth or
+/// shallower (i.e. its subtree is exhausted). Calls outside any function
+/// (module-level statements, field initializers) are dropped rather than
+/// attributed to a fake caller, since there's nothing meaningful to graph
+/// them against.
+pub fn extract_calls_ts(rel: &str, lang: &TsLang, text: &str, out: &mut Vec<CallEdge>) {
+    let mut parser = Parser::new();
+    let language: Language = lang.language.into();
+    if parser.set_language(&language).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return;
+    };
+    let src = text.as_bytes();
+    let mut cursor = tree.walk();
+    let mut depth = 0usize;
+    let mut scopes: Vec<(usize, String)> = Vec::new();
+    loop {
+        let node = cursor.node();
+
+        while scopes.last().is_some_and(|&(d, _)| d >= depth) {
+            scopes.pop();
+        }
+        if let Some((name, kind)) = (lang.map)(&node, src) {
+            if kind == "function" || kind == "method" {
+                scopes.push((depth, name));
+            }
+        }
+        if let Some(callee) = (lang.call_target)(&node, src) {
+            if let Some((_, caller)) = scopes.last() {
+                out.push(CallEdge {
+                    caller: caller.clone(),
+                    callee,
+                    file: rel.to_string(),
+                    line: node.start_position().row + 1,
+                });
+            }
+        }
+
+        if cursor.goto_first_child() {
+            depth += 1;
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+            depth -= 1;
         }
     }
 }
@@ -472,5 +653,71 @@ mod tests {
         assert!(ts_language_for(Path::new("x.swift")).is_none());
         assert!(ts_language_for(Path::new("x.lua")).is_none());
         assert!(ts_language_for(Path::new("x.kt")).is_none());
+    }
+
+    fn calls(text: &str, path: &str) -> Vec<CallEdge> {
+        let mut out = Vec::new();
+        let lang = ts_language_for(Path::new(path)).expect("grammar wired");
+        extract_calls_ts(&path.replace('\\', "/"), lang, text, &mut out);
+        out
+    }
+
+    #[test]
+    fn rust_call_graph_resolves_plain_and_method_calls() {
+        let out = calls(
+            "fn main() {\n  helper();\n  self.render();\n}\nfn helper() {\n  Foo::bar();\n}\n",
+            "lib.rs",
+        );
+        assert!(out
+            .iter()
+            .any(|c| c.caller == "main" && c.callee == "helper"));
+        assert!(out
+            .iter()
+            .any(|c| c.caller == "main" && c.callee == "render"));
+        assert!(out
+            .iter()
+            .any(|c| c.caller == "helper" && c.callee == "bar"));
+    }
+
+    #[test]
+    fn python_call_graph_resolves_attribute_calls() {
+        let out = calls(
+            "def run():\n    setup()\n    obj.start()\n\ndef setup():\n    pass\n",
+            "a.py",
+        );
+        assert!(out.iter().any(|c| c.caller == "run" && c.callee == "setup"));
+        assert!(out.iter().any(|c| c.caller == "run" && c.callee == "start"));
+    }
+
+    #[test]
+    fn go_call_graph_resolves_selector_calls() {
+        let out = calls(
+            "package p\n\nfunc Run() {\n  Setup()\n  svc.Start()\n}\n\nfunc Setup() {}\n",
+            "p.go",
+        );
+        assert!(out.iter().any(|c| c.caller == "Run" && c.callee == "Setup"));
+        assert!(out.iter().any(|c| c.caller == "Run" && c.callee == "Start"));
+    }
+
+    #[test]
+    fn typescript_call_graph_resolves_member_calls() {
+        let out = calls(
+            "function run() {\n  setup();\n  this.start();\n}\nfunction setup() {}\n",
+            "a.ts",
+        );
+        assert!(out.iter().any(|c| c.caller == "run" && c.callee == "setup"));
+        assert!(out.iter().any(|c| c.caller == "run" && c.callee == "start"));
+    }
+
+    #[test]
+    fn calls_outside_any_function_are_dropped() {
+        let out = calls("top_level_call();\nfn main() {}\n", "lib.rs");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn malformed_input_produces_no_calls_but_does_not_panic() {
+        let out = calls("fn broken( {\n  foo(\n", "lib.rs");
+        assert!(out.iter().all(|c| c.line >= 1));
     }
 }

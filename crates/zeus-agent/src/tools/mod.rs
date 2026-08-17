@@ -16,9 +16,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use zeus_fs::{
-    filter_out_own_index, word_boundary, ApprovalDecision, CopyOptions, DeviceEngine, EditOptions,
-    GitEngine, GitOutput, IndexEngine, PermissionGate, PermissionRequest, PlatformEngine,
-    PlatformOutput, ReadOptions, ResetMode, SearchOptions, SymbolIndex, Workspace, WriteOptions,
+    filter_out_own_index, word_boundary, ApprovalDecision, CallEdge, CopyOptions, DeviceEngine,
+    EditOptions, GitEngine, GitOutput, IndexEngine, PermissionGate, PermissionRequest,
+    PlatformEngine, PlatformOutput, ReadOptions, ResetMode, SearchOptions, SymbolIndex, Workspace,
+    WriteOptions,
 };
 use zeus_provider::{ModelProvider, ToolSpec};
 
@@ -688,6 +689,18 @@ ToolSpec {
                 "properties": {
                     "name": {"type": "string"},
                     "max": {"type": "integer"}
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolSpec {
+            name: "code_graph".into(),
+            description: "Call graph: who calls this symbol, and/or what does it call. Built from tree-sitter AST parsing (not text search), so it only covers languages with a wired grammar (rust/python/go/js/ts/c/cpp/java/cs/rb) and misses dynamic dispatch/reflection. Run code_index first.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "direction": {"type": "string", "enum": ["callers", "callees", "both"]}
                 },
                 "required": ["name"]
             }),
@@ -1708,6 +1721,7 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
             | "code_symbols"
             | "code_defs"
             | "code_refs"
+            | "code_graph"
             | "code_rename"
             | "bg_list"
             | "bg_output"
@@ -1971,6 +1985,7 @@ impl ToolManager {
             "code_symbols" => self.do_code_symbols(&args),
             "code_defs" => self.do_code_defs(&args),
             "code_refs" => self.do_code_refs(&args),
+            "code_graph" => self.do_code_graph(&args),
             "code_rename" => self.do_code_rename(&args),
             "bash" => self.do_bash(&args, approver),
             "test" => self.do_test(&args, approver),
@@ -2621,6 +2636,59 @@ impl ToolManager {
             }
             Err(e) => Ok(ToolResult::err(e.to_string())),
         }
+    }
+
+    fn do_code_graph(&self, args: &Value) -> Result<ToolResult> {
+        let name = Self::str_arg(args, "name")?;
+        let direction = args
+            .get("direction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("both");
+        let root = self.workspace.project_root.clone();
+        let idx = match SymbolIndex::load(&root) {
+            Ok(Some(idx)) => idx,
+            Ok(None) => return Ok(ToolResult::err("no index; run code_index first")),
+            Err(e) => return Ok(ToolResult::err(e.to_string())),
+        };
+
+        let fmt_callers = |edges: &[&CallEdge]| -> String {
+            edges
+                .iter()
+                .map(|c| format!("{}:{}  {} -> {name}", c.file, c.line, c.caller))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let fmt_callees = |edges: &[&CallEdge]| -> String {
+            edges
+                .iter()
+                .map(|c| format!("{}:{}  {name} -> {}", c.file, c.line, c.callee))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut sections = Vec::new();
+        if direction == "callers" || direction == "both" {
+            let callers = idx.callers_of(name);
+            sections.push(if callers.is_empty() {
+                format!("no callers of '{name}' found")
+            } else {
+                format!("{} caller(s) of '{name}':\n{}", callers.len(), fmt_callers(&callers))
+            });
+        }
+        if direction == "callees" || direction == "both" {
+            let callees = idx.callees_of(name);
+            sections.push(if callees.is_empty() {
+                format!("'{name}' calls nothing found in the graph")
+            } else {
+                format!(
+                    "'{name}' calls {} function(s):\n{}",
+                    callees.len(),
+                    fmt_callees(&callees)
+                )
+            });
+        }
+        sections.push("Call graph is built from tree-sitter AST parsing of languages with a wired grammar; it misses dynamic dispatch/reflection and any language without a grammar, so absence is not proof of no callers/callees.".to_string());
+        Ok(ToolResult::ok(sections.join("\n\n")))
     }
 
     fn do_code_rename(&self, args: &Value) -> Result<ToolResult> {
@@ -4972,6 +5040,44 @@ mod tests {
             .unwrap();
         assert!(!r.is_error);
         assert!(r.content.contains("3 reference(s)"), "got: {}", r.content);
+    }
+
+    #[test]
+    fn code_graph_reports_callers_and_callees() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "fn main() {\n  helper();\n}\nfn helper() {\n  leaf();\n}\nfn leaf() {}\n",
+        )
+        .unwrap();
+
+        let tm = tool_manager(&root);
+        tm.dispatch_with_approver("code_index", r#"{"force":true}"#, approve)
+            .unwrap();
+
+        let r = tm
+            .dispatch_with_approver("code_graph", r#"{"name":"helper"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("caller(s) of 'helper'"));
+        assert!(r.content.contains("main -> helper"));
+        assert!(r.content.contains("calls 1 function(s)"));
+        assert!(r.content.contains("helper -> leaf"));
+
+        let r = tm
+            .dispatch_with_approver("code_graph", r#"{"name":"helper","direction":"callers"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.contains("main -> helper"));
+        assert!(!r.content.contains("helper -> leaf"));
+
+        let r = tm
+            .dispatch_with_approver("code_graph", r#"{"name":"nope"}"#, approve)
+            .unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.contains("no callers of 'nope' found"));
     }
 
     #[test]

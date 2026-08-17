@@ -20,7 +20,7 @@ mod workspace;
 
 pub use checkpoint::{CheckpointStore, CheckpointSummary, FileSnapshot};
 pub use codeint::{
-    filter_out_own_index, paths_equal, word_boundary, IndexEngine, Symbol, SymbolIndex,
+    filter_out_own_index, paths_equal, word_boundary, CallEdge, IndexEngine, Symbol, SymbolIndex,
 };
 pub use device::{DeviceEngine, DeviceOutput};
 pub use diff::preview_diff;

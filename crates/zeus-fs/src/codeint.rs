@@ -71,6 +71,21 @@ pub struct Symbol {
     pub line: usize,
 }
 
+/// One call site: `caller` invokes `callee` at `file`:`line`. Built only from
+/// tree-sitter-backed languages (see [`crate::tsint`]) — the enclosing
+/// function is derived from real AST scope, not a regex guess, so languages
+/// without a wired grammar simply contribute no edges rather than wrong ones.
+/// `caller`/`callee` are bare identifiers (last segment of a method/member
+/// call), matching the plain names the rest of the symbol index uses, so a
+/// call edge can be looked up with the same name you'd pass to `code_defs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CallEdge {
+    pub caller: String,
+    pub callee: String,
+    pub file: String,
+    pub line: usize,
+}
+
 /// The on-disk contract — one JSON file, database-free.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SymbolIndex {
@@ -81,6 +96,10 @@ pub struct SymbolIndex {
     /// How many files were scanned during the last build.
     pub scanned_files: usize,
     pub symbols: Vec<Symbol>,
+    /// Call-graph edges. `#[serde(default)]` so an index built before this
+    /// field existed still loads instead of failing deserialization.
+    #[serde(default)]
+    pub calls: Vec<CallEdge>,
 }
 
 /// Language profile: which extensions map to which `(regex, kind)` pairs.
@@ -219,6 +238,7 @@ impl IndexEngine {
     pub fn scan(&self) -> Result<SymbolIndex> {
         let root = &self.project_root;
         let mut symbols = Vec::new();
+        let mut calls = Vec::new();
         let mut scanned = 0usize;
 
         let root_clone = root.clone();
@@ -258,6 +278,7 @@ impl IndexEngine {
             // the regex extractors remain the fallback for other languages.
             if let Some(ts) = crate::tsint::ts_language_for(path) {
                 crate::tsint::extract_symbols_ts(&rel, ts, &text, &mut symbols);
+                crate::tsint::extract_calls_ts(&rel, ts, &text, &mut calls);
             } else {
                 extract_symbols(&rel, lang, &text, &mut symbols);
             }
@@ -273,6 +294,7 @@ impl IndexEngine {
             project_root: root.to_string_lossy().into_owned(),
             scanned_files: scanned,
             symbols,
+            calls,
         })
     }
 }
@@ -392,6 +414,22 @@ impl SymbolIndex {
             (b.0, a.1.file.as_str(), a.1.line).cmp(&(a.0, b.1.file.as_str(), b.1.line))
         });
         hits.into_iter().map(|(_, s)| s).collect()
+    }
+
+    /// Edges where `name` is the callee — "who calls this?" — sorted by file
+    /// then line for stable, scannable output.
+    pub fn callers_of(&self, name: &str) -> Vec<&CallEdge> {
+        let mut hits: Vec<&CallEdge> = self.calls.iter().filter(|c| c.callee == name).collect();
+        hits.sort_by(|a, b| (a.file.as_str(), a.line).cmp(&(b.file.as_str(), b.line)));
+        hits
+    }
+
+    /// Edges where `name` is the caller — "what does this call?" — sorted by
+    /// file then line.
+    pub fn callees_of(&self, name: &str) -> Vec<&CallEdge> {
+        let mut hits: Vec<&CallEdge> = self.calls.iter().filter(|c| c.caller == name).collect();
+        hits.sort_by(|a, b| (a.file.as_str(), a.line).cmp(&(b.file.as_str(), b.line)));
+        hits
     }
 }
 
@@ -558,5 +596,34 @@ mod tests {
         idx.save(root).unwrap();
         let loaded = SymbolIndex::load(root).unwrap().unwrap();
         assert_eq!(loaded.symbols.len(), idx.symbols.len());
+    }
+
+    #[test]
+    fn scan_builds_call_graph_and_supports_callers_callees_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("main.rs"),
+            "fn main() {\n  helper();\n}\nfn helper() {\n  leaf();\n}\nfn leaf() {}\n",
+        )
+        .unwrap();
+
+        let idx = IndexEngine::new(root).scan().unwrap();
+        let callers = idx.callers_of("helper");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].caller, "main");
+
+        let callees = idx.callees_of("helper");
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].callee, "leaf");
+
+        assert!(idx.callers_of("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn old_index_without_calls_field_still_deserializes() {
+        let json = r#"{"built_at":0,"project_root":"/x","scanned_files":1,"symbols":[]}"#;
+        let idx: SymbolIndex = serde_json::from_str(json).unwrap();
+        assert!(idx.calls.is_empty());
     }
 }
