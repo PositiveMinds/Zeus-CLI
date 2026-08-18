@@ -42,9 +42,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io;
 use tokio::sync::{mpsc, watch};
@@ -154,6 +152,86 @@ enum Mode {
         rows: Vec<super::highlight::DiffRow>,
         scroll: usize,
     },
+    /// Filesystem browser opened with ctrl+o — pick files to reference (or
+    /// `/upload`) without typing paths. Enter descends into a dir or inserts
+    /// a file's quoted path into the composer (multi-select: stay open until
+    /// esc). Backspace/← go up a level. ctrl+h toggles hidden files.
+    FilePicker {
+        cwd: std::path::PathBuf,
+        entries: Vec<FileEntry>,
+        selected: usize,
+        show_hidden: bool,
+    },
+}
+
+/// One row in the ctrl+o file picker.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FileEntry {
+    name: String,
+    is_dir: bool,
+    /// Size in bytes for files; 0 for directories.
+    size: u64,
+    /// Name starts with a `.` (hidden unless ctrl+h is on).
+    hidden: bool,
+    /// A file with this name already exists in `.agent/uploads/`.
+    staged: bool,
+}
+
+/// Read a directory for the ctrl+o file picker: directories first, then
+/// files, each sorted case-insensitively. Hidden entries are kept when
+/// `show_hidden` is set. `staged_names` marks entries already present in the
+/// uploads dir (top-level names only).
+fn load_dir_entries(
+    path: &std::path::Path,
+    show_hidden: bool,
+    staged_names: &std::collections::HashSet<String>,
+) -> Vec<FileEntry> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let hidden = name.starts_with('.');
+            if hidden && !show_hidden {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let size = if is_dir {
+                0
+            } else {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+            let e = FileEntry {
+                name,
+                is_dir,
+                size,
+                hidden,
+                staged: staged_names.contains(&entry.file_name().to_string_lossy().into_owned()),
+            };
+            if is_dir {
+                dirs.push(e);
+            } else {
+                files.push(e);
+            }
+        }
+    }
+    dirs.sort_by_key(|e| e.name.to_lowercase());
+    files.sort_by_key(|e| e.name.to_lowercase());
+    dirs.into_iter().chain(files).collect()
+}
+
+/// Names of the files already staged in `.agent/uploads/` (top-level only),
+/// so the file picker can mark them.
+fn staged_upload_names(config: &Config) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    if let Ok(dir) = crate::uploads_dir(config) {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                set.insert(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    set
 }
 
 /// Applies a chosen (provider, model id) pair: switches provider first if
@@ -458,6 +536,8 @@ fn tui_mouse_and_keys_help() -> String {
         "  ctrl+c / ctrl+y       copy the selection (or the last reply if none)",
         "  ctrl+f                find in the transcript",
         "  ctrl+p                open the command palette (seeds \"/\")",
+        "  ctrl+o                open the file picker (inserts quoted paths into the composer)",
+        "  ctrl+h                inside the picker: toggle hidden files",
         "  tab                   cycle agent mode (build/plan/auto)",
         "  esc                   cancel a turn, clear input/selection, or close a picker",
         "  alt+1 / alt+2 / alt+3 fill an example chip (empty-state screen only)",
@@ -1515,7 +1595,10 @@ fn selection_copy_payload(
 ) -> Option<(String, bool)> {
     let text = selection_plain_text(transcript, selection)?;
     let single_block = matches!(selection, Some((a, b)) if a == b);
-    match single_block.then(|| single_fenced_code_block(&text)).flatten() {
+    match single_block
+        .then(|| single_fenced_code_block(&text))
+        .flatten()
+    {
         Some(code) => Some((code.to_string(), true)),
         None => Some((text, false)),
     }
@@ -1539,7 +1622,11 @@ fn copy_selection(state: &mut AppState) {
         .unwrap_or(0);
     match super::clipboard::copy(&to_copy) {
         Ok(()) => {
-            let suffix = if is_code_only { " (code block only)" } else { "" };
+            let suffix = if is_code_only {
+                " (code block only)"
+            } else {
+                ""
+            };
             state.push_info(format!(
                 "copied {count} char(s) from {len} block(s) to clipboard{suffix}"
             ));
@@ -1807,6 +1894,8 @@ fn render_hints(f: &mut Frame, area: Rect, _state: &AppState) {
     let pairs: &[[&str; 2]] = &[
         ["tab", "agents"],
         ["/ ctrl+p", "commands"],
+        ["ctrl+o", "files"],
+        ["ctrl+h", "hidden"],
         ["click", "select"],
         ["ctrl+c", "copy"],
         ["ctrl+f", "find"],
@@ -2287,7 +2376,7 @@ fn render_side(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
         Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(files_h),
-        Constraint::Length(4),
+        Constraint::Length(6),
     ])
     .split(area);
 
@@ -2477,26 +2566,58 @@ fn render_side_foot(f: &mut Frame, area: Rect, state: &AppState) {
         Some(usd) => format!("~${usd:.2}"),
         None => "—".to_string(),
     };
+    let frac = state.context_window.map(|window| {
+        (state.session_usage.total_tokens as f64 / window.max(1) as f64).clamp(0.0, 1.0)
+    });
     let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(area);
+
+    // Context budget bar (only once the model's window is known) and a
+    // compaction warning once the session approaches the window.
+    if let Some(frac) = frac {
+        let style = if frac >= 0.95 {
+            theme::red()
+        } else if frac >= 0.8 {
+            theme::yellow()
+        } else {
+            theme::violet()
+        };
+        let gauge = Gauge::default()
+            .gauge_style(style)
+            .ratio(frac)
+            .label(format!("context {:.0}%", frac * 100.0))
+            .use_unicode(true);
+        f.render_widget(gauge, rows[2]);
+        if frac >= 0.8 {
+            let warn = Line::from(Span::styled(
+                format!("context {:.0}% full — /compact", frac * 100.0),
+                style.add_modifier(Modifier::BOLD),
+            ));
+            f.render_widget(Paragraph::new(warn), rows[3]);
+        }
+    }
+
     let vals: [(String, String); 4] = [
         ("Session".into(), session),
         ("Tokens".into(), tokens),
         ("Cost".into(), cost),
         ("Branch".into(), branch),
     ];
+    let slot: [usize; 4] = [0, 1, 4, 5];
     for (i, (k, v)) in vals.iter().enumerate() {
         let line = Line::from(vec![
             Span::styled(k.clone(), theme::faint()),
             Span::styled("  ", theme::faint()),
             Span::styled(v.clone(), theme::dim()),
         ]);
-        f.render_widget(Paragraph::new(line), rows[i]);
+        f.render_widget(Paragraph::new(line), rows[slot[i]]);
     }
 }
 
@@ -2850,6 +2971,7 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
             | Mode::KeyEntry { .. }
             | Mode::Approval { .. }
             | Mode::Diff { .. }
+            | Mode::FilePicker { .. }
     ) || state.session_picker.is_some();
     if any_modal_open {
         dim_backdrop(f, area);
@@ -2906,6 +3028,16 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
 
     if let Mode::Diff { rows, scroll } = &state.mode {
         render_diff_modal(f, area, rows, *scroll);
+    }
+
+    if let Mode::FilePicker {
+        cwd,
+        entries,
+        selected,
+        show_hidden,
+    } = &state.mode
+    {
+        render_file_picker(f, area, cwd, entries, *selected, *show_hidden);
     }
 
     if let Some(search) = &state.search {
@@ -3253,6 +3385,141 @@ async fn handle_key(
         }
         if key.code == KeyCode::Esc {
             state.mode = Mode::Chat;
+        }
+        return Ok(());
+    }
+
+    // ---- ctrl+o: filesystem picker ----
+    // Open a file browser so paths don't have to be typed — pick files to
+    // insert into the composer (e.g. ahead of `/upload`) straight from the
+    // filesystem. Only when idle and in chat, so it never interrupts a turn
+    // or stomps a picker that's already open.
+    if matches!(state.mode, Mode::Chat)
+        && !state.busy
+        && key.code == KeyCode::Char('o')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let start = config.project_root.clone().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
+        let staged = staged_upload_names(config);
+        let entries = load_dir_entries(&start, false, &staged);
+        state.mode = Mode::FilePicker {
+            cwd: start,
+            entries,
+            selected: 0,
+            show_hidden: false,
+        };
+        return Ok(());
+    }
+
+    // ---- Filesystem picker navigation (ctrl+o) ----
+    if let Mode::FilePicker { .. } = &state.mode {
+        match key.code {
+            KeyCode::Esc => state.mode = Mode::Chat,
+            KeyCode::Up => {
+                if let Mode::FilePicker { selected, .. } = &mut state.mode {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Mode::FilePicker {
+                    entries, selected, ..
+                } = &mut state.mode
+                {
+                    if *selected + 1 < entries.len() {
+                        *selected += 1;
+                    }
+                }
+            }
+            KeyCode::Home => {
+                if let Mode::FilePicker { selected, .. } = &mut state.mode {
+                    *selected = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Mode::FilePicker {
+                    entries, selected, ..
+                } = &mut state.mode
+                {
+                    *selected = entries.len().saturating_sub(1);
+                }
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Mode::FilePicker {
+                    cwd,
+                    entries,
+                    selected,
+                    show_hidden,
+                } = &mut state.mode
+                {
+                    *show_hidden = !*show_hidden;
+                    *entries = load_dir_entries(cwd, *show_hidden, &staged_upload_names(config));
+                    *selected = 0;
+                }
+            }
+            KeyCode::Backspace | KeyCode::Left => {
+                let parent = match &state.mode {
+                    Mode::FilePicker { cwd, .. } => cwd.parent().map(|p| p.to_path_buf()),
+                    _ => None,
+                };
+                if let Some(parent) = parent {
+                    if let Mode::FilePicker {
+                        cwd,
+                        entries,
+                        selected,
+                        show_hidden,
+                    } = &mut state.mode
+                    {
+                        *cwd = parent;
+                        *entries =
+                            load_dir_entries(cwd, *show_hidden, &staged_upload_names(config));
+                        *selected = 0;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let action = match &state.mode {
+                    Mode::FilePicker {
+                        cwd,
+                        entries,
+                        selected,
+                        ..
+                    } => entries
+                        .get(*selected)
+                        .map(|e| (cwd.join(&e.name), e.is_dir)),
+                    _ => None,
+                };
+                match action {
+                    Some((full, true)) => {
+                        if let Mode::FilePicker {
+                            cwd,
+                            entries,
+                            selected,
+                            show_hidden,
+                        } = &mut state.mode
+                        {
+                            *cwd = full;
+                            *entries =
+                                load_dir_entries(cwd, *show_hidden, &staged_upload_names(config));
+                            *selected = 0;
+                        }
+                    }
+                    Some((full, false)) => {
+                        // Insert the quoted path into the composer and stay
+                        // open so multiple files can be picked in one go
+                        // (esc closes; then send or /upload the result).
+                        let quoted = format!("\"{}\"", full.display());
+                        if !state.input.is_empty() {
+                            state.input.push(' ');
+                        }
+                        state.input.push_str(&quoted);
+                        state.cursor = char_count(&state.input);
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
         }
         return Ok(());
     }
@@ -3963,7 +4230,11 @@ async fn handle_key(
                             }
                             "" => state.push_info(format!(
                                 "mouse capture: {}",
-                                if state.mouse_capture_enabled { "on" } else { "off" }
+                                if state.mouse_capture_enabled {
+                                    "on"
+                                } else {
+                                    "off"
+                                }
                             )),
                             _ => state.push_error("usage: /mouse [on|off]"),
                         }
@@ -4250,7 +4521,10 @@ async fn handle_key(
                                 "usage: /bg <goal> — run an orchestrated plan in the background, or /bg list | output <id> | pause <id> | resume <id> | stop <id>"
                                     .to_string(),
                             );
-                        } else if matches!(first_word, "list" | "output" | "stop" | "pause" | "resume") {
+                        } else if matches!(
+                            first_word,
+                            "list" | "output" | "stop" | "pause" | "resume"
+                        ) {
                             handle_bg_subcommand(state, config, first_word, sub_arg);
                         } else {
                             let (goal, workflow) = match full_arg.rsplit_once("@@workflow:") {
@@ -4279,6 +4553,83 @@ async fn handle_key(
                             copy_last_response(state);
                         }
                     }
+                    "upload" => {
+                        let (to, paths, parse_err) = crate::parse_upload_args(arg);
+                        if let Some(e) = parse_err {
+                            state.push_error(format!("upload failed: {e}"));
+                        } else if paths.is_empty() {
+                            state.push_error(
+                                "usage: /upload [--to SUBDIR] <path> [path ...] — copies files \
+                                 (anywhere on disk) into .agent/uploads/ and tells the agent to \
+                                 read them; quote paths with spaces: /upload \"my file.png\""
+                                    .to_string(),
+                            );
+                        } else {
+                            match crate::upload_files(config, &paths, to.as_deref(), false) {
+                                Ok(report) if !report.uploaded.is_empty() => {
+                                    state.push_user(trimmed.clone());
+                                    for w in &report.warnings {
+                                        state.push_error(w.clone());
+                                    }
+                                    let msg = format!(
+                                        "The user uploaded the following file(s). Read each one as \
+                                         appropriate — read for text, read_image for images, \
+                                         read_document for PDF/office docs:\n{}",
+                                        report.uploaded.join("\n")
+                                    );
+                                    start_turn(
+                                        state,
+                                        agent_slot,
+                                        turn_handle,
+                                        cancel_tx,
+                                        ui_tx,
+                                        msg,
+                                        yes,
+                                    );
+                                }
+                                Ok(_) => state.push_error("no files uploaded".to_string()),
+                                Err(e) => state.push_error(format!("upload failed: {e:#}")),
+                            }
+                        }
+                    }
+                    "uploads" => match arg.split_whitespace().next() {
+                        Some("rm") => {
+                            let rel = arg["rm".len()..].trim();
+                            match crate::delete_upload(config, rel) {
+                                Ok(n) => {
+                                    state.push_info(format!(
+                                        "removed {n} item(s) from .agent/uploads"
+                                    ));
+                                }
+                                Err(e) => state.push_error(format!("remove failed: {e:#}")),
+                            }
+                        }
+                        _ => match crate::list_uploads(config) {
+                            Ok(entries) if entries.is_empty() => {
+                                state.push_info(
+                                    "no uploads staged yet — use /upload <path> to add files",
+                                );
+                            }
+                            Ok(entries) => {
+                                let mut msg = "staged uploads:".to_string();
+                                for e in entries {
+                                    msg.push_str("\n  ");
+                                    if e.size == 0 {
+                                        msg.push_str(&format!("{}  (dir)", e.rel));
+                                    } else {
+                                        msg.push_str(&format!(
+                                            "{}  {}",
+                                            e.rel,
+                                            crate::human_size(e.size)
+                                        ));
+                                    }
+                                }
+                                msg.push_str("\nuse `/uploads rm <rel-path>` to remove one");
+                                state.push_info(msg);
+                            }
+                            Err(e) => state.push_error(format!("uploads listing failed: {e:#}")),
+                        },
+                    },
                     _ => {
                         let expanded = expand_slash_command(config, trimmed.clone());
                         if expanded != trimmed {
@@ -4935,7 +5286,9 @@ async fn run_app<B: Backend>(
                             Err(e) => {
                                 state.pending_plan_goal = None;
                                 let msg = format!("{e:#}");
-                                if let Some(hint) = provider_trouble_hint(&msg) {
+                                if let Some(hint) = crate::credit_failure_hint(config, &msg) {
+                                    state.push_info(hint);
+                                } else if let Some(hint) = provider_trouble_hint(&msg) {
                                     state.push_info(hint);
                                 }
                                 state.push_error(format!("turn failed: {msg}"));
@@ -5111,9 +5464,7 @@ mod tests {
         for (w, h) in [(0u16, 0u16), (1, 1), (10, 3), (33, 7), (34, 8)] {
             let backend = ratatui::backend::TestBackend::new(w.max(1), h.max(1));
             let mut terminal = Terminal::new(backend).unwrap();
-            terminal
-                .draw(|f| render_too_small(f, f.area()))
-                .unwrap();
+            terminal.draw(|f| render_too_small(f, f.area())).unwrap();
         }
     }
 
@@ -5272,8 +5623,7 @@ mod tests {
     fn selection_copy_payload_prefers_the_single_code_block_when_unambiguous() {
         let text = "explanation\n\n```py\nprint('hi')\n```\n\nmore text";
         let transcript = vec![Block_::new(Role::Assistant, text.to_string())];
-        let (copied, is_code_only) =
-            selection_copy_payload(&transcript, Some((0, 0))).unwrap();
+        let (copied, is_code_only) = selection_copy_payload(&transcript, Some((0, 0))).unwrap();
         assert!(is_code_only);
         assert_eq!(copied, "print('hi')");
     }
@@ -5282,8 +5632,7 @@ mod tests {
     fn selection_copy_payload_falls_back_to_whole_block_with_multiple_code_blocks() {
         let text = "```py\nprint(1)\n```\n```py\nprint(2)\n```";
         let transcript = vec![Block_::new(Role::Assistant, text.to_string())];
-        let (copied, is_code_only) =
-            selection_copy_payload(&transcript, Some((0, 0))).unwrap();
+        let (copied, is_code_only) = selection_copy_payload(&transcript, Some((0, 0))).unwrap();
         assert!(!is_code_only);
         assert_eq!(copied, text);
     }
@@ -5297,8 +5646,7 @@ mod tests {
             Block_::new(Role::Assistant, "```py\nprint(1)\n```".to_string()),
             Block_::new(Role::Assistant, "```py\nprint(2)\n```".to_string()),
         ];
-        let (_copied, is_code_only) =
-            selection_copy_payload(&transcript, Some((0, 1))).unwrap();
+        let (_copied, is_code_only) = selection_copy_payload(&transcript, Some((0, 1))).unwrap();
         assert!(!is_code_only);
     }
 
@@ -5461,6 +5809,62 @@ mod tests {
     }
 
     #[test]
+    fn side_foot_shows_context_budget_bar_and_warning() {
+        let (mut state, _config) = test_app_state(std::path::Path::new("."));
+        state.context_window = Some(10_000);
+        state.session_usage = TokenUsage::new(9_000, 0);
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(48, 10)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_side_foot(f, area, &state);
+            })
+            .unwrap();
+        let joined = buffer_rows(terminal.backend().buffer()).join("\n");
+        assert!(
+            joined.contains("context 90%"),
+            "budget bar should label usage:\n{joined}"
+        );
+        assert!(
+            joined.contains("/compact"),
+            "at 90% the footer should suggest /compact:\n{joined}"
+        );
+        assert!(
+            joined.contains("Tokens"),
+            "Tokens readout present:\n{joined}"
+        );
+        assert!(
+            joined.contains("Session"),
+            "Session readout present:\n{joined}"
+        );
+        assert!(
+            joined.contains("Branch"),
+            "Branch readout present:\n{joined}"
+        );
+
+        // Far under the window: no compaction warning.
+        let (mut quiet, _config) = test_app_state(std::path::Path::new("."));
+        quiet.context_window = Some(100_000);
+        quiet.session_usage = TokenUsage::new(1_000, 500);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(48, 10)).unwrap();
+        terminal
+            .draw(|f| {
+                render_side_foot(f, f.area(), &quiet);
+            })
+            .unwrap();
+        let quiet_rows = buffer_rows(terminal.backend().buffer()).join("\n");
+        assert!(
+            !quiet_rows.contains("/compact"),
+            "under the threshold there is no warning:\n{quiet_rows}"
+        );
+        assert!(
+            quiet_rows.contains("context 2%"),
+            "the bar still labels the low usage:\n{quiet_rows}"
+        );
+    }
+
+    #[test]
     fn hints_elide_trailing_pairs_when_narrow() {
         use ratatui::text::Span;
         let pairs: &[[&str; 2]] = &[
@@ -5471,8 +5875,12 @@ mod tests {
             ["ctrl+f", "find"],
             ["esc", "close"],
         ];
-        let join =
-            |spans: &[Span<'static>]| spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let join = |spans: &[Span<'static>]| {
+            spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
         // Wide terminal: full legend with 4-space gaps.
         let wide = hints_for_width(pairs, 200);
         assert_eq!(
@@ -5790,5 +6198,144 @@ mod tests {
         .unwrap();
 
         assert!(state.quit, "Ctrl+C with no selection should quit");
+    }
+
+    #[test]
+    fn load_dir_entries_lists_directories_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("zeta")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("alpha")).unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "b").unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "aaaaa").unwrap();
+        std::fs::write(tmp.path().join(".env"), "x").unwrap();
+        let empty = std::collections::HashSet::new();
+        let entries = load_dir_entries(tmp.path(), false, &empty);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta", "a.txt", "b.txt"]);
+        assert!(entries[0].is_dir && entries[1].is_dir);
+        assert!(!entries[2].is_dir && !entries[3].is_dir);
+        assert_eq!(entries[2].size, 5, "a.txt holds 5 bytes");
+        assert!(entries.iter().all(|e| !e.hidden));
+
+        // Hidden files appear only when show_hidden is set.
+        let shown = load_dir_entries(tmp.path(), true, &empty);
+        assert!(shown.iter().any(|e| e.name == ".env" && e.hidden));
+
+        // A file matching a staged name is flagged for the picker.
+        let mut staged = std::collections::HashSet::new();
+        staged.insert("b.txt".to_string());
+        let flagged = load_dir_entries(tmp.path(), false, &staged);
+        assert!(flagged.iter().any(|e| e.name == "b.txt" && e.staged));
+        assert!(flagged.iter().all(|e| e.name != "b.txt" || e.staged));
+        assert!(!flagged.iter().any(|e| e.name == "a.txt" && e.staged));
+    }
+
+    /// Ctrl+O opens the file picker; Enter descends into a directory, Enter
+    /// on a file inserts its quoted path into the composer, and Esc closes.
+    #[tokio::test]
+    async fn file_picker_ctrl_o_descend_insert_esc() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/hello.txt"), "hi").unwrap();
+        let (mut state, config) = test_app_state(tmp.path());
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut agent_slot: Option<Agent> = None;
+        let mut turn_handle: Option<TurnJoin> = None;
+        let mut cancel_tx: Option<watch::Sender<bool>> = None;
+
+        let open = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        handle_key(
+            open,
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(state.mode, Mode::FilePicker { .. }),
+            "Ctrl+O should open the file picker"
+        );
+        let cwd = match &state.mode {
+            Mode::FilePicker { cwd, .. } => cwd.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(cwd, tmp.path());
+
+        // `.agent` (created by the agent's workspace) sorts before `sub`, so
+        // move down onto `sub` before descending.
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        handle_key(
+            down,
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &config,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(
+            enter,
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &config,
+            false,
+        )
+        .await
+        .unwrap();
+        let (cwd2, entries) = match &state.mode {
+            Mode::FilePicker { cwd, entries, .. } => (cwd.clone(), entries.clone()),
+            _ => panic!("still in picker after Enter on a directory"),
+        };
+        assert_eq!(cwd2, tmp.path().join("sub"));
+        assert_eq!(entries[0].name, "hello.txt");
+
+        handle_key(
+            enter,
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            state.input.contains("hello.txt"),
+            "Enter on a file should insert its quoted path, got: {:?}",
+            state.input
+        );
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(
+            esc,
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(state.mode, Mode::Chat),
+            "Esc should close the picker"
+        );
     }
 }

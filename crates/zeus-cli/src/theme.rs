@@ -440,6 +440,9 @@ pub fn cyan() -> Style {
 pub fn gold() -> Style {
     Style::default().fg(GOLD)
 }
+pub fn yellow() -> Style {
+    Style::default().fg(Color::Yellow)
+}
 pub fn green() -> Style {
     Style::default().fg(GREEN)
 }

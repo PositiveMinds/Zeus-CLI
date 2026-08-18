@@ -8,9 +8,10 @@
 use super::pickers::{is_free_model, model_picker_filtered, PickerEntry, ProviderEntry};
 use super::theme;
 use super::tui_text::{
-    centered_rect, char_count, cost_per_million_tokens, fmt_price, format_token_count,
-    mask_secret, textwrap_len, wrap_text,
+    centered_rect, char_count, cost_per_million_tokens, fmt_price, format_token_count, mask_secret,
+    textwrap_len, wrap_text,
 };
+use super::FileEntry;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -216,7 +217,11 @@ pub(crate) fn render_menu(
     inner
 }
 
-pub(crate) fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionPickerState) -> Rect {
+pub(crate) fn render_session_picker(
+    f: &mut Frame,
+    area: Rect,
+    picker: &SessionPickerState,
+) -> Rect {
     let width = area.width.saturating_sub(6).clamp(40, 96);
     let filtered = session_picker_filtered(picker);
     let height = (filtered.len() as u16 + 5)
@@ -284,6 +289,109 @@ pub(crate) fn render_session_picker(f: &mut Frame, area: Rect, picker: &SessionP
     list_area
 }
 
+/// The ctrl+o filesystem picker — a directory browser that inserts picked
+/// files into the composer as quoted paths. Directories render with a
+/// trailing `/` and bold; Enter descends or inserts, ←/Backspace goes up,
+/// ctrl+h toggles hidden files. Files already staged in `.agent/uploads/`
+/// carry a `✓`; file sizes appear right-aligned.
+pub(crate) fn render_file_picker(
+    f: &mut Frame,
+    area: Rect,
+    cwd: &std::path::Path,
+    entries: &[FileEntry],
+    selected: usize,
+    show_hidden: bool,
+) -> Rect {
+    let width = area.width.saturating_sub(6).clamp(48, 96);
+    let height = (entries.len() as u16 + 6)
+        .min(PICKER_MAX_H)
+        .clamp(10, area.height.saturating_sub(4).max(10));
+    let popup = centered_rect(width, height, area);
+
+    let inner = Popup::new(popup)
+        .title(Line::from(vec![
+            Span::styled(" Open file ", theme::text().add_modifier(Modifier::BOLD)),
+            Span::styled(cwd.display().to_string(), theme::faint()),
+        ]))
+        .corner(Line::from(vec![
+            Span::styled(format!("{} entries ", entries.len()), theme::faint()),
+            Span::styled("esc ", theme::dim()),
+        ]))
+        .bottom(
+            Line::from(Span::styled(
+                " ↑/↓ move · enter open dir / insert file · ← back · ctrl+h hidden · esc close ",
+                theme::dim(),
+            ))
+            .alignment(Alignment::Center),
+        )
+        .render(f);
+
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let head = Line::from(vec![
+        Span::styled("▸ ", theme::violet()),
+        Span::styled(
+            format!(
+                "picked files are inserted into the composer as quoted paths{}",
+                if show_hidden {
+                    "  ·  hidden shown"
+                } else {
+                    ""
+                },
+            ),
+            theme::dim(),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(head), rows[0]);
+
+    let list_area = rows[1];
+    let name_width = (list_area.width as usize).saturating_sub(10).max(6);
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|e| {
+            let marker = if e.staged { "✓" } else { " " };
+            let marker_style = if e.staged {
+                theme::green()
+            } else {
+                theme::dim()
+            };
+            let name = if e.is_dir {
+                format!("{}/", e.name)
+            } else {
+                e.name.clone()
+            };
+            let truncated: String = name.chars().take(name_width).collect();
+            let trunc_len = truncated.chars().count();
+            let name_style = if e.is_dir {
+                theme::text().add_modifier(Modifier::BOLD)
+            } else if e.hidden {
+                theme::faint()
+            } else {
+                theme::text()
+            };
+            let size_str = if e.is_dir {
+                "dir".to_string()
+            } else {
+                crate::human_size(e.size)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(marker, marker_style),
+                Span::styled(truncated, name_style),
+                Span::styled(
+                    " ".repeat(name_width.saturating_sub(trunc_len)),
+                    theme::faint(),
+                ),
+                Span::styled(size_str, theme::faint()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items).highlight_style(selected_style());
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected.min(entries.len().saturating_sub(1))));
+    f.render_stateful_widget(list, list_area, &mut list_state);
+
+    list_area
+}
+
 pub(crate) fn dim_backdrop(f: &mut Frame, area: Rect) {
     fn dim(c: Color) -> Color {
         match c {
@@ -310,7 +418,12 @@ pub(crate) fn dim_backdrop(f: &mut Frame, area: Rect) {
 /// pitch for the provider, a link to get a key, a masked input field, and
 /// an `enter submit` footer. Returns the input field's inner rect so the
 /// caller can place the terminal cursor in it.
-pub(crate) fn render_key_entry_modal(f: &mut Frame, area: Rect, provider: &str, input: &str) -> Rect {
+pub(crate) fn render_key_entry_modal(
+    f: &mut Frame,
+    area: Rect,
+    provider: &str,
+    input: &str,
+) -> Rect {
     let (blurb, url) = provider_blurb(provider);
     let width = area.width.saturating_sub(10).clamp(40, 76);
     let blurb_lines = textwrap_len(blurb, width as usize - 4);
