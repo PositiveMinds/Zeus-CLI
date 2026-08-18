@@ -1010,14 +1010,15 @@ mod tests {
     #[test]
     fn augment_path_skips_missing_dirs_and_dedupes() {
         let tmp = TempDir::new().unwrap();
+        let sep = if cfg!(windows) { ';' } else { ':' };
         // No toolchain dirs exist under the fake home -> unchanged.
-        let original = "C:\\Windows;C:\\System32";
-        assert_eq!(augment_path(original, tmp.path()), original);
+        let original = format!("C:\\Windows{sep}C:\\System32");
+        assert_eq!(augment_path(&original, tmp.path()), original);
         // Already-listed dirs are not duplicated.
         let home_with_cargo = tmp.path().join("home");
         std::fs::create_dir_all(home_with_cargo.join(".cargo/bin")).unwrap();
         let already = format!(
-            "{};C:\\Windows",
+            "{}{sep}C:\\Windows",
             home_with_cargo.join(".cargo/bin").display()
         );
         let out = augment_path(&already, &home_with_cargo);
@@ -1278,7 +1279,10 @@ mod tests {
         };
         let wait_growth = |path: &std::path::Path| {
             let before = lines(path);
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            // CI Windows runners cold-start powershell very slowly (AV scan +
+            // parallel test-thread CPU contention), so allow a generous
+            // deadline before concluding the worker never wrote.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
                 std::thread::sleep(Duration::from_millis(100));
                 if lines(path) > before || std::time::Instant::now() > deadline {

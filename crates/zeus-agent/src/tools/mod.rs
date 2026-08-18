@@ -5786,7 +5786,8 @@ mod tests {
         // we can: dispatch_inner routes every registered name to do_platform
         // rather than UnknownTool.
         for name in &registry {
-            let tm = tool_manager(std::path::Path::new("/does/not/matter"));
+            let tmp = TempDir::new().unwrap();
+            let tm = tool_manager(tmp.path());
             let r = tm.dispatch_with_approver(name, "{}", approve).unwrap();
             // A real platform call will fail on a missing CLI/auth — that's
             // fine. What must never happen is UnknownTool (no handler).

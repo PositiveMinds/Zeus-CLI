@@ -67,7 +67,7 @@ if have python3; then
 fi
 
 if have php; then
-  run php php_app bash -c "php -l src/index.php >/dev/null"
+  run php php_app bash -c "php -l index.php >/dev/null"
   run laravel lar_app bash -c "php -l artisan >/dev/null && php -l routes/web.php >/dev/null"
 fi
 
