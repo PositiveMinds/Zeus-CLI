@@ -354,7 +354,10 @@ mod tests {
         std::fs::write(&corrupt, b"this is definitely not a PE/ELF/Mach-O binary").unwrap();
 
         let plugins = load_all(tmp.path());
-        assert!(plugins.is_empty(), "corrupt dylib must be skipped, not loaded");
+        assert!(
+            plugins.is_empty(),
+            "corrupt dylib must be skipped, not loaded"
+        );
     }
 
     #[test]
@@ -368,7 +371,10 @@ mod tests {
         std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
 
         let plugins = load_all(tmp.path());
-        assert!(plugins.is_empty(), "truncated dylib must be skipped, not loaded");
+        assert!(
+            plugins.is_empty(),
+            "truncated dylib must be skipped, not loaded"
+        );
     }
 
     #[test]

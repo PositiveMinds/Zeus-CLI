@@ -942,7 +942,11 @@ impl Agent {
                 on_event(AgentEvent::PlanGenerated {
                     steps: planned.clone(),
                 });
-                (TaskPlan::from_steps(goal, &planned, "", false), planned, false)
+                (
+                    TaskPlan::from_steps(goal, &planned, "", false),
+                    planned,
+                    false,
+                )
             }
         };
 
@@ -1722,6 +1726,19 @@ impl Agent {
                     |_: &PermissionRequest| ApprovalDecision::Approved,
                 )?;
                 messages.push(Message::tool_result(call.id.clone(), result.content));
+                if !result.images.is_empty() {
+                    // Keep a specialist's visual findings visible to the
+                    // model, same as `drive_turn` does for the main loop —
+                    // `read_image` is in the read-only tool set, so images
+                    // must ride along on their own user message here.
+                    messages.push(Message::user_with_images(
+                        format!(
+                            "The tool '{}' produced image content you must inspect visually (attached below).",
+                            call.name
+                        ),
+                        result.images,
+                    ));
+                }
             }
         }
         Ok((
@@ -1845,8 +1862,10 @@ impl Agent {
                     .map_err(AgentError::Provider)?;
 
                 let mut text = String::new();
-                let mut calls: HashMap<String, (Option<String>, String, Option<serde_json::Value>)> =
-                    HashMap::new();
+                let mut calls: HashMap<
+                    String,
+                    (Option<String>, String, Option<serde_json::Value>),
+                > = HashMap::new();
                 let mut call_order: Vec<String> = Vec::new();
                 let mut finish = FinishReason::Stop;
 
@@ -1904,13 +1923,10 @@ impl Agent {
                      This usually happens when a small model chokes on a large tool list. \
                      Reply with a concrete answer, or make a valid tool call \
                      (attempt {} of {}).",
-                    degenerate_retries,
-                    MAX_DEGENERATE_RETRIES
+                    degenerate_retries, MAX_DEGENERATE_RETRIES
                 );
                 on_event(AgentEvent::TextDelta(nudge.clone()));
-                self.state
-                    .messages
-                    .push(Message::user(nudge.clone()));
+                self.state.messages.push(Message::user(nudge.clone()));
             };
 
             if finish == FinishReason::Cancelled {
@@ -2177,12 +2193,10 @@ impl Agent {
             .push(Message::assistant(conclude_text.clone()));
         self.persist()?;
         on_event(AgentEvent::Done);
-        self.tools
-            .hooks()
-            .run_on_stop(
-                &self.state.session_id,
-                &format!("turn finished: {total_tool_calls} tool call(s), forced conclusion"),
-            );
+        self.tools.hooks().run_on_stop(
+            &self.state.session_id,
+            &format!("turn finished: {total_tool_calls} tool call(s), forced conclusion"),
+        );
         Ok(TurnResult {
             final_text: conclude_text,
             tool_calls: total_tool_calls,
@@ -2494,6 +2508,18 @@ async fn run_headless_step(
                 |_: &PermissionRequest| ApprovalDecision::Approved,
             )?;
             messages.push(Message::tool_result(call.id.clone(), result.content));
+            if !result.images.is_empty() {
+                // Headless steps expose `read_image` (read-only), so carry
+                // any image the specialist read along to the model too —
+                // otherwise its visual findings would be invisible.
+                messages.push(Message::user_with_images(
+                    format!(
+                        "The tool '{}' produced image content you must inspect visually (attached below).",
+                        call.name
+                    ),
+                    result.images,
+                ));
+            }
         }
     }
     Ok((
@@ -2672,12 +2698,14 @@ mod tests {
                 MockReply::ToolCalls(calls) => {
                     let tool_calls: Vec<zeus_provider::ToolCall> = calls
                         .into_iter()
-                        .map(|(id, name, arguments, extra_content)| zeus_provider::ToolCall {
-                            id,
-                            name,
-                            arguments,
-                            extra_content,
-                        })
+                        .map(
+                            |(id, name, arguments, extra_content)| zeus_provider::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                                extra_content,
+                            },
+                        )
                         .collect();
                     let mut message = Message::assistant("");
                     message.tool_calls = tool_calls;
@@ -2898,7 +2926,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.tool_calls, 1, "repeated call must not be executed again");
+        assert_eq!(
+            result.tool_calls, 1,
+            "repeated call must not be executed again"
+        );
         assert!(
             result.final_text.contains("repeated the same tool call"),
             "expected stuck-loop message, got: {}",
@@ -3352,7 +3383,10 @@ mod tests {
                 .push(request.tools.iter().map(|t| t.name.clone()).collect());
             self.inner.chat(request).await
         }
-        async fn stream(&self, request: ChatRequest) -> zeus_provider::Result<zeus_provider::ChatStream> {
+        async fn stream(
+            &self,
+            request: ChatRequest,
+        ) -> zeus_provider::Result<zeus_provider::ChatStream> {
             self.tools_seen
                 .lock()
                 .unwrap()
@@ -3362,10 +3396,16 @@ mod tests {
         async fn list_models(&self) -> zeus_provider::Result<Vec<ModelInfo>> {
             self.inner.list_models().await
         }
-        async fn embeddings(&self, request: EmbeddingRequest) -> zeus_provider::Result<EmbeddingResponse> {
+        async fn embeddings(
+            &self,
+            request: EmbeddingRequest,
+        ) -> zeus_provider::Result<EmbeddingResponse> {
             self.inner.embeddings(request).await
         }
-        async fn count_tokens(&self, request: TokenCountRequest) -> zeus_provider::Result<TokenCountResponse> {
+        async fn count_tokens(
+            &self,
+            request: TokenCountRequest,
+        ) -> zeus_provider::Result<TokenCountResponse> {
             self.inner.count_tokens(request).await
         }
     }
@@ -3422,7 +3462,9 @@ mod tests {
         for request_tools in seen.iter() {
             assert!(request_tools.iter().any(|n| n == "read"));
             assert!(
-                request_tools.iter().all(|n| crate::tools::is_read_only_tool(n)),
+                request_tools
+                    .iter()
+                    .all(|n| crate::tools::is_read_only_tool(n)),
                 "non-read-only tool offered to headless step: {request_tools:?}"
             );
         }
@@ -3482,11 +3524,20 @@ mod tests {
             .unwrap();
 
         // The resume gate fired; the plan-execute gate did not.
-        assert!(requested.iter().any(|t| t == "plan_resume"), "{requested:?}");
-        assert!(!requested.iter().any(|t| t == "plan_execute"), "{requested:?}");
+        assert!(
+            requested.iter().any(|t| t == "plan_resume"),
+            "{requested:?}"
+        );
+        assert!(
+            !requested.iter().any(|t| t == "plan_execute"),
+            "{requested:?}"
+        );
         // Step 2 ran (only the pending step), and the review accepted it.
         assert!(summary.contains("did the second thing"), "{summary}");
-        assert!(requested.iter().any(|t| t == "review_accept"), "{requested:?}");
+        assert!(
+            requested.iter().any(|t| t == "review_accept"),
+            "{requested:?}"
+        );
         // The persisted plan now shows both steps done.
         let plan = crate::plans::TaskPlan::read(&tasks_file)
             .unwrap()
@@ -3544,8 +3595,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(requested.iter().any(|t| t == "plan_resume"), "{requested:?}");
-        assert!(requested.iter().any(|t| t == "plan_execute"), "{requested:?}");
+        assert!(
+            requested.iter().any(|t| t == "plan_resume"),
+            "{requested:?}"
+        );
+        assert!(
+            requested.iter().any(|t| t == "plan_execute"),
+            "{requested:?}"
+        );
         assert!(summary.contains("fresh step done"), "{summary}");
     }
 
@@ -3580,15 +3637,21 @@ mod tests {
 
         assert!(summary.contains("Review:"), "{summary}");
         let blocked = events.iter().find_map(|e| match e {
-            AgentEvent::ToolCallFinished { name, result, is_error, .. } if name == "write" => {
-                Some((result.clone(), *is_error))
-            }
+            AgentEvent::ToolCallFinished {
+                name,
+                result,
+                is_error,
+                ..
+            } if name == "write" => Some((result.clone(), *is_error)),
             _ => None,
         });
         let (result, is_error) = blocked.expect("write tool call recorded");
         assert!(is_error, "write during review must be an error result");
         assert!(result.contains("Plan mode is active"), "{result}");
-        assert!(!root.join("pwned.txt").exists(), "reviewer write must not land on disk");
+        assert!(
+            !root.join("pwned.txt").exists(),
+            "reviewer write must not land on disk"
+        );
     }
 
     #[tokio::test]

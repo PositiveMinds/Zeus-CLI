@@ -70,7 +70,9 @@ impl Persona {
     /// tool surface actually treats as mutating (test/verify/git_commit/…).
     pub fn read_only(&self) -> bool {
         match self.tools {
-            Some(tools) => !tools.is_empty() && tools.iter().all(|t| crate::tools::is_read_only_tool(t)),
+            Some(tools) => {
+                !tools.is_empty() && tools.iter().all(|t| crate::tools::is_read_only_tool(t))
+            }
             None => false,
         }
     }

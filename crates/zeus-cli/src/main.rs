@@ -105,7 +105,7 @@ async fn run() -> Result<()> {
     });
 
     match cli.command {
-        None => cmd_repl(&config, cli.yes).await,
+        None => cmd_repl(&config, cli.yes, cli.fresh).await,
         Some(Commands::Init { .. }) => unreachable!(),
         Some(Commands::Config { action }) => cmd_config(&config, action),
         Some(Commands::Chat {
@@ -164,6 +164,13 @@ async fn run() -> Result<()> {
             to,
             overwrite,
         }) => cmd_cp(&config, from, to, overwrite, cli.yes),
+        Some(Commands::Upload { paths, to, dry_run }) => cmd_upload(&config, paths, to, dry_run),
+        Some(Commands::Completion { shell }) => {
+            use clap::CommandFactory;
+            let mut cmd = crate::Cli::command();
+            clap_complete::generate(shell.to_clap(), &mut cmd, "zeus", &mut io::stdout());
+            Ok(())
+        }
         Some(Commands::BulkEdit {
             roots,
             old,
@@ -189,7 +196,9 @@ async fn run() -> Result<()> {
         Some(Commands::UserCommand { action }) => cmd_user_commands(&config, action, cli.yes),
         Some(Commands::Codeint { action }) => cmd_codeint(&config, action),
         Some(Commands::Ragindex { action }) => cmd_ragindex(&config, action).await,
-        Some(Commands::Project { action }) => cmd_project(&config, action, cli.project_root.as_deref()),
+        Some(Commands::Project { action }) => {
+            cmd_project(&config, action, cli.project_root.as_deref())
+        }
     }
 }
 
@@ -212,7 +221,34 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
         println!("  settings: {}", proj.settings_toml.display());
         println!("  memory:   {}", proj.memory_md.display());
         println!("  tasks:    {}", proj.tasks_json.display());
+        ensure_agent_gitignored(&root)?;
     }
+    Ok(())
+}
+
+/// If `root` is a git repo, make sure `.agent/` is ignored — uploaded files
+/// (`.agent/uploads/`) can be secrets, and a fresh project's `.gitignore`
+/// won't have the rule `zeus` itself relies on.
+fn ensure_agent_gitignored(root: &std::path::Path) -> Result<()> {
+    if !root.join(".git").exists() {
+        return Ok(());
+    }
+    let gitignore = root.join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    let already = existing.lines().any(|l| {
+        let t = l.trim();
+        t == ".agent" || t == ".agent/" || t == "**/.agent" || t == "**/.agent/" || t == "/.agent"
+    });
+    if already {
+        return Ok(());
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(".agent/\n");
+    std::fs::write(&gitignore, out).with_context(|| format!("write {}", gitignore.display()))?;
+    println!("  gitignore: added `.agent/` to {}", gitignore.display());
     Ok(())
 }
 
@@ -421,6 +457,73 @@ pub(crate) fn describe_providers(config: &Config) -> Vec<String> {
     out
 }
 
+/// If `err` reads like an out-of-credits / billing failure from a cloud
+/// provider (the OpenRouter 402 we've seen in the wild), return a concrete
+/// "switch to a provider that has a key" hint — listing exactly which
+/// configured providers are usable right now. `None` for anything else, so
+/// callers fall through to the generic error handling untouched.
+/// Providers other than `exclude` that currently have a usable key: a stored
+/// key, an embedded Authorization header, a non-empty api_key_env variable,
+/// or a local kind that needs no key at all. Sorted for stable output.
+fn providers_with_keys(config: &Config, exclude: &str) -> Vec<String> {
+    let stored = KeysFile::load(&config.global.keys_toml).unwrap_or_default();
+    let mut names: Vec<String> = config
+        .providers
+        .providers
+        .iter()
+        .filter(|(name, cfg)| {
+            if name.as_str() == exclude {
+                return false; // it's the one that just failed
+            }
+            let local = matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp");
+            local
+                || stored.get(name).is_some()
+                || cfg.headers.contains_key("Authorization")
+                || cfg
+                    .api_key_env
+                    .as_ref()
+                    .map(|var| std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false))
+                    .unwrap_or(false)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+pub(crate) fn credit_failure_hint(config: &Config, err: &str) -> Option<String> {
+    let lower = err.to_lowercase();
+    let is_credit = [
+        "402",
+        "insufficient credits",
+        "out of credits",
+        "credit limit",
+        "more credits",
+        "billing",
+        "payment required",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
+    if !is_credit {
+        return None;
+    }
+    let with_key = providers_with_keys(config, &config.settings.model.provider);
+    if with_key.is_empty() {
+        return Some(
+            "this provider is out of credits — add credits at its billing page, or set a key \
+             for another provider with `zeus key set <name>` (see `zeus key list`)"
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "this provider is out of credits — {} has a key. Switch with `/provider {}` \
+         (TUI) or `zeus chat --provider {}` (one-shot).",
+        with_key.join(", "),
+        with_key[0],
+        with_key[0]
+    ))
+}
+
 /// Persist the default provider (and optionally model) to the active
 /// settings.toml layer — so a `/provider` switch survives restarts. Returns
 /// the path written, for the confirm message.
@@ -513,11 +616,47 @@ async fn cmd_chat(
     let request = ChatRequest::new(
         model.clone(),
         vec![
-            Message::system("You are zeus, a helpful coding assistant. Be concise and accurate."),
+            Message::system(format!(
+                "You are zeus, a helpful coding assistant. Be concise and accurate. \
+                 Today's date is {today}; the current local time is {time_now}.",
+                today = current_date(),
+                time_now = current_time(),
+            )),
             Message::user(message),
         ],
     );
 
+    run_chat_with_failover(config, &*provider, model, request, stream).await
+}
+
+/// Whether a provider error is a good candidate for failing over to another
+/// configured provider: out-of-credits (402 / billing language) or a rate
+/// limit (429). Contract errors (400/401/403/404) and 5xx are not — 5xx is
+/// provider-specific and usually affects all endpoints at once.
+fn failover_relevant(err: &anyhow::Error) -> bool {
+    let Some(provider_err) = err.downcast_ref::<zeus_provider::ProviderError>() else {
+        return false;
+    };
+    match provider_err {
+        zeus_provider::ProviderError::Http { status, message } => {
+            *status == 402 || *status == 429 || {
+                let lower = message.to_lowercase();
+                lower.contains("credit")
+                    || lower.contains("billing")
+                    || lower.contains("quota")
+                    || lower.contains("rate limit")
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Send one chat request, streaming or not.
+async fn attempt_chat(
+    provider: &dyn ModelProvider,
+    request: ChatRequest,
+    stream: bool,
+) -> anyhow::Result<()> {
     if stream {
         let mut s = provider.stream(request).await.context("stream start")?;
         let stdout = io::stdout();
@@ -555,6 +694,55 @@ async fn cmd_chat(
         );
     }
     Ok(())
+}
+
+/// One-shot `chat`: send with the requested provider, and if it bounces with
+/// out-of-credits or a rate limit, silently fail over to the next configured
+/// provider that has a key (mirroring `credit_failure_hint`'s candidate set).
+async fn run_chat_with_failover(
+    config: &Config,
+    primary: &dyn ModelProvider,
+    primary_model: String,
+    request: ChatRequest,
+    stream: bool,
+) -> Result<()> {
+    match attempt_chat(primary, request.clone(), stream).await {
+        Ok(()) => Ok(()),
+        Err(err) if failover_relevant(&err) => {
+            let candidates = providers_with_keys(config, primary.id());
+            if candidates.is_empty() {
+                return Err(err).context(format!(
+                    "no other provider with a key — add credits to {} or run `zeus chat --provider <name>`",
+                    primary.id()
+                ));
+            }
+            let mut last = err;
+            for name in candidates {
+                let Ok(prov) = create_provider(&name, &config.providers) else {
+                    continue;
+                };
+                let model = config
+                    .providers
+                    .get(&name)
+                    .and_then(|c| c.default_model.clone())
+                    .unwrap_or_else(|| primary_model.clone());
+                eprintln!(
+                    "{} is out of credits / rate-limited — failing over to {} ({model})",
+                    primary.id(),
+                    name
+                );
+                match attempt_chat(&*prov, request.clone(), stream).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = e,
+                }
+            }
+            Err(last).context(format!(
+                "all failover providers failed (from {})",
+                primary.id()
+            ))
+        }
+        Err(err) => Err(err).context("chat failed"),
+    }
 }
 
 async fn cmd_models(
@@ -1017,11 +1205,19 @@ async fn build_agent_with_provider(
 
 /// The agent's standing instructions (system prompt): identity, tool
 /// discipline, and the anti-hallucination grounding rules. New sessions get
-/// this as their leading system message; resumed sessions keep their own.
+/// this as their leading system message; resumed sessions keep their own
+/// (their stale date is harmless — the agent can always call the
+/// `current_time` tool for a fresh reading, which is also how a session that
+/// runs past midnight keeps an accurate sense of "today").
 fn system_prompt(_config: &Config) -> Message {
-    Message::system(
+    Message::system(format!(
         "You are zeus, a helpful coding assistant with access to file, git, terminal, \
-             and search tools. Default to replying in plain text with no tool call at all. \
+             and search tools. Today's date is {today}, and the current local time is \
+             {time_now}. For any date/time question, answer directly from these facts or, \
+             when precision matters or the session has been running a while, call the \
+             current_time tool — never guess a date from your training data.\n\
+             \n\
+             Default to replying in plain text with no tool call at all. \
              Only call a tool when the user's message clearly requires one — e.g. they ask you \
              to read, write, or search a specific file, run a command, or inspect git history. \
              A greeting, thank-you, or general question (\"hi\", \"hello\", \"thanks\", \"how are \
@@ -1046,7 +1242,20 @@ fn system_prompt(_config: &Config) -> Message {
              you, say you need to run the relevant tool rather than fabricating the answer.\n\
              5. When you are not certain, say so plainly. It is always better to admit a gap or \
              run a tool than to produce a confident but wrong answer.",
-    )
+        today = current_date(),
+        time_now = current_time(),
+    ))
+}
+
+/// `2026-08-18` — the session-start date, stamped into the system prompt.
+fn current_date() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// `HH:MM:SS` (local) at session start, so a "what time is it" right after
+/// opening zeus is answerable without a tool round-trip.
+fn current_time() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 /// A factual, bounded snapshot of the project the agent is operating in,
@@ -1629,6 +1838,14 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "copy",
         "copy the last assistant reply to the system clipboard",
     ),
+    (
+        "upload",
+        "copy files (anywhere on disk) into .agent/uploads/ and tell the agent to read them: /upload [--to SUBDIR] <path> [path ...]",
+    ),
+    (
+        "uploads",
+        "list what's currently staged under .agent/uploads/: /uploads",
+    ),
 ];
 
 fn print_repl_help_lines() -> String {
@@ -1943,7 +2160,25 @@ pub(crate) async fn build_agent_repl_with_session(
     }
 }
 
-async fn cmd_repl(config: &Config, yes: bool) -> Result<()> {
+async fn cmd_repl(config: &Config, yes: bool, fresh: bool) -> Result<()> {
+    // Auto-resume the most recently used saved session unless the user asked
+    // for a fresh one with `--new`. A crashed/killed session therefore picks
+    // right back up where it left off (state files are written atomically,
+    // so a corrupt file still resolves to a clean empty session rather than
+    // a hard launch failure).
+    let store = SessionStore::new(config.global.sessions.clone());
+    if !fresh {
+        if let Ok(Some(id)) = store.most_recent() {
+            let agent = build_agent_repl_with_session(config, None, None, id).await?;
+            if config.project_root.is_some() {
+                agent.set_plan_mode(true);
+            }
+            if io::stdin().is_terminal() && io::stdout().is_terminal() {
+                return tui::run(config, agent, yes).await;
+            }
+            return run_plain_repl(config, agent, yes).await;
+        }
+    }
     let agent = build_agent_repl(config).await?;
     if config.project_root.is_some() {
         agent.set_plan_mode(true);
@@ -1988,6 +2223,11 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
             break;
         }
 
+        // A successful /upload copies the files and then falls through to a
+        // normal turn whose message tells the agent what arrived — so this
+        // override is declared at loop scope, not inside the slash block.
+        let mut upload_message: Option<String> = None;
+
         // Built-in REPL meta-commands — intercepted before the user-defined
         // `.agent/commands/*.md` template expansion below, and never sent
         // to the model themselves (unlike those templates, which expand
@@ -1999,6 +2239,64 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
             let arg = parts.next().unwrap_or("").trim();
             let mut handled = true;
             match cmd {
+                "upload" => {
+                    let (to, paths, parse_err) = parse_upload_args(arg);
+                    if let Some(e) = parse_err {
+                        eprintln!("upload failed: {e}");
+                    } else if paths.is_empty() {
+                        eprintln!(
+                            "usage: /upload [--to SUBDIR] <path> [path ...] — copies files \
+                             (anywhere on disk) into .agent/uploads/ and tells the agent to read them; \
+                             quote paths with spaces: /upload \"my file.png\""
+                        );
+                    } else {
+                        match upload_files(config, &paths, to.as_deref(), false) {
+                            Ok(report) if !report.uploaded.is_empty() => {
+                                for rel in &report.uploaded {
+                                    println!("uploaded: {rel}");
+                                }
+                                for w in &report.warnings {
+                                    println!("warning: {w}");
+                                }
+                                upload_message = Some(format!(
+                                    "The user uploaded the following file(s). Read each one as \
+                                     appropriate — read for text, read_image for images, \
+                                     read_document for PDF/office docs:\n{}",
+                                    report.uploaded.join("\n")
+                                ));
+                                handled = false; // send the turn below
+                            }
+                            Ok(_) => eprintln!("no files uploaded"),
+                            Err(e) => eprintln!("upload failed: {e:#}"),
+                        }
+                    }
+                }
+                "uploads" => match arg.split_whitespace().next() {
+                    Some("rm") => {
+                        let rel = arg["rm".len()..].trim();
+                        match delete_upload(config, rel) {
+                            Ok(n) => println!("removed {n} item(s) from .agent/uploads"),
+                            Err(e) => eprintln!("remove failed: {e:#}"),
+                        }
+                    }
+                    _ => match list_uploads(config) {
+                        Ok(entries) if entries.is_empty() => {
+                            println!("no uploads staged yet — use /upload <path> to add files");
+                        }
+                        Ok(entries) => {
+                            println!("staged uploads:");
+                            for e in entries {
+                                if e.size == 0 {
+                                    println!("  {}  (dir)", e.rel);
+                                } else {
+                                    println!("  {}  {}", e.rel, human_size(e.size));
+                                }
+                            }
+                            println!("use `/uploads rm <rel-path>` to remove one");
+                        }
+                        Err(e) => eprintln!("uploads listing failed: {e:#}"),
+                    },
+                },
                 "help" => print_repl_help(),
                 "clear" => {
                     let (provider, model) =
@@ -2328,7 +2626,10 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
             }
         }
 
-        let message = expand_slash_command(config, line.to_string());
+        let message = match upload_message {
+            Some(m) => m,
+            None => expand_slash_command(config, line.to_string()),
+        };
 
         // Ctrl-C during a turn cancels *that turn* via the agent's existing
         // cancellation mechanism (run_turn notices it internally and winds
@@ -2357,6 +2658,9 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     "\n{}",
                     ui::styled(ui::error_style(), &format!("turn failed: {e:#}"))
                 );
+                if let Some(hint) = credit_failure_hint(config, &format!("{e:#}")) {
+                    eprintln!("{}", ui::styled(ui::warn_style(), &hint));
+                }
                 continue;
             }
         };
@@ -2487,6 +2791,528 @@ fn cmd_cp(config: &Config, from: PathBuf, to: PathBuf, overwrite: bool, yes: boo
         .copy(&from, &to, CopyOptions { overwrite }, approver(yes))
         .context("cp")?;
     println!("copied {} -> {}", from.display(), to.display());
+    Ok(())
+}
+
+/// `zeus upload <paths...>`: copy files/directories (from anywhere on disk)
+/// into `<project>/.agent/uploads/` and print their project-relative paths.
+/// The agent can only read inside the project root (path containment), so
+/// this is the "give zeus a file that lives elsewhere" ergonomic.
+fn cmd_upload(
+    config: &Config,
+    paths: Vec<PathBuf>,
+    to: Option<String>,
+    dry_run: bool,
+) -> Result<()> {
+    let raw: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let report = upload_files(config, &raw, to.as_deref(), dry_run)?;
+    let verb = if dry_run { "would stage" } else { "uploaded" };
+    for rel in &report.uploaded {
+        println!("{verb}: {rel}");
+    }
+    for w in &report.warnings {
+        println!("warning: {w}");
+    }
+    if report.uploaded.is_empty() {
+        println!("nothing to upload");
+        return Ok(());
+    }
+    if dry_run {
+        println!("(dry run — nothing was copied; drop --dry-run to stage these)");
+    } else {
+        println!(
+            "staged under .agent/uploads — the agent reads these like any project file \
+             (read for text, read_image for images, read_document for PDF/office docs)."
+        );
+    }
+    Ok(())
+}
+
+/// Result of a successful upload: the staged project-relative paths plus any
+/// non-fatal notes (e.g. "this looks binary, so the agent can't read it as
+/// text"). Warnings are printed to the user but don't stop the upload.
+#[derive(Debug, PartialEq)]
+pub(crate) struct UploadReport {
+    pub uploaded: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Per-upload safety cap — a single top-level path (file or whole tree) may
+/// stage at most this many bytes, so a stray multi-GB directory can't be
+/// pulled into the project by accident.
+const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Copy one or more paths (files or directories) from anywhere on disk into
+/// `<project>/.agent/uploads/`, returning each item's project-relative path
+/// (forward slashes, so the agent and the user see the same spelling). All
+/// inputs are validated *before* any copy, so a typo'd path doesn't leave
+/// earlier uploads half-staged. Symlinks are never followed, and nothing
+/// over `MAX_UPLOAD_BYTES` is staged. A plain local copy — nothing leaves
+/// the machine. Used by both `zeus upload` and the `/upload` slash command.
+/// With `dry_run` the destinations are computed and returned but nothing is
+/// copied or created.
+pub(crate) fn upload_files(
+    config: &Config,
+    paths: &[String],
+    to: Option<&str>,
+    dry_run: bool,
+) -> Result<UploadReport> {
+    let root = config.project_root.clone().ok_or_else(|| {
+        anyhow::anyhow!("no project root — run zeus inside a project (or pass --project-root)")
+    })?;
+    let mut dest_dir = root.join(".agent").join("uploads");
+    if let Some(sub) = to {
+        // Keep the subdir a single plain name — never a path — so a value
+        // like `..` or `a/b` can't point the upload somewhere surprising.
+        if sub.is_empty() || sub == "." || sub == ".." || sub.contains(['/', '\\']) {
+            bail!("--to must be a plain subdirectory name (no slashes): got '{sub}'");
+        }
+        dest_dir = dest_dir.join(sub);
+    }
+    if !dry_run {
+        std::fs::create_dir_all(&dest_dir)
+            .with_context(|| format!("create upload directory {}", dest_dir.display()))?;
+    }
+
+    // Validate every path before copying any of them.
+    let mut sources: Vec<PathBuf> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for raw in paths {
+        let p = raw.trim().trim_matches(['"', '\'']);
+        if p.is_empty() {
+            continue;
+        }
+        let src = PathBuf::from(p);
+        let src = if src.is_absolute() {
+            src
+        } else {
+            std::env::current_dir()
+                .context("read current directory")?
+                .join(src)
+        };
+        if !src.exists() {
+            errors.push(format!("'{p}' does not exist"));
+            continue;
+        }
+        sources.push(src);
+    }
+    if !errors.is_empty() {
+        bail!("upload aborted — {}", errors.join("; "));
+    }
+
+    // Pre-flight the whole set (symlinks + sizes) so a bad pick aborts
+    // before a single byte is copied.
+    let mut symlinks: Vec<String> = Vec::new();
+    let mut oversized: Vec<String> = Vec::new();
+    for src in &sources {
+        let size = walk_upload_tree(src, &mut symlinks)?;
+        if size > MAX_UPLOAD_BYTES {
+            oversized.push(format!(
+                "'{}' is {:.1} GiB — the upload cap is {:.0} MiB",
+                src.display(),
+                size as f64 / (1024.0 * 1024.0 * 1024.0),
+                MAX_UPLOAD_BYTES as f64 / (1024.0 * 1024.0)
+            ));
+        }
+    }
+    if !symlinks.is_empty() {
+        bail!(
+            "upload aborted — symlinks are never followed: {}",
+            symlinks.join("; ")
+        );
+    }
+    if !oversized.is_empty() {
+        bail!("upload aborted — {}", oversized.join("; "));
+    }
+
+    let mut uploaded = Vec::new();
+    let mut warnings = Vec::new();
+    for src in sources {
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow::anyhow!("can't derive a file name from '{}'", src.display()))?;
+        // Idempotency: re-uploading a file whose staged copy is byte-identical
+        // (or a directory tree that already matches) is a no-op — no `-1`
+        // duplicate is created and nothing is clobbered. Only a *changed*
+        // source gets deduped into `name-1`, `name-2`, …
+        let first_dest = dest_dir.join(&name);
+        if upload_is_unchanged(&src, &first_dest) {
+            let rel = first_dest
+                .strip_prefix(&root)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| first_dest.display().to_string());
+            uploaded.push(rel);
+            continue;
+        }
+        let dest = unique_dest(&dest_dir, &name);
+        if !dry_run {
+            if src.is_dir() {
+                copy_dir_recursive(&src, &dest)
+                    .with_context(|| format!("upload directory {}", src.display()))?;
+            } else {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create {}", parent.display()))?;
+                }
+                std::fs::copy(&src, &dest).with_context(|| format!("upload {}", src.display()))?;
+            }
+        }
+        let rel = dest
+            .strip_prefix(&root)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| dest.display().to_string());
+        uploaded.push(rel);
+        if !dry_run && !src.is_dir() {
+            if let Some(w) = upload_warning_for(&dest) {
+                warnings.push(w);
+            }
+        }
+    }
+    Ok(UploadReport { uploaded, warnings })
+}
+
+/// Split a `/upload` command line into `(to, paths, error)`. Handles a
+/// `--to <subdir>` flag anywhere in the line and double-quoted paths that
+/// contain spaces — `/upload --to designs "/my files/a b.png" c.png`.
+/// The returned paths are de-quoted; `upload_files` re-trims defensively.
+pub(crate) fn parse_upload_args(arg: &str) -> (Option<String>, Vec<String>, Option<String>) {
+    let mut to = None;
+    let mut paths = Vec::new();
+    let mut error = None;
+    let cs: Vec<char> = arg.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        while i < cs.len() && cs[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= cs.len() {
+            break;
+        }
+        let mut tok = String::new();
+        if cs[i] == '"' {
+            i += 1;
+            let mut closed = false;
+            while i < cs.len() {
+                if cs[i] == '"' {
+                    closed = true;
+                    i += 1;
+                    break;
+                }
+                tok.push(cs[i]);
+                i += 1;
+            }
+            if !closed {
+                error = Some("unterminated quote in path".to_string());
+            }
+        } else {
+            while i < cs.len() && !cs[i].is_whitespace() {
+                tok.push(cs[i]);
+                i += 1;
+            }
+        }
+        if tok == "--to" {
+            while i < cs.len() && cs[i].is_whitespace() {
+                i += 1;
+            }
+            let mut sub = String::new();
+            if i < cs.len() && cs[i] == '"' {
+                i += 1;
+                while i < cs.len() && cs[i] != '"' {
+                    sub.push(cs[i]);
+                    i += 1;
+                }
+                if i < cs.len() {
+                    i += 1;
+                }
+            } else {
+                while i < cs.len() && !cs[i].is_whitespace() {
+                    sub.push(cs[i]);
+                    i += 1;
+                }
+            }
+            if sub.is_empty() {
+                error = Some("--to needs a value".to_string());
+            } else {
+                to = Some(sub);
+            }
+        } else if !tok.is_empty() && error.is_none() {
+            paths.push(tok);
+        }
+        if error.is_some() {
+            break;
+        }
+    }
+    (to, paths, error)
+}
+
+/// One staged upload, project-relative with forward slashes (dirs get a
+/// trailing `/` and a `size` of 0).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UploadEntry {
+    pub rel: String,
+    pub size: u64,
+}
+
+/// The `<project>/.agent/uploads` directory, erroring when there's no
+/// project root.
+pub(crate) fn uploads_dir(config: &Config) -> Result<std::path::PathBuf> {
+    let root = config
+        .project_root
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no project root — run zeus inside a project"))?;
+    Ok(root.join(".agent").join("uploads"))
+}
+
+/// List everything currently staged under `<project>/.agent/uploads/`.
+/// Empty when nothing is staged yet. Backs the `/uploads` slash command.
+pub(crate) fn list_uploads(config: &Config) -> Result<Vec<UploadEntry>> {
+    let dir = uploads_dir(config)?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let root = config.project_root.clone().unwrap();
+    let mut out = Vec::new();
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).with_context(|| format!("read {}", d.display()))? {
+            let entry = entry.context("read directory entry")?;
+            let p = entry.path();
+            let rel = p
+                .strip_prefix(&root)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| p.display().to_string());
+            if entry.file_type().context("stat directory entry")?.is_dir() {
+                out.push(UploadEntry {
+                    rel: format!("{rel}/"),
+                    size: 0,
+                });
+                stack.push(p);
+            } else {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push(UploadEntry { rel, size });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(out)
+}
+
+/// Delete a staged upload (file, or directory tree). The `rel` path is
+/// validated to stay inside `.agent/uploads/` so it can't escape. Returns
+/// the number of filesystem items removed.
+pub(crate) fn delete_upload(config: &Config, rel: &str) -> Result<u64> {
+    let dir = uploads_dir(config)?;
+    let rel = rel.trim().trim_matches(['"', '\'']).trim_start_matches('/');
+    // Accept both the listing's project-relative form (`.agent/uploads/x`)
+    // and a path already relative to the uploads dir (`x`).
+    let rel = rel
+        .strip_prefix(".agent/uploads/")
+        .or_else(|| rel.strip_prefix(".agent/uploads"))
+        .unwrap_or(rel);
+    if rel.is_empty() || rel == "." || rel == ".." {
+        bail!("usage: /uploads rm <rel-path> — pick one from the /uploads listing");
+    }
+    let dest = dir.join(rel);
+    let within = dest
+        .strip_prefix(&dir)
+        .ok()
+        .and_then(|p| p.components().next())
+        .map(|c| {
+            !matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        .unwrap_or(false);
+    if !within {
+        bail!("refusing to delete outside .agent/uploads: {rel}");
+    }
+    if !dest.exists() {
+        bail!("no such upload: {rel} (run /uploads to see the current listing)");
+    }
+    let meta =
+        std::fs::symlink_metadata(&dest).with_context(|| format!("stat {}", dest.display()))?;
+    let n = if meta.is_dir() {
+        let count = std::fs::read_dir(&dest)
+            .map(|rd| rd.flatten().count())
+            .unwrap_or(0)
+            + 1;
+        std::fs::remove_dir_all(&dest).with_context(|| format!("remove {}", dest.display()))?;
+        count as u64
+    } else {
+        std::fs::remove_file(&dest).with_context(|| format!("remove {}", dest.display()))?;
+        1
+    };
+    Ok(n)
+}
+
+/// Human-readable size, e.g. `14 B`, `12.3 KiB`, `4.5 MiB`.
+pub(crate) fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// Walk a source (file or whole tree), returning its total size in bytes and
+/// recording any symlinks found. Symlinks are never followed — they're
+/// reported so the caller can abort before copying anything.
+fn walk_upload_tree(src: &Path, symlinks: &mut Vec<String>) -> Result<u64> {
+    let meta = std::fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        symlinks.push(src.display().to_string());
+        return Ok(0);
+    }
+    if meta.is_file() {
+        return Ok(meta.len());
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry.context("read directory entry")?;
+        total += walk_upload_tree(&entry.path(), symlinks)?;
+    }
+    Ok(total)
+}
+
+/// A non-fatal note for one staged file: if it's a binary blob that isn't a
+/// known image or office-document format, the agent can't `read` it as text —
+/// say which tool it should use instead.
+fn upload_warning_for(dest: &Path) -> Option<String> {
+    let binary = match std::fs::File::open(dest) {
+        Ok(mut f) => {
+            let mut buf = [0u8; 8192];
+            let n = std::io::Read::read(&mut f, &mut buf).unwrap_or(0);
+            buf[..n].contains(&0)
+        }
+        Err(_) => return None,
+    };
+    if !binary {
+        return None;
+    }
+    let ext = dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let handled_by_read_image = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "avif" | "heic" | "ico"
+    );
+    let handled_by_read_document = matches!(
+        ext.as_str(),
+        "pdf" | "docx" | "doc" | "xlsx" | "xls" | "pptx" | "ppt" | "odt" | "ods" | "odp"
+    );
+    if handled_by_read_image || handled_by_read_document {
+        return None;
+    }
+    Some(format!(
+        "'{}' looks like a binary file — the agent can't 'read' it as text; use read_image (images) or read_document (PDF/office docs).",
+        dest.display()
+    ))
+}
+
+/// Pick a non-colliding destination name, appending `-1`, `-2`, … before the
+/// extension when `name` is already taken (an upload never overwrites).
+fn unique_dest(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (stem, ext) = match Path::new(name).extension().and_then(|e| e.to_str()) {
+        Some(ext) => {
+            let stem = Path::new(name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.to_string());
+            (stem, format!(".{ext}"))
+        }
+        None => (name.to_string(), String::new()),
+    };
+    for i in 1.. {
+        let candidate = dir.join(format!("{stem}-{i}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("loop always returns or the name space is exhausted")
+}
+
+/// True when the staged copy at `dest` already matches `src` — byte-identical
+/// for files, structurally identical (same relative paths, dirs, and file
+/// sizes) for directories. The basis of `/upload` idempotency.
+fn upload_is_unchanged(src: &Path, dest: &Path) -> bool {
+    if !dest.exists() {
+        return false;
+    }
+    if src.is_dir() {
+        if !dest.is_dir() {
+            return false;
+        }
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        collect_upload_tree(src, std::path::Path::new(""), &mut a);
+        collect_upload_tree(dest, std::path::Path::new(""), &mut b);
+        a.sort_by(|x, y| x.0.cmp(&y.0));
+        b.sort_by(|x, y| x.0.cmp(&y.0));
+        a == b
+    } else {
+        match (std::fs::metadata(src), std::fs::metadata(dest)) {
+            (Ok(a), Ok(b)) if a.len() == b.len() => {
+                matches!((std::fs::read(src), std::fs::read(dest)), (Ok(x), Ok(y)) if x == y)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Recursively collect `(relative path, is_dir, size)` for every entry under
+/// `dir`. Used to compare two directory trees without reading file bytes.
+fn collect_upload_tree(dir: &Path, rel: &Path, out: &mut Vec<(PathBuf, bool, u64)>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let child_rel = rel.join(e.file_name());
+            if p.is_dir() {
+                out.push((child_rel.clone(), true, 0));
+                collect_upload_tree(&p, &child_rel, out);
+            } else {
+                let len = p.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push((child_rel, false, len));
+            }
+        }
+    }
+}
+
+/// Recursively copy a directory tree. Symlinks are never followed — the
+/// pre-flight in `upload_files` already rejects them, so hitting one here is
+/// a race and is treated as fatal rather than silently copied.
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry.context("read directory entry")?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        let ft = entry.file_type().context("stat directory entry")?;
+        if ft.is_symlink() {
+            bail!("symlinks are never followed: {}", from.display());
+        }
+        if ft.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).with_context(|| format!("copy {}", from.display()))?;
+        }
+    }
     Ok(())
 }
 
@@ -2836,7 +3662,9 @@ fn load_symbol_index(root: &Path) -> Result<SymbolIndex> {
 /// walked-up project root, so scaffolding from inside an existing repo doesn't
 /// accidentally dump the new project into the ancestor repo.
 fn scaffold_base(explicit_root: Option<&Path>, cwd: &Path) -> PathBuf {
-    explicit_root.map(Path::to_path_buf).unwrap_or_else(|| cwd.to_path_buf())
+    explicit_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 fn cmd_project(config: &Config, action: ProjectCmd, explicit_root: Option<&Path>) -> Result<()> {
@@ -3743,7 +4571,8 @@ mod tests {
     /// `deepseek/deepseek-chat` passes through untouched).
     #[test]
     fn bg_orchestrate_argv_includes_model_flag() {
-        let args = bg_orchestrate_argv("write readme", Some("ship"), Some("deepseek/deepseek-chat"));
+        let args =
+            bg_orchestrate_argv("write readme", Some("ship"), Some("deepseek/deepseek-chat"));
         assert_eq!(args[0], "agent");
         assert!(args.windows(2).any(|w| w == ["--workflow", "ship"]));
         assert!(args
@@ -3772,5 +4601,462 @@ mod tests {
             } => assert_eq!(model.as_deref(), Some("deepseek/deepseek-chat")),
             other => panic!("expected bg orchestrate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_parses_upload_subcommand() {
+        let cli = Cli::try_parse_from([
+            "zeus",
+            "upload",
+            "C:/Users/me/Desktop/shot.png",
+            "C:/Users/me/Documents/report.pdf",
+            "--to",
+            "designs",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Upload { paths, to, dry_run } => {
+                assert_eq!(paths.len(), 2);
+                assert_eq!(to.as_deref(), Some("designs"));
+                assert!(!dry_run);
+            }
+            other => panic!("expected Upload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upload_files_copies_into_project_and_dedupes() {
+        use tempfile::TempDir;
+        use zeus_config::{AgentSettings, GlobalPaths, ProvidersFile};
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Source files live OUTSIDE the project root — that's the whole point
+        // of upload: the agent can only read inside the project, so upload
+        // stages the file there for it.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("shot.png"), b"png-bytes").unwrap();
+        std::fs::write(outside.join("report.pdf"), b"pdf-bytes").unwrap();
+        std::fs::create_dir_all(outside.join("assets")).unwrap();
+        std::fs::write(outside.join("assets/logo.svg"), b"<svg/>").unwrap();
+
+        let config = Config {
+            global: GlobalPaths::from_root(root.join(".zeus-home")),
+            project: None,
+            settings: AgentSettings::default(),
+            providers: ProvidersFile::default(),
+            project_root: Some(root.clone()),
+        };
+
+        let report = upload_files(
+            &config,
+            &[
+                outside.join("shot.png").to_string_lossy().into_owned(),
+                outside.join("report.pdf").to_string_lossy().into_owned(),
+                outside.join("assets").to_string_lossy().into_owned(),
+            ],
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.uploaded,
+            vec![
+                ".agent/uploads/shot.png".to_string(),
+                ".agent/uploads/report.pdf".to_string(),
+                ".agent/uploads/assets".to_string(),
+            ]
+        );
+        assert!(
+            report.warnings.is_empty(),
+            "text/svg/png uploads shouldn't warn: {:?}",
+            report.warnings
+        );
+        assert_eq!(
+            std::fs::read(root.join(".agent/uploads/shot.png")).unwrap(),
+            b"png-bytes"
+        );
+        assert!(root.join(".agent/uploads/assets/logo.svg").exists());
+
+        // Re-uploading a byte-identical file is a no-op (idempotent) — the
+        // staged copy already matches, so no `-1` duplicate is created.
+        let second = upload_files(
+            &config,
+            &[outside.join("shot.png").to_string_lossy().into_owned()],
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(second.uploaded, vec![".agent/uploads/shot.png".to_string()]);
+
+        // Only a *changed* source gets deduped — never clobbered.
+        std::fs::write(outside.join("shot.png"), "png-bytes-v2").unwrap();
+        let second = upload_files(
+            &config,
+            &[outside.join("shot.png").to_string_lossy().into_owned()],
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            second.uploaded,
+            vec![".agent/uploads/shot-1.png".to_string()]
+        );
+
+        // --to stages under a named subdirectory.
+        let sub = upload_files(
+            &config,
+            &[outside.join("shot.png").to_string_lossy().into_owned()],
+            Some("designs"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            sub.uploaded,
+            vec![".agent/uploads/designs/shot.png".to_string()]
+        );
+
+        // A missing path aborts cleanly (and before copying anything).
+        let err = upload_files(
+            &config,
+            &["C:/definitely/missing.txt".to_string()],
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+
+        // --to refuses path separators so it can't escape .agent/uploads.
+        let err = upload_files(&config, &[], Some("../evil"), false).unwrap_err();
+        assert!(err.to_string().contains("plain subdirectory"));
+
+        // /uploads lists what's staged (dirs with a trailing slash + sizes).
+        let listed = list_uploads(&config).unwrap();
+        let rels: Vec<&str> = listed.iter().map(|e| e.rel.as_str()).collect();
+        assert!(rels.contains(&".agent/uploads/report.pdf"));
+        assert!(rels.contains(&".agent/uploads/assets/"));
+        assert!(rels.contains(&".agent/uploads/shot-1.png"));
+        let pdf = listed
+            .iter()
+            .find(|e| e.rel == ".agent/uploads/report.pdf")
+            .unwrap();
+        assert_eq!(pdf.size, 9, "pdf-bytes is 9 bytes");
+        assert!(listed
+            .iter()
+            .any(|e| e.rel == ".agent/uploads/shot.png" && e.size == 9));
+
+        // Dry-run computes the same destinations without touching the disk.
+        let dry = upload_files(
+            &config,
+            &[outside.join("shot.png").to_string_lossy().into_owned()],
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(dry.uploaded, vec![".agent/uploads/shot-2.png".to_string()]);
+        assert!(
+            dry.warnings.is_empty(),
+            "dry run must not sniff staged files"
+        );
+        assert!(
+            !root.join(".agent/uploads/shot-2.png").exists(),
+            "dry run copies nothing"
+        );
+    }
+
+    #[test]
+    fn uploads_rm_deletes_only_inside_uploads() {
+        use tempfile::TempDir;
+        use zeus_config::{AgentSettings, GlobalPaths, ProvidersFile};
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("a.txt"), "aaa").unwrap();
+
+        let config = Config {
+            global: GlobalPaths::from_root(root.join(".zeus-home")),
+            project: None,
+            settings: AgentSettings::default(),
+            providers: ProvidersFile::default(),
+            project_root: Some(root.clone()),
+        };
+
+        upload_files(
+            &config,
+            &[outside.join("a.txt").to_string_lossy().into_owned()],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(root.join(".agent/uploads/a.txt").exists());
+
+        // An escape attempt is refused.
+        let err = delete_upload(&config, "../evil").unwrap_err();
+        assert!(err.to_string().contains("refusing"));
+
+        // A directory tree is removed recursively.
+        std::fs::create_dir_all(root.join(".agent/uploads/bundle")).unwrap();
+        std::fs::write(root.join(".agent/uploads/bundle/x.txt"), "x").unwrap();
+        let n = delete_upload(&config, ".agent/uploads/bundle").unwrap();
+        assert_eq!(n, 2);
+        assert!(!root.join(".agent/uploads/bundle").exists());
+
+        let n = delete_upload(&config, ".agent/uploads/a.txt").unwrap();
+        assert_eq!(n, 1);
+        assert!(!root.join(".agent/uploads/a.txt").exists());
+
+        // Unknown rel errors cleanly.
+        assert!(delete_upload(&config, ".agent/uploads/nope.txt").is_err());
+        assert!(delete_upload(&config, "").is_err());
+    }
+
+    #[test]
+    fn human_size_formats_bytes() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(14), "14 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(12 * 1024 + 512), "12.5 KiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
+    }
+
+    #[test]
+    fn upload_files_stages_pdf_and_warns_on_unknown_binary() {
+        use tempfile::TempDir;
+        use zeus_config::{AgentSettings, GlobalPaths, ProvidersFile};
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // A plausible minimal PDF header (binary content, but read_document
+        // handles it, so upload must NOT warn about it).
+        std::fs::write(
+            outside.join("report.pdf"),
+            b"%PDF-1.4\n1 0 obj\n<< >>\nendobj\n%%EOF",
+        )
+        .unwrap();
+        // Unknown binary — NUL bytes with no doc/image extension → warn.
+        std::fs::write(outside.join("tool.bin"), [0u8; 64]).unwrap();
+        // Known image — binary but read_image handles it → no warning.
+        std::fs::write(outside.join("pic.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
+
+        let config = Config {
+            global: GlobalPaths::from_root(root.join(".zeus-home")),
+            project: None,
+            settings: AgentSettings::default(),
+            providers: ProvidersFile::default(),
+            project_root: Some(root.clone()),
+        };
+
+        let report = upload_files(
+            &config,
+            &[
+                outside.join("report.pdf").to_string_lossy().into_owned(),
+                outside.join("tool.bin").to_string_lossy().into_owned(),
+                outside.join("pic.png").to_string_lossy().into_owned(),
+            ],
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.uploaded.len(), 3);
+        // Byte-identical staging (the whole point of upload).
+        assert_eq!(
+            std::fs::read(root.join(".agent/uploads/report.pdf")).unwrap(),
+            b"%PDF-1.4\n1 0 obj\n<< >>\nendobj\n%%EOF"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".agent/uploads/tool.bin")).unwrap(),
+            [0u8; 64]
+        );
+        // Exactly one warning: the unknown binary. PDF and PNG are known.
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
+        assert!(report.warnings[0].contains("tool.bin"));
+        assert!(report.warnings[0].contains("read_image"));
+    }
+
+    #[test]
+    fn parse_upload_args_handles_quotes_and_to_flag() {
+        let (to, paths, err) = parse_upload_args("--to designs \"my file a.png\" b.png");
+        assert!(err.is_none());
+        assert_eq!(to.as_deref(), Some("designs"));
+        assert_eq!(paths, vec!["my file a.png", "b.png"]);
+
+        // No --to, plain paths, quotes with spaces preserved.
+        let (to, paths, err) = parse_upload_args("--to\"nope\" \"a b.txt\" c.txt");
+        // The first token is `--to"nope"` — not the flag — so it's a path.
+        assert!(err.is_none());
+        assert_eq!(to, None);
+        assert_eq!(paths.len(), 3);
+
+        let (to, paths, err) = parse_upload_args("\"unterminated");
+        assert!(err.is_some());
+        assert!(paths.is_empty());
+        assert_eq!(to, None);
+
+        let (_, paths, err) = parse_upload_args("--to");
+        assert!(err.is_some());
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn credit_failure_hint_suggests_provider_with_key() {
+        use tempfile::TempDir;
+        use zeus_config::{AgentSettings, GlobalPaths, ProvidersFile};
+
+        let tmp = TempDir::new().unwrap();
+        let global = GlobalPaths::from_root(tmp.path().join(".zeus-home"));
+        std::fs::create_dir_all(global.keys_toml.parent().unwrap()).unwrap();
+        // Stored key for gemini (the live-machine setup: openrouter keyed but
+        // out of credits, gemini keyed and working).
+        std::fs::write(&global.keys_toml, "[keys]\ngemini = \"gk-abc\"\n").unwrap();
+
+        let config = Config {
+            global: global.clone(),
+            project: None,
+            settings: AgentSettings::default(),
+            providers: ProvidersFile {
+                providers: std::collections::HashMap::from([
+                    (
+                        "openrouter".into(),
+                        zeus_config::ProviderConfig {
+                            kind: "openrouter".into(),
+                            base_url: None,
+                            api_key_env: None,
+                            default_model: None,
+                            headers: std::collections::HashMap::new(),
+                            embeddings: false,
+                            prompt_cache: false,
+                        },
+                    ),
+                    (
+                        "gemini".into(),
+                        zeus_config::ProviderConfig {
+                            kind: "gemini".into(),
+                            base_url: None,
+                            api_key_env: None,
+                            default_model: None,
+                            headers: std::collections::HashMap::new(),
+                            embeddings: false,
+                            prompt_cache: false,
+                        },
+                    ),
+                ]),
+            },
+            project_root: None,
+        };
+
+        let hint = credit_failure_hint(&config, "HTTP 402 Payment Required — out of credits");
+        let hint = hint.expect("a 402 must produce a credit hint");
+        assert!(hint.contains("gemini"), "hint: {hint}");
+        assert!(
+            !hint.contains("openrouter"),
+            "current provider excluded: {hint}"
+        );
+
+        // A non-credit failure (e.g. network) must NOT produce the hint.
+        assert!(credit_failure_hint(&config, "connection reset by peer").is_none());
+    }
+
+    #[test]
+    fn failover_relevant_detects_credits_and_rate_limits_only() {
+        let wrap = |status: u16, msg: &str| -> anyhow::Error {
+            anyhow::Error::new(zeus_provider::ProviderError::Http {
+                status,
+                message: msg.into(),
+            })
+        };
+        assert!(failover_relevant(&wrap(402, "out of credits")));
+        assert!(failover_relevant(&wrap(429, "Too Many Requests")));
+        assert!(failover_relevant(&wrap(
+            200,
+            "you have exceeded your rate limit"
+        )));
+        assert!(!failover_relevant(&wrap(404, "model not found")));
+        assert!(!failover_relevant(&wrap(401, "unauthorized")));
+        assert!(!failover_relevant(&wrap(503, "service unavailable")));
+        assert!(!failover_relevant(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+    }
+
+    #[test]
+    fn ensure_agent_gitignored_appends_rule() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+
+        ensure_agent_gitignored(tmp.path()).unwrap();
+        let ignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(
+            ignore.lines().any(|l| l.trim() == ".agent/"),
+            "gitignore: {ignore}"
+        );
+
+        // Idempotent — a second pass must not duplicate the rule.
+        ensure_agent_gitignored(tmp.path()).unwrap();
+        let ignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        let count = ignore.lines().filter(|l| l.trim() == ".agent/").count();
+        assert_eq!(count, 1, "gitignore: {ignore}");
+
+        // A non-repo dir gets no .gitignore at all.
+        let bare = TempDir::new().unwrap();
+        ensure_agent_gitignored(bare.path()).unwrap();
+        assert!(!bare.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn upload_files_rejects_symlinks_when_creation_is_possible() {
+        use tempfile::TempDir;
+        use zeus_config::{AgentSettings, GlobalPaths, ProvidersFile};
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("real.txt");
+        std::fs::write(&target, "secret outside the project").unwrap();
+        let link = outside.join("link.txt");
+
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_file(&target, &link);
+
+        // Symlink creation needs privilege/dev-mode on Windows; when it fails
+        // we can't exercise the guard, so skip quietly.
+        let is_link = std::fs::symlink_metadata(&link)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            return;
+        }
+
+        let config = Config {
+            global: GlobalPaths::from_root(root.join(".zeus-home")),
+            project: None,
+            settings: AgentSettings::default(),
+            providers: ProvidersFile::default(),
+            project_root: Some(root.clone()),
+        };
+
+        let err =
+            upload_files(&config, &[link.to_string_lossy().into_owned()], None, false).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected a symlink refusal, got: {err}"
+        );
     }
 }

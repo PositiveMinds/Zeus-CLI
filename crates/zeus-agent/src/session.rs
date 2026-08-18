@@ -66,7 +66,13 @@ impl SessionStore {
             return Ok(ConversationState::new(session_id));
         }
         let text = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&text).map_err(|e| AgentError::Session(e.to_string()))
+        match serde_json::from_str(&text) {
+            Ok(state) => Ok(state),
+            // A torn/corrupt file (crash mid-write, manual edit) must not
+            // brick the session: fall back to a fresh state for the id
+            // rather than hard-failing the launch.
+            Err(_) => Ok(ConversationState::new(session_id)),
+        }
     }
 
     pub fn save(&self, state: &ConversationState) -> Result<()> {
@@ -75,7 +81,13 @@ impl SessionStore {
         state.last_activity = unix_millis();
         let text =
             serde_json::to_string_pretty(&state).map_err(|e| AgentError::Session(e.to_string()))?;
-        std::fs::write(self.path(&state.session_id), text)?;
+        let target = self.path(&state.session_id);
+        // Crash-safe: write to a temp file in the same directory, then rename
+        // over the target. A crash mid-write leaves the previous file intact,
+        // and the rename is atomic on the same filesystem.
+        let tmp = target.with_extension("json.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &target)?;
         Ok(())
     }
 
@@ -203,6 +215,41 @@ mod tests {
         let mut ids = store.list_session_ids().unwrap();
         ids.sort();
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf());
+        let mut state = ConversationState::new("atomic");
+        state.messages.push(Message::user("persist me"));
+        store.save(&state).unwrap();
+
+        // Only the target `.json` remains — the temp file is renamed away.
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["atomic.json".to_string()],
+            "no .json.tmp leftover"
+        );
+        assert_eq!(store.load("atomic").unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn load_corrupt_session_falls_back_to_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf());
+        std::fs::write(tmp.path().join("torn.json"), "{not valid json").unwrap();
+        let state = store.load("torn").unwrap();
+        assert_eq!(state.session_id, "torn");
+        assert!(
+            state.messages.is_empty(),
+            "corrupt state loads as a fresh one"
+        );
     }
 
     #[test]

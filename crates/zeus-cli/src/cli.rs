@@ -4,6 +4,31 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use zeus_fs::ResetMode;
 
+/// The shells we can emit tab-completion scripts for.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Elvish,
+    Fish,
+    #[value(name = "powershell", alias = "pwsh")]
+    PowerShell,
+    Zsh,
+}
+
+impl CompletionShell {
+    /// Map to the clap_complete shell enum used to generate the script.
+    pub fn to_clap(self) -> clap_complete::Shell {
+        use clap_complete::Shell;
+        match self {
+            CompletionShell::Bash => Shell::Bash,
+            CompletionShell::Elvish => Shell::Elvish,
+            CompletionShell::Fish => Shell::Fish,
+            CompletionShell::PowerShell => Shell::PowerShell,
+            CompletionShell::Zsh => Shell::Zsh,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "zeus",
@@ -23,6 +48,12 @@ pub struct Cli {
     /// Auto-approve permission prompts for this process only (never persisted)
     #[arg(long, global = true)]
     pub yes: bool,
+
+    /// Start a fresh session instead of auto-resuming the most recently used
+    /// one (REPL/TUI only; `agent --resume` and `--session` still apply to
+    /// the one-shot path).
+    #[arg(long = "new", global = true)]
+    pub fresh: bool,
 
     /// No subcommand: start an interactive REPL session instead of a
     /// one-shot command.
@@ -177,6 +208,26 @@ pub enum Commands {
         to: PathBuf,
         #[arg(long)]
         overwrite: bool,
+    },
+
+    /// Upload files/directories from anywhere on disk into .agent/uploads/
+    /// so the agent can read them — the agent is confined to the project
+    /// root, so this is how you hand it files that live elsewhere.
+    Upload {
+        /// Files or directories to copy into the project (any location)
+        paths: Vec<PathBuf>,
+        /// Stage them under .agent/uploads/<subdir> instead of .agent/uploads/
+        #[arg(long, value_name = "SUBDIR")]
+        to: Option<String>,
+        /// Show what would be staged without copying anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Generate shell completions (redirect into your shell's rc file)
+    Completion {
+        /// Which shell to generate completions for
+        shell: CompletionShell,
     },
 
     /// Pattern-based search+replace across multiple files (previews scope, then one approval to apply)

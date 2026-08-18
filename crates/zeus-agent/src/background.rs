@@ -329,9 +329,11 @@ impl BackgroundTaskRegistry {
             stderr_pos = self.drain_from(self.stderr_path(id), stderr_pos);
             let status = match self.get(id)? {
                 Some((_, status)) => status,
-                None => return Err(AgentError::Terminal(format!(
-                    "no such background task: {id}"
-                ))),
+                None => {
+                    return Err(AgentError::Terminal(format!(
+                        "no such background task: {id}"
+                    )))
+                }
             };
             if status == TaskStatus::Exited {
                 // One final drain so nothing the process flushed just before
