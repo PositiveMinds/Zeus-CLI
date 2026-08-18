@@ -760,7 +760,9 @@ server.serve_forever()
                 .expect("failed to spawn test server");
             // If anything below panics, still kill the child before unwinding.
             let mut guard = KillOnDrop(&mut child, true);
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            // macOS CI runners cold-start python very slowly under the
+            // parallel test threads, so allow a generous deadline.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
             let port = loop {
                 if let Ok(contents) = std::fs::read_to_string(&port_file) {
                     if let Ok(port) = contents.trim().parse::<u16>() {
