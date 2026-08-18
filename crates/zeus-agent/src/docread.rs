@@ -1,6 +1,6 @@
 //! Document text extraction — turn office/binaries into readable text for the
-//! model. Supports text formats (.md/.txt/.log/.json/...), HTML, PDF, DOCX,
-//! XLSX, PPTX.
+//! model. Supports text formats (.md/.txt/.log/.json/...), HTML (tables kept
+//! as row grids), PDF, EPUB, DOCX, XLSX, PPTX.
 
 use std::io::Read;
 use std::path::Path;
@@ -39,9 +39,10 @@ pub fn extract(path: &Path, max_chars: usize) -> Result<Document, String> {
             let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
             Document {
                 summary: "html".into(),
-                text: super::tools::strip_html_pub(&raw),
+                text: super::tools::strip_html_with_tables(&raw),
             }
         }
+        "epub" => extract_epub(path)?,
         // Plain-text family: md, txt, log, json, csv, toml, yaml, xml, hcl…
         _ => {
             let raw = match std::fs::read_to_string(path) {
@@ -96,6 +97,203 @@ fn page_count_text(text: &str) -> String {
     } else {
         format!("{pages} pages (approx)")
     }
+}
+
+/// EPUB: a zip of XHTML chapters listed in the spine of the OPF package.
+/// Chapters are extracted in spine order (the reading order) with the table
+/// structure preserved.
+fn extract_epub(path: &Path) -> Result<Document, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("not a valid zip/epub: {e}"))?;
+
+    // Locate the package (OPF) via META-INF/container.xml.
+    let raw = read_entry(&mut archive, "META-INF/container.xml")
+        .ok_or_else(|| "epub missing META-INF/container.xml".to_string())?;
+    let rootfile = raw
+        .split("full-path")
+        .nth(1)
+        .and_then(|s| {
+            let s = s.trim_start();
+            s.strip_prefix('=')?
+                .trim()
+                .strip_prefix('"')?
+                .split('"')
+                .next()
+                .map(str::to_string)
+        })
+        .ok_or_else(|| "epub container.xml has no rootfile".to_string())?;
+    let rootfile = rootfile.replace('\\', "/");
+
+    let raw = read_entry(&mut archive, &rootfile)
+        .ok_or_else(|| format!("epub missing package file {rootfile}"))?;
+
+    let base = rootfile
+        .rsplit_once('/')
+        .map(|(d, _)| d.to_string())
+        .unwrap_or_default();
+    let manifest = manifest_of(&raw);
+    let spine = spine_of(&raw);
+    if spine.is_empty() {
+        return Err("epub has an empty spine".into());
+    }
+
+    let mut chapters = 0usize;
+    let mut out = Vec::new();
+    for idref in &spine {
+        let Some((_, href)) = manifest.iter().find(|(id, _)| id == idref) else {
+            continue;
+        };
+        let href = href.split('#').next().unwrap_or("").to_string();
+        if href.is_empty() {
+            continue;
+        }
+        let name = if base.is_empty() {
+            href.clone()
+        } else {
+            format!("{base}/{href}")
+        };
+        let name = percent_decode(&name);
+        let Some(html) = read_entry(&mut archive, &name) else {
+            continue;
+        };
+        let text = super::tools::strip_html_with_tables(&html);
+        if text.trim().is_empty() {
+            continue;
+        }
+        chapters += 1;
+        out.push(format!("\n--- chapter {chapters}: {href} ---\n{text}"));
+    }
+    if out.is_empty() {
+        return Err("epub parsed but no readable chapters found".into());
+    }
+    Ok(Document {
+        summary: format!("epub ({chapters} chapters)"),
+        text: out.join("\n"),
+    })
+}
+
+/// Read an archive entry to a `String` by exact name, falling back to a
+/// case-insensitive scan (many epubs are sloppy about `OEBPS/` vs `oebps/`).
+/// Returns the owned text so no borrow of the archive outlives the lookup.
+fn read_entry(archive: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<String> {
+    let mut s = String::new();
+    if let Ok(mut f) = archive.by_name(name) {
+        f.read_to_string(&mut s).ok()?;
+        return Some(s);
+    }
+    let n = archive.len();
+    for i in 0..n {
+        let Ok(mut f) = archive.by_index(i) else {
+            continue;
+        };
+        if f.name().eq_ignore_ascii_case(name) {
+            f.read_to_string(&mut s).ok()?;
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Collect XML attributes into owned key/value pairs.
+fn attr_pairs<'a>(
+    attrs: impl Iterator<
+        Item = Result<
+            quick_xml::events::attributes::Attribute<'a>,
+            quick_xml::events::attributes::AttrError,
+        >,
+    >,
+) -> Vec<(String, String)> {
+    attrs
+        .flatten()
+        .map(|a| {
+            let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+            let value = a.unescape_value().unwrap_or_default().into_owned();
+            (key, value)
+        })
+        .collect()
+}
+
+/// `manifest`: `id → href` for every `<item>` in the OPF.
+fn manifest_of(opf: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut reader = Reader::from_str(opf);
+    loop {
+        let item = match reader.read_event() {
+            Ok(Event::Start(e)) if e.name().as_ref() == b"item" => Some(attr_pairs(e.attributes())),
+            Ok(Event::Empty(e)) if e.name().as_ref() == b"item" => Some(attr_pairs(e.attributes())),
+            Ok(Event::Eof) => break,
+            _ => None,
+        };
+        if let Some(item) = item {
+            let mut id = None;
+            let mut href = None;
+            for (key, value) in item {
+                match key.as_str() {
+                    "id" => id = Some(value),
+                    "href" => href = Some(value),
+                    _ => {}
+                }
+            }
+            if let (Some(id), Some(href)) = (id, href) {
+                out.push((id, href));
+            }
+        }
+    }
+    out
+}
+
+/// `spine`: the ordered list of `idref`s the reader should follow.
+fn spine_of(opf: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut reader = Reader::from_str(opf);
+    loop {
+        let itemref = match reader.read_event() {
+            Ok(Event::Start(e)) if e.name().as_ref() == b"itemref" => {
+                Some(attr_pairs(e.attributes()))
+            }
+            Ok(Event::Empty(e)) if e.name().as_ref() == b"itemref" => {
+                Some(attr_pairs(e.attributes()))
+            }
+            Ok(Event::Eof) => break,
+            _ => None,
+        };
+        if let Some(attrs) = itemref {
+            for (key, value) in attrs {
+                if key == "idref" {
+                    out.push(value);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Decode `%20`-style escapes in epub hrefs.
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Which office format we're unpacking.
@@ -395,6 +593,62 @@ mod tests {
     }
 
     #[test]
+    fn pdf_extracts_text_layer() {
+        // A minimal, hand-built PDF with one text object and a correct xref —
+        // exercises `read_document` on a real (if tiny) PDF end to end.
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("mini.pdf");
+        std::fs::write(&f, minimal_pdf("Hello PDF World")).unwrap();
+
+        let doc = extract(&f, 10_000).unwrap();
+        assert!(doc.text.contains("Hello PDF World"), "was: {}", doc.text);
+        assert!(doc.summary.starts_with("pdf ("), "was: {}", doc.summary);
+    }
+
+    /// Build a minimal single-page PDF with `text` drawn on the page. The xref
+    /// offsets are computed as the buffer grows, so the table stays valid.
+    fn minimal_pdf(text: &str) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets: Vec<usize> = Vec::new();
+        {
+            let mut push = |num: usize, body: String| {
+                offsets.push(buf.len());
+                buf.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+            };
+            push(1, "<< /Type /Catalog /Pages 2 0 R >>".to_string());
+            push(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string());
+            push(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>"
+                    .to_string(),
+            );
+            let stream = format!("BT /F1 24 Tf 72 720 Td ({text}) Tj ET");
+            let stream_obj = format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                stream.len(),
+                stream
+            );
+            push(4, stream_obj);
+            push(
+                5,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            );
+        }
+        let xref_start = buf.len();
+        buf.extend_from_slice(b"xref\n0 6\n");
+        buf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        buf
+    }
+
+    #[test]
     fn docx_round_trips_text() {
         // Build a minimal docx by hand: [Content_Types].xml, _rels/, word/.
         let tmp = TempDir::new().unwrap();
@@ -419,5 +673,72 @@ mod tests {
 
         let doc = extract(&f, 10_000).unwrap();
         assert!(doc.text.contains("Hello Document"), "was: {}", doc.text);
+    }
+
+    #[test]
+    fn html_tables_render_as_row_grid() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("page.html");
+        std::fs::write(
+            &f,
+            "<html><body><h1>Report</h1><table><tr><th>Name</th><th>Qty</th></tr>\
+             <tr><td>Bolts</td><td>42</td></tr><tr><td>Nuts</td><td>7</td></tr></table>\
+             <p>Done &amp; done.</p></body></html>",
+        )
+        .unwrap();
+        let doc = extract(&f, 10_000).unwrap();
+        assert_eq!(doc.summary, "html");
+        assert!(
+            doc.text.contains("Bolts | 42"),
+            "table cells should become a pipe row, got: {}",
+            doc.text
+        );
+        assert!(doc.text.contains("Nuts | 7"));
+        assert!(doc.text.contains("Name | Qty"));
+        assert!(doc.text.contains("Done & done."), "entities decode");
+    }
+
+    #[test]
+    fn epub_chapters_extract_in_spine_order() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("book.epub");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&f).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("META-INF/container.xml", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><container version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+        )
+        .unwrap();
+        zip.add_directory("OEBPS/", opts).unwrap();
+        zip.start_file("OEBPS/content.opf", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><package><manifest>
+<item id="c2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+<item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+</manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#,
+        )
+        .unwrap();
+        zip.start_file("OEBPS/ch1.xhtml", opts).unwrap();
+        zip.write_all(
+            b"<html><body><h1>Chapter One</h1><table><tr><th>Name</th><th>Age</th></tr><tr><td>Ada</td><td>36</td></tr></table></body></html>",
+        )
+        .unwrap();
+        zip.start_file("OEBPS/ch2.xhtml", opts).unwrap();
+        zip.write_all(b"<html><body><h1>Chapter Two</h1><p>Second chapter text.</p></body></html>")
+            .unwrap();
+        zip.finish().unwrap();
+
+        let doc = extract(&f, 10_000).unwrap();
+        assert_eq!(doc.summary, "epub (2 chapters)");
+        assert!(doc.text.contains("Chapter One"), "was: {}", doc.text);
+        assert!(doc.text.contains("Chapter Two"));
+        assert!(doc.text.contains("Ada | 36"), "table row preserved");
+        // Spine order matters: chapter 1 comes before chapter 2.
+        let one = doc.text.find("Chapter One").unwrap();
+        let two = doc.text.find("Chapter Two").unwrap();
+        assert!(one < two, "spine order not respected");
     }
 }

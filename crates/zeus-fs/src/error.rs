@@ -40,7 +40,7 @@ pub enum FsError {
     #[error("must read file before writing/editing existing path: {0}")]
     MustReadFirst(PathBuf),
 
-    #[error("binary file refused: {0}")]
+    #[error("binary file refused: {0} (a plain read can't decode this — if it's an image use read_image; if it's a PDF/DOCX/XLSX/PPTX/HTML document use read_document)")]
     BinaryFile(PathBuf),
 
     #[error("invalid path: {0}")]

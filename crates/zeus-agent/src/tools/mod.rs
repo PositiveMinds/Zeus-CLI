@@ -11,6 +11,7 @@ use crate::plugin::LoadedPlugin;
 use crate::terminal::{CommandProfile, Sandbox, TerminalOptions, TerminalRunner};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
@@ -77,6 +78,11 @@ fn core_tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["todos"]
             }),
+        },
+        ToolSpec {
+            name: "current_time".into(),
+            description: "Return the current local date and time (with UTC offset, ISO week, and day of year). Use whenever the user asks what date/time it is, or whenever a task depends on the current date (naming files with today's date, scheduling, 'is X released yet' comparisons). Always fresh — never assume a date or time from your training data; the value is read from the clock at call time.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
         },
         ToolSpec {
             name: "read".into(),
@@ -343,7 +349,7 @@ ToolSpec {
         },
 ToolSpec {
             name: "read_document".into(),
-            description: "Extract text from binary/office documents for the model to act on: PDF, DOCX, XLSX (each worksheet as a row grid), PPTX (slides). Also handles plain-text formats via the read tool. max_chars caps returned text (default 20000). Use instead of read for .pdf/.docx/.pptx/.xlsx files — read would return binary garbage for those. Returns unsupported/missing files as errors. For scanned/image PDFs (no text layer) it errors and you should use read_image + the ui-design skill.".into(),
+            description: "Extract text from binary/office documents for the model to act on: PDF, DOCX, XLSX (each worksheet as a row grid), PPTX (slides), EPUB (chapters in reading order). HTML is also handled with tables rendered as pipe-delimited row grids. Also handles plain-text formats via the read tool. max_chars caps returned text (default 20000). Use instead of read for .pdf/.docx/.pptx/.xlsx/.epub/.html files — read would return binary garbage for those. Returns unsupported/missing files as errors. For scanned/image PDFs (no text layer) it errors and you should use read_image + the ui-design skill.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -825,7 +831,7 @@ pub const PLATFORM_TOOLS: &[&str] = &[
     "firebase_functions",
 ];
 
-/// Tool specs for the platform-CLI integrations (gh/supabase/vercel/aws/â€¦).
+/// Tool specs for the platform-CLI integrations (gh/supabase/vercel/aws/…).
 /// Kept separate so the file stays navigable. Names must match the
 /// `do_platform` dispatch arms exactly.
 pub fn platform_tool_specs() -> Vec<ToolSpec> {
@@ -1125,7 +1131,7 @@ pub fn platform_tool_specs() -> Vec<ToolSpec> {
         // --- Kubernetes ---
         ToolSpec {
             name: "k8s_get".into(),
-            description: "kubectl get resources (pods/services/deployments/â€¦).".into(),
+            description: "kubectl get resources (pods/services/deployments/…).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1608,10 +1614,7 @@ fn platform_cli_for(name: &str) -> Option<&'static str> {
 
 /// Drop platform-tool specs whose CLI isn't in `present`. Core tools have no
 /// CLI mapping (`platform_cli_for` returns `None`) and always survive.
-fn filter_platform_specs(
-    specs: Vec<ToolSpec>,
-    present: &HashSet<String>,
-) -> Vec<ToolSpec> {
+fn filter_platform_specs(specs: Vec<ToolSpec>, present: &HashSet<String>) -> Vec<ToolSpec> {
     specs
         .into_iter()
         .filter(|s| platform_cli_for(&s.name).is_none_or(|cli| present.contains(cli)))
@@ -1624,8 +1627,23 @@ fn filter_platform_specs(
 /// Windows checks the `.exe/.cmd/.bat/.com` variants.
 fn detect_platform_clis() -> HashSet<String> {
     const CLIS: &[&str] = &[
-        "gh", "supabase", "vercel", "docker", "kubectl", "terraform", "circleci", "aws", "sam",
-        "az", "gcloud", "helm", "flyctl", "railway", "render", "netlify", "firebase",
+        "gh",
+        "supabase",
+        "vercel",
+        "docker",
+        "kubectl",
+        "terraform",
+        "circleci",
+        "aws",
+        "sam",
+        "az",
+        "gcloud",
+        "helm",
+        "flyctl",
+        "railway",
+        "render",
+        "netlify",
+        "firebase",
     ];
     CLIS.iter()
         .filter(|c| cli_on_path(c))
@@ -1738,6 +1756,9 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
             // to let a read-only Plan-mode turn use for progress tracking
             // too, same as the reference product's own `todowrite` tool.
             | "todowrite"
+            // Pure clock read, no side effects — useful in Plan mode and to
+            // delegated specialists ("what's today's date").
+            | "current_time"
     )
 }
 
@@ -1970,6 +1991,7 @@ impl ToolManager {
         let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
         match name {
             "todowrite" => self.do_todowrite(&args),
+            "current_time" => self.do_current_time(&args),
             "read" => self.do_read(&args),
             "read_multiple" => self.do_read_multiple(&args),
             "write" => self.do_write(&args, approver),
@@ -2213,6 +2235,30 @@ impl ToolManager {
             .filter(|t| t.get("status").and_then(|v| v.as_str()) == Some("completed"))
             .count();
         Ok(ToolResult::ok(format!("{done}/{} done", todos.len())))
+    }
+
+    /// Current local date/time from the system clock, so the model never has
+    /// to guess "today" from its training data — always fresh at call time.
+    fn do_current_time(&self, _args: &Value) -> Result<ToolResult> {
+        use chrono::Datelike;
+        let now = chrono::Local::now();
+        let off = now.offset().local_minus_utc();
+        let (sign, off) = if off < 0 { ('-', -off) } else { ('+', off) };
+        let content = format!(
+            "Current date and time (local): {} — {}, {}\n\
+             UTC offset: {sign}{:02}:{:02}\n\
+             ISO week {} of year {}; day {} of {}",
+            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%A"),
+            now.format("%B %d, %Y"),
+            off / 3600,
+            (off % 3600) / 60,
+            now.iso_week().week(),
+            now.year(),
+            now.ordinal(),
+            if is_leap_year(now.year()) { 366 } else { 365 },
+        );
+        Ok(ToolResult::ok(content))
     }
 
     fn do_read(&self, args: &Value) -> Result<ToolResult> {
@@ -2672,7 +2718,11 @@ impl ToolManager {
             sections.push(if callers.is_empty() {
                 format!("no callers of '{name}' found")
             } else {
-                format!("{} caller(s) of '{name}':\n{}", callers.len(), fmt_callers(&callers))
+                format!(
+                    "{} caller(s) of '{name}':\n{}",
+                    callers.len(),
+                    fmt_callers(&callers)
+                )
             });
         }
         if direction == "callees" || direction == "both" {
@@ -2722,7 +2772,7 @@ impl ToolManager {
         );
         for (f, lines) in &by_file {
             let shown: Vec<String> = lines.iter().take(5).map(|l| l.to_string()).collect();
-            let suffix = if lines.len() > 5 { ", â€¦" } else { "" };
+            let suffix = if lines.len() > 5 { ", …" } else { "" };
             out.push_str(&format!(
                 "  {}: {} line(s) [{}]\n",
                 f.display(),
@@ -3050,6 +3100,14 @@ impl ToolManager {
                 )))
             }
         };
+        // A redirect can bounce us onto an internal service even when the
+        // original URL was public — re-run the SSRF guard on the final URL
+        // after redirects were followed.
+        if let Some(reason) = reject_web_target(resp.url().as_str()) {
+            return Ok(ToolResult::err(format!(
+                "web_fetch refused after redirect: {reason}"
+            )));
+        }
         let status = resp.status();
         if !status.is_success() {
             return Ok(ToolResult::err(format!(
@@ -3083,7 +3141,7 @@ impl ToolManager {
         };
         if content.chars().count() > max_chars {
             content = content.chars().take(max_chars).collect::<String>();
-            content.push_str("\nâ€¦ (truncated, max_chars reached)");
+            content.push_str("\n… (truncated, max_chars reached)");
         }
         Ok(ToolResult::ok(format!("# web_fetch {url}\n{content}")))
     }
@@ -3265,7 +3323,7 @@ impl ToolManager {
 
     /// `read_skill` — load a skill's SKILL.md body (+ bundled resources),
     /// and optionally its `depends_on` chain so one call can compose a whole
-    /// workflow (e.g. database â†’ backend â†’ frontend â†’ security â†’ testing).
+    /// workflow (e.g. database → backend → frontend → security → testing).
     fn do_read_skill(&self, args: &Value) -> Result<ToolResult> {
         let name = Self::str_arg(args, "name")?.to_lowercase();
         use crate::skills::{read_skill_resource, skill_resources};
@@ -3376,7 +3434,7 @@ impl ToolManager {
                     format!("# {} — {}\n\n{}", resolved.display(), doc.summary, doc.text);
                 if text.chars().count() > max_chars {
                     text = text.chars().take(max_chars).collect::<String>();
-                    text.push_str("\nâ€¦(truncated by tool cap)");
+                    text.push_str("\n…(truncated by tool cap)");
                 }
                 Ok(ToolResult::ok(text))
             }
@@ -3979,16 +4037,26 @@ fn summarize_test_output(stdout: &str) -> String {
 }
 
 /// Launch the platform's default browser opener for `url`, launch-and-forget.
-/// Rejects non-`{http,https,file}://` (and scheme-less `host:port`) targets so
-/// a stray string can't be misinterpreted as a shell flag or command.
+/// Rejects non-`{http,https}://` (and scheme-less `host:port`) targets so a
+/// stray string can't be misinterpreted as a shell flag or command. `file://`
+/// is deliberately refused — the browser tool is for *web* URLs; a local file
+/// path belongs to the file tools, which carry their own permission gates.
 fn open_browser_url(url: &str) -> std::io::Result<()> {
     let url = url.trim();
     if !(url.starts_with("http://")
         || url.starts_with("https://")
-        || url.starts_with("file://")
         || url.starts_with("localhost:")
         || url.starts_with("127.0.0.1:")
-        || (url.contains('.') && !url.contains(' ') && !url.starts_with('-')))
+        || {
+            // Bare hostname or `host:port` (no scheme) — must look like a URL,
+            // not a filesystem path. `C:/foo.txt`, `..\secret`, or `/etc/hosts`
+            // would otherwise pass the dot check and get handed to the platform
+            // opener as a path.
+            url.contains('.')
+                && !url.contains(' ')
+                && !url.starts_with('-')
+                && !url.contains(['/', '\\'])
+        })
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -4039,7 +4107,15 @@ fn image_mime(path: &Path) -> Option<&'static str> {
 /// Returns `Some(reason)` if `url` points at a loopback/private target that
 /// `web_fetch` should refuse to scrape (the fetch tool retrieves content for
 /// the model, so pointing it at the user's local services would leak them).
+/// Returns the refusal reason when `url` must be blocked. Refusals cover
+/// loopback, RFC1918 private ranges, link-local, and cloud-metadata hosts —
+/// both by literal name and by resolved IP — so `127.0.0.2`, `10.x`,
+/// `192.168.x`, `[::ffff:127.0.0.1]`, trailing-dot hostnames, and a hostname
+/// that merely *resolves to* an internal address are all refused, not just
+/// the exact strings a name-only check would catch.
 fn reject_web_target(url: &str) -> Option<String> {
+    use std::net::ToSocketAddrs;
+
     let host = url
         .trim_start_matches("http://")
         .trim_start_matches("https://")
@@ -4052,30 +4128,207 @@ fn reject_web_target(url: &str) -> Option<String> {
     if host.is_empty() {
         return Some("no host in url".into());
     }
+    // A single trailing dot is valid DNS but wouldn't match the literal
+    // blocklist below — normalize it away before comparing.
+    let norm = host.trim_end_matches('.');
+    if norm.is_empty() {
+        return Some("'host' has no name".into());
+    }
     for bad in [
         "localhost",
         "127.0.0.1",
         "::1",
-        "[::1]",
         "0.0.0.0",
         "169.254.169.254",
         "metadata.google.internal",
     ] {
-        if host == bad {
+        if norm.eq_ignore_ascii_case(bad) {
             return Some(format!(
                 "'{host}' resolves to the loopback/metadata services"
             ));
         }
     }
+
+    // Literal-IP fast path first (no DNS), then resolve the hostname and
+    // check *every* resolved address — any internal address wins the block.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip(ip) {
+            return Some(format!("'{host}' is an internal address"));
+        }
+        return None;
+    }
+    // Unresolvable hosts (DNS failure) fall through — the fetch itself will
+    // fail naturally; don't fabricate a refusal for a name we can't look up.
+    if let Ok(addrs) = norm.to_socket_addrs() {
+        for addr in addrs {
+            let ip = addr.ip();
+            if is_blocked_ip(ip) {
+                return Some(format!("'{host}' resolves to internal address '{ip}'"));
+            }
+        }
+    }
     None
 }
 
-/// Public alias for the doc-extraction module to reuse.
-pub(crate) fn strip_html_pub(html: &str) -> String {
-    strip_html(html)
+/// True for addresses the agent must never be pointed at: loopback, RFC1918
+/// private space, link-local (incl. cloud metadata), unspecified/broadcast,
+/// and IPv4-mapped IPv6 forms of any of the above.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
+        }
+    }
 }
 
-/// Crude-but-effective HTML â†’ text: drops scripts/styles/head, then tags,
+/// Gregorian leap-year rule (a year divisible by 400 is a leap year; other
+/// centuries are not). Kept as a small local helper so the clock tool doesn't
+/// depend on chrono's date-trait gymnastics.
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Public alias for the doc-extraction module to reuse.
+/// HTML → text with table structure preserved: cells become `a | b | c`
+/// rows (one per `<tr>`), block elements break lines, and script/style blocks
+/// are dropped. Used for HTML documents and epub chapters, where a flat tag
+/// strip would lose tabular data.
+pub(crate) fn strip_html_with_tables(html: &str) -> String {
+    // Drop <script>/<style> blocks verbatim first — the XML reader would
+    // choke on the `<`/`>` inside their bodies.
+    let mut clipped = String::with_capacity(html.len());
+    let mut rest = html;
+    loop {
+        let mut skip = None;
+        let mut best = rest.len();
+        for tag in ["<script", "<style"] {
+            if let Some(idx) = rest.find(tag) {
+                if idx < best {
+                    best = idx;
+                    skip = Some(tag);
+                }
+            }
+        }
+        let Some(open) = skip else { break };
+        clipped.push_str(&rest[..best]);
+        let tail = &rest[best..];
+        let close = if open == "<script" {
+            "</script"
+        } else {
+            "</style"
+        };
+        match tail.find(close) {
+            Some(end) => rest = &tail[end..],
+            None => break,
+        }
+    }
+    clipped.push_str(rest);
+
+    let mut out = String::new();
+    let mut reader = quick_xml::Reader::from_str(&clipped);
+    reader.config_mut().trim_text(true);
+    let mut in_table = 0usize;
+    let mut cell_started = false;
+    let mut cell_in_row = false;
+    loop {
+        use quick_xml::events::Event;
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"table" => {
+                    in_table += 1;
+                    out.push('\n');
+                }
+                b"tr" => {
+                    out.push('\n');
+                    cell_in_row = false;
+                }
+                b"td" | b"th" => {
+                    if in_table > 0 {
+                        if cell_in_row {
+                            out.push_str("| ");
+                        }
+                        cell_started = true;
+                    }
+                }
+                b"br" | b"p" | b"div" | b"li" | b"blockquote" | b"h1" | b"h2" | b"h3" | b"h4"
+                | b"h5" | b"h6"
+                    if in_table == 0 =>
+                {
+                    out.push('\n');
+                }
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => {
+                if e.name().as_ref() == b"br" && in_table == 0 {
+                    out.push('\n');
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if let Ok(decoded) = e.unescape() {
+                    let t = decoded.trim();
+                    if !t.is_empty() {
+                        out.push_str(t);
+                        if !cell_started {
+                            out.push(' ');
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"table" => {
+                    in_table = in_table.saturating_sub(1);
+                    out.push('\n');
+                }
+                b"tr" => {
+                    out.push('\n');
+                    cell_in_row = false;
+                }
+                b"td" | b"th" => {
+                    if in_table > 0 {
+                        out.push(' ');
+                        cell_in_row = true;
+                        cell_started = false;
+                    }
+                }
+                b"p" | b"div" | b"li" | b"blockquote" | b"h1" | b"h2" | b"h3" | b"h4" | b"h5"
+                | b"h6"
+                    if in_table == 0 =>
+                {
+                    out.push('\n');
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            _ => {}
+        }
+    }
+    out.split('\n')
+        .map(|l| {
+            l.trim()
+                .trim_end_matches(" |")
+                .trim_end_matches('|')
+                .trim()
+                .to_string()
+        })
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Crude-but-effective HTML → text: drops scripts/styles/head, then tags,
 /// then decodes common entities and collapses whitespace. Good enough for
 /// scraping docs/pages into something the model can read.
 fn strip_html(html: &str) -> String {
@@ -4144,6 +4397,7 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
     use base64::Engine;
+    use chrono::Datelike;
     use tempfile::TempDir;
     use zeus_config::{AgentSettings, Config, GlobalPaths, ProvidersFile};
     use zeus_provider::{
@@ -4227,7 +4481,10 @@ mod tests {
             .map(|s| s.name)
             .collect();
         for name in ["read", "write", "edit", "bash", "git_status", "grep"] {
-            assert!(kept.contains(&name.to_string()), "core tool '{name}' was filtered");
+            assert!(
+                kept.contains(&name.to_string()),
+                "core tool '{name}' was filtered"
+            );
         }
         assert_eq!(kept.len(), core_tool_specs().len());
     }
@@ -4236,7 +4493,12 @@ mod tests {
     fn platform_tools_filtered_by_cli_presence() {
         // No CLIs present -> no platform tools advertised.
         let none = filter_platform_specs(platform_tool_specs(), &HashSet::new());
-        assert_eq!(none.len(), 0, "no CLIs present but {} platform tools advertised", none.len());
+        assert_eq!(
+            none.len(),
+            0,
+            "no CLIs present but {} platform tools advertised",
+            none.len()
+        );
 
         // Only `gh` present -> gh tools survive, everything else is dropped.
         let mut present = HashSet::new();
@@ -5067,7 +5329,11 @@ mod tests {
         assert!(r.content.contains("helper -> leaf"));
 
         let r = tm
-            .dispatch_with_approver("code_graph", r#"{"name":"helper","direction":"callers"}"#, approve)
+            .dispatch_with_approver(
+                "code_graph",
+                r#"{"name":"helper","direction":"callers"}"#,
+                approve,
+            )
             .unwrap();
         assert!(!r.is_error);
         assert!(r.content.contains("main -> helper"));
@@ -5392,6 +5658,104 @@ mod tests {
         assert!(blocked.is_error, "{}", blocked.content);
         assert!(blocked.content.contains("Plan mode"), "{}", blocked.content);
         tm.set_plan_mode(false);
+    }
+
+    #[test]
+    fn browser_rejects_file_scheme_and_bare_paths() {
+        // `file://` must not be accepted: it would let the opener walk the
+        // local filesystem instead of a web URL.
+        assert!(open_browser_url("file:///C:/Windows/System32").is_err());
+        assert!(open_browser_url("file:///etc/hosts").is_err());
+        // A dot-containing filesystem path must not pass the bare-host branch.
+        assert!(open_browser_url("C:/Users/me/notes.txt").is_err());
+        assert!(open_browser_url("../secret/config.toml").is_err());
+        // Legitimate web targets still open.
+        assert!(open_browser_url("http://localhost:5173").is_ok());
+        assert!(open_browser_url("https://example.com").is_ok());
+        assert!(open_browser_url("localhost:5173").is_ok());
+    }
+
+    #[test]
+    fn web_fetch_rejects_internal_targets() {
+        for url in [
+            "http://localhost",
+            "http://localhost:8080/path",
+            "http://127.0.0.1",
+            "http://127.0.0.2",   // any loopback, not just .0.1
+            "http://10.0.0.1",    // RFC1918
+            "http://172.16.0.5",  // RFC1918
+            "http://192.168.1.1", // RFC1918
+            "http://169.254.169.254/latest/meta-data/", // cloud metadata
+            "http://[::1]",
+            "http://[::ffff:127.0.0.1]",
+            "http://[::ffff:10.0.0.1]",
+            "http://metadata.google.internal",
+            "http://localhost.", // trailing dot
+            "https://127.0.0.1:8443",
+            "https://0.0.0.0",
+        ] {
+            assert!(
+                reject_web_target(url).is_some(),
+                "expected '{url}' to be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn web_fetch_blocks_hostnames_that_resolve_to_loopback() {
+        // `localhost` normally resolves to 127.0.0.1/::1 — covered by the
+        // literal list too, but this exercises the DNS-resolution path via a
+        // name that isn't on the literal blocklist but resolves internally.
+        if let Some(reason) = reject_web_target("http://localhost.") {
+            assert!(reason.contains("localhost"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn web_fetch_allows_public_targets() {
+        for url in [
+            "http://example.com",
+            "https://example.com/docs",
+            "https://api.github.com/repos/foo/bar",
+            "http://193.0.0.1", // public-range IP
+            "https://8.8.8.8",  // public DNS
+        ] {
+            assert!(
+                reject_web_target(url).is_none(),
+                "unexpected block of '{url}'"
+            );
+        }
+    }
+
+    #[test]
+    fn current_time_tool_returns_a_parseable_datetime() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        let tm = tool_manager(&root);
+        let r = tm
+            .dispatch_with_approver("current_time", "{}", approve)
+            .unwrap();
+        assert!(!r.is_error, "{}", r.content);
+        // Format is "<date> — <weekday>, <month> <day>, <year>" with a UTC
+        // offset line — at minimum it must carry the current year.
+        assert!(
+            r.content.contains(&chrono::Local::now().year().to_string()),
+            "expected current year in: {}",
+            r.content
+        );
+        assert!(r.content.contains("UTC offset"), "{}", r.content);
+
+        // Plan mode must still allow it (read-only clock read).
+        tm.set_plan_mode(true);
+        let in_plan = tm
+            .dispatch_with_approver("current_time", "{}", approve)
+            .unwrap();
+        assert!(!in_plan.is_error, "{}", in_plan.content);
+    }
+
+    #[test]
+    fn current_time_is_listed_as_read_only() {
+        assert!(is_read_only_tool("current_time"));
     }
 
     /// The `PLATFORM_TOOLS` registry is the single source of truth: every
