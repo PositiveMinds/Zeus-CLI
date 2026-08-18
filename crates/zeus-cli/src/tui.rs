@@ -269,6 +269,17 @@ fn apply_picker_choice(
     state.record_recent_model(&state.provider.clone(), &model_id);
     state.model = model_id;
     state.context_window = None;
+    match persist_default_provider(config, &state.provider, Some(&state.model)) {
+        Ok(path) => state.push_info(format!(
+            "picked {}: {} — saved to {}",
+            state.provider,
+            state.model,
+            path.display()
+        )),
+        Err(e) => state.push_info(format!(
+            "switched, but saving default provider/model failed: {e:#}"
+        )),
+    }
 }
 
 /// Selecting a *model* row (as opposed to a provider row) in any picker or
@@ -4329,7 +4340,20 @@ async fn handle_key(
                         } else if let Some(agent) = agent_slot.as_mut() {
                             agent.set_model(arg.to_string());
                             state.model = arg.to_string();
-                            state.push_info(format!("switched to model: {arg}"));
+                            match persist_default_provider(
+                                config,
+                                &state.provider,
+                                Some(&state.model),
+                            ) {
+                                Ok(path) => state.push_info(format!(
+                                    "switched to model: {} — saved to {}",
+                                    state.model,
+                                    path.display()
+                                )),
+                                Err(e) => state.push_info(format!(
+                                    "switched to model, but saving default failed: {e:#}"
+                                )),
+                            }
                         }
                     }
                     "provider" => {

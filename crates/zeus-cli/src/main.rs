@@ -376,7 +376,7 @@ async fn resolve_provider(
                     None => {
                         info!(provider = %name, "no reachable model server detected");
                         return Err(anyhow::anyhow!(
-                            "no model provider is reachable. Start a local server (ollama/lmstudio/llamacpp) or configure a cloud provider and set its API key, then run `zeus config set core.default.provider <name>` (or pass `--provider <name>`)"
+                            "no model provider is reachable. Start a local server (ollama/lmstudio/llamacpp) or configure a cloud provider and set its API key, then run `zeus config set model.provider <name>` (or pass `--provider <name>`)"
                         ));
                     }
                 }
@@ -731,7 +731,13 @@ async fn run_chat_with_failover(
                     primary.id(),
                     name
                 );
-                match attempt_chat(&*prov, request.clone(), stream).await {
+                // Rebuild the request with the failover provider's own default
+                // model — the primary's model ID is provider-specific (e.g.
+                // OpenCode Zen's `deepseek-v4-flash-free` means nothing to
+                // OpenRouter) and would otherwise 400.
+                let mut swapped = request.clone();
+                swapped.model = model.clone();
+                match attempt_chat(&*prov, swapped, stream).await {
                     Ok(()) => return Ok(()),
                     Err(e) => last = e,
                 }
@@ -2391,7 +2397,13 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                         println!("current model: {}", agent.model());
                     } else {
                         agent.set_model(arg.to_string());
-                        println!("switched to model: {arg}");
+                        match persist_default_provider(config, &config.settings.model.provider, Some(agent.model())) {
+                            Ok(path) => println!(
+                                "switched to model: {arg} — saved to {}",
+                                path.display()
+                            ),
+                            Err(e) => eprintln!("switched to model, but saving default failed: {e:#}"),
+                        }
                     }
                 }
                 "provider" => handle_provider_slash(arg, config, &mut agent).await,
