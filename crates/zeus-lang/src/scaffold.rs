@@ -228,7 +228,7 @@ fn templates(lang: Language) -> Vec<(&'static str, &'static str)> {
         Language::Kotlin => vec![
             (
                 "build.gradle.kts",
-                "plugins {\n    application\n    kotlin(\"jvm\") version \"1.9.0\"\n}\n\nrepositories { mavenCentral() }\n\napplication { mainClass.set(\"MainKt\") }\n",
+                "plugins {\n    application\n    kotlin(\"jvm\") version \"2.2.0\"\n}\n\nrepositories { mavenCentral() }\n\napplication { mainClass.set(\"MainKt\") }\n",
             ),
             (
                 "settings.gradle.kts",
