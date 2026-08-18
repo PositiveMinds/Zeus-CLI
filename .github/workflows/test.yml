@@ -36,14 +36,27 @@ jobs:
       # even when Cargo.lock changes (the per-commit rebuild churn that the
       # old full target-dir cache didn't help with). This is the main driver
       # of the "Test" job wall-clock time.
-      - name: Enable sccache
+      #
+      # The GitHub Actions cache service occasionally has incidents where the
+      # backend is unreachable; sccache then fails at server startup on *every*
+      # rustc invocation. sccache is only an optimization, so we tolerate a
+      # down cache: the action step is non-fatal, and the probe below only
+      # wires sccache into cargo when its backend actually answers.
+      - name: Enable sccache (optional)
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.7
 
       - name: Configure sccache for cargo
         shell: bash
         run: |
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          if sccache --show-stats >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+            echo "using sccache"
+          else
+            echo "sccache cache backend unavailable (GH Actions cache incident?) — building without sccache"
+          fi
 
       # Compiled artifacts come from sccache above; this cache only keeps the
       # downloaded crate sources so a cold Cargo.lock doesn't re-download the
