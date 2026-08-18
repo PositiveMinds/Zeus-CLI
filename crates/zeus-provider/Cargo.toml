@@ -15,6 +15,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
+# Pinned to 0.13.x (not the floating 0.13): all three crates that use reqwest
+# must agree on the resolved version so the OpenSSL-free `rustls` transport,
+# blocking feature gating, and any security fixes behave identically everywhere.
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
 dirs.workspace = true
 zip = { workspace = true }

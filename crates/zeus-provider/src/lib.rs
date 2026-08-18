@@ -21,6 +21,7 @@ mod local_models;
 mod ollama;
 mod openai_compat;
 mod registry;
+mod retry;
 mod types;
 mod unconfigured;
 

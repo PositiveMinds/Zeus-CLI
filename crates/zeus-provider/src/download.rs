@@ -103,7 +103,9 @@ async fn download_attempt(
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_content_range);
-        let total = from_header.and_then(|(_, t)| t).or_else(|| resp.content_length());
+        let total = from_header
+            .and_then(|(_, t)| t)
+            .or_else(|| resp.content_length());
         let start = from_header.map(|(s, _)| s).unwrap_or(resume_from);
         (start, total)
     } else {
@@ -202,7 +204,10 @@ async fn download_single_stream_with_retries(
     let mut attempt = 0u32;
     loop {
         // How far along is the partial file already?
-        let resume_from = tokio::fs::metadata(&tmp_path).await.map(|m| m.len()).unwrap_or(0);
+        let resume_from = tokio::fs::metadata(&tmp_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         match download_attempt(client, url, &tmp_path, resume_from, on_progress).await {
             Ok(_) => {

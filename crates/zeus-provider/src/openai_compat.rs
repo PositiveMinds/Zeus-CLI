@@ -291,15 +291,21 @@ impl ModelProvider for OpenAiCompatProvider {
         }
         let model = request.model.clone();
         let body = build_body(&request, false);
-        let resp = self
-            .client
-            .post(self.chat_url())
-            .headers(self.reqwest_headers())
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_reqwest_err)?;
-        let resp = error_for_status(resp).await?;
+        let resp = crate::retry::with_retry(|| {
+            let body = body.clone();
+            async move {
+                let resp = self
+                    .client
+                    .post(self.chat_url())
+                    .headers(self.reqwest_headers())
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(map_reqwest_err)?;
+                error_for_status(resp).await
+            }
+        })
+        .await?;
         let parsed: OaChatResponse = resp.json().await.map_err(map_reqwest_err)?;
         let choice = parsed
             .choices
@@ -341,15 +347,21 @@ impl ModelProvider for OpenAiCompatProvider {
         }
         let cancel = request.cancel.clone();
         let body = build_body(&request, true);
-        let resp = self
-            .client
-            .post(self.chat_url())
-            .headers(self.reqwest_headers())
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_reqwest_err)?;
-        let resp = error_for_status(resp).await?;
+        let resp = crate::retry::with_retry(|| {
+            let body = body.clone();
+            async move {
+                let resp = self
+                    .client
+                    .post(self.chat_url())
+                    .headers(self.reqwest_headers())
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(map_reqwest_err)?;
+                error_for_status(resp).await
+            }
+        })
+        .await?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent>>(32);
 
@@ -737,37 +749,37 @@ server.serve_forever()
         /// which can only ever be produced by *this* server. The child is killed
         /// even if the readiness wait fails, so no process leaks on panic.
         fn start() -> Self {
-        let dir = tempfile::TempDir::new().expect("create test server temp dir");
-        let script_path = dir.path().join("server.py");
-        let port_file = dir.path().join("port");
-        std::fs::write(&script_path, server_script()).unwrap();
-        let mut child = Command::new(python_cmd())
-            .arg(&script_path)
-            .arg(&port_file)
-            .spawn()
-            .expect("failed to spawn test server");
-        // If anything below panics, still kill the child before unwinding.
-        let mut guard = KillOnDrop(&mut child, true);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let port = loop {
-            if let Ok(contents) = std::fs::read_to_string(&port_file) {
-                if let Ok(port) = contents.trim().parse::<u16>() {
-                    break port;
+            let dir = tempfile::TempDir::new().expect("create test server temp dir");
+            let script_path = dir.path().join("server.py");
+            let port_file = dir.path().join("port");
+            std::fs::write(&script_path, server_script()).unwrap();
+            let mut child = Command::new(python_cmd())
+                .arg(&script_path)
+                .arg(&port_file)
+                .spawn()
+                .expect("failed to spawn test server");
+            // If anything below panics, still kill the child before unwinding.
+            let mut guard = KillOnDrop(&mut child, true);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let port = loop {
+                if let Ok(contents) = std::fs::read_to_string(&port_file) {
+                    if let Ok(port) = contents.trim().parse::<u16>() {
+                        break port;
+                    }
                 }
+                if std::time::Instant::now() >= deadline {
+                    panic!("test server did not report its port in time");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            };
+            guard.disarm();
+            drop(guard);
+            Self {
+                child,
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                _dir: dir,
             }
-            if std::time::Instant::now() >= deadline {
-                panic!("test server did not report its port in time");
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        };
-        guard.disarm();
-        drop(guard);
-        Self {
-            child,
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            _dir: dir,
         }
-    }
     }
 
     /// Kills the spawned child when it goes out of scope (used as a panic
@@ -807,7 +819,8 @@ server.serve_forever()
     #[tokio::test]
     async fn chat_sends_authorization_header() {
         let server = TestServer::start();
-        let provider = OpenAiCompatProvider::new("test", &server.base_url).with_api_key("sk-test-key");
+        let provider =
+            OpenAiCompatProvider::new("test", &server.base_url).with_api_key("sk-test-key");
         let resp = provider
             .chat(ChatRequest::new(
                 "auth-echo-model",
@@ -853,13 +866,19 @@ server.serve_forever()
         let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let resp = provider
-            .chat(ChatRequest::new("gemini-tool-model", vec![Message::user("hi")]))
+            .chat(ChatRequest::new(
+                "gemini-tool-model",
+                vec![Message::user("hi")],
+            ))
             .await
             .unwrap();
         assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
         assert_eq!(resp.message.tool_calls.len(), 1);
         let call = &resp.message.tool_calls[0];
-        assert_eq!(call.extra_content.as_ref().unwrap()["google"]["thought_signature"], "sg_aG9wZWx5");
+        assert_eq!(
+            call.extra_content.as_ref().unwrap()["google"]["thought_signature"],
+            "sg_aG9wZWx5"
+        );
     }
 
     /// The follow-up request must echo `extra_content` verbatim on the
@@ -870,7 +889,10 @@ server.serve_forever()
         let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let first = provider
-            .chat(ChatRequest::new("gemini-tool-model", vec![Message::user("hi")]))
+            .chat(ChatRequest::new(
+                "gemini-tool-model",
+                vec![Message::user("hi")],
+            ))
             .await
             .unwrap();
         let assistant = first.message.clone();
@@ -890,7 +912,10 @@ server.serve_forever()
         let server = TestServer::start();
         let provider = OpenAiCompatProvider::new("test", &server.base_url);
         let mut stream = provider
-            .stream(ChatRequest::new("gemini-tool-model", vec![Message::user("hi")]))
+            .stream(ChatRequest::new(
+                "gemini-tool-model",
+                vec![Message::user("hi")],
+            ))
             .await
             .unwrap();
         let mut signature = None;
@@ -903,7 +928,9 @@ server.serve_forever()
             } = ev.unwrap()
             {
                 if let Some(extra) = extra_content {
-                    signature = extra["google"]["thought_signature"].as_str().map(String::from);
+                    signature = extra["google"]["thought_signature"]
+                        .as_str()
+                        .map(String::from);
                 }
                 arguments.push_str(&arguments_delta);
             }

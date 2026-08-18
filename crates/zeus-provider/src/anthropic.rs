@@ -238,15 +238,21 @@ impl ModelProvider for AnthropicProvider {
         }
         let model = request.model.clone();
         let body = build_body(&request, false);
-        let resp = self
-            .client
-            .post(self.messages_url())
-            .headers(self.headers())
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_reqwest_err)?;
-        let resp = error_for_status(resp).await?;
+        let resp = crate::retry::with_retry(|| {
+            let body = body.clone();
+            async move {
+                let resp = self
+                    .client
+                    .post(self.messages_url())
+                    .headers(self.headers())
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(map_reqwest_err)?;
+                error_for_status(resp).await
+            }
+        })
+        .await?;
         let parsed: AnMessage = resp.json().await.map_err(map_reqwest_err)?;
 
         let mut text = String::new();
@@ -295,15 +301,21 @@ impl ModelProvider for AnthropicProvider {
         }
         let cancel = request.cancel.clone();
         let body = build_body(&request, true);
-        let resp = self
-            .client
-            .post(self.messages_url())
-            .headers(self.headers())
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_reqwest_err)?;
-        let resp = error_for_status(resp).await?;
+        let resp = crate::retry::with_retry(|| {
+            let body = body.clone();
+            async move {
+                let resp = self
+                    .client
+                    .post(self.messages_url())
+                    .headers(self.headers())
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(map_reqwest_err)?;
+                error_for_status(resp).await
+            }
+        })
+        .await?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent>>(32);
 

@@ -12,7 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 zeus-agent = { workspace = true }
@@ -32,7 +34,11 @@ crossterm = "0.28"
 syntect = { workspace = true }
 arboard = { workspace = true }
 serde_json = { workspace = true }
+# Pinned to 0.13.x (not the floating 0.13): all three crates that use reqwest
+# must agree on the resolved version so the OpenSSL-free `rustls` transport,
+# blocking feature gating, and any security fixes behave identically everywhere.
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+zip = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

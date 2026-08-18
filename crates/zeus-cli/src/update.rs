@@ -110,25 +110,21 @@ fn platform_asset_name() -> Result<&'static str> {
 }
 
 /// Extracts a downloaded release archive with whatever the platform already
-/// has on hand — `Expand-Archive` (built into every Windows 10/11) for the
-/// `.zip`, `tar` (universal on Linux/macOS) for the `.tar.gz` — rather than
-/// pulling in a zip/tar crate just for this one-shot use.
+/// has on hand — the `zip` crate (path-safety guarded, same rules as the
+/// provider's own model-archive extractor) for the `.zip` on Windows, `tar`
+/// (universal on Linux/macOS) for the `.tar.gz` — rather than pulling in a
+/// zip/tar crate just for this one-shot use. (Expand-Archive was the previous
+/// Windows path but .NET Framework's implementation is the classic zip-slip
+/// vector; the `zip` crate with an explicit containment check is stricter.)
 fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
-    let status = if cfg!(windows) {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
-                    archive.display(),
-                    dest.display()
-                ),
-            ])
-            .status()
-            .context("spawn powershell to extract the downloaded zip")?
+    std::fs::create_dir_all(dest).context("create extract directory")?;
+    if cfg!(windows) {
+        extract_zip_safely(archive, dest)
     } else {
-        std::process::Command::new("tar")
+        // GNU/BSD tar both strip leading `/` and `..` path components from
+        // member names during extraction, so a traversal entry can't escape
+        // `-C dest` here the way it can with a raw zip writer.
+        let status = std::process::Command::new("tar")
             .args([
                 "-xzf",
                 &archive.to_string_lossy(),
@@ -136,10 +132,43 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
                 &dest.to_string_lossy(),
             ])
             .status()
-            .context("spawn tar to extract the downloaded archive")?
-    };
-    if !status.success() {
-        bail!("extracting the downloaded archive failed with {status}");
+            .context("spawn tar to extract the downloaded archive")?;
+        if !status.success() {
+            bail!("extracting the downloaded archive failed with {status}");
+        }
+        Ok(())
+    }
+}
+
+/// Extract a `.zip` into `dest`, refusing absolute paths and `..` traversal
+/// components — the same zip-slip guard the provider's model-archive
+/// extractor enforces. The update archive comes from zeus's own GitHub
+/// releases today, but a poisoned/mirrored release must not be able to write
+/// outside `dest` even then.
+fn extract_zip_safely(archive: &Path, dest: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive).context("open downloaded zip")?;
+    let mut archive = zip::ZipArchive::new(file).context("read downloaded zip")?;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .with_context(|| format!("read zip entry {i}"))?;
+        let rel = entry.name().replace('\\', "/");
+        let rel_path = Path::new(&rel);
+        if rel_path.is_absolute() || rel.split('/').any(|c| c == "..") {
+            bail!("zip entry '{rel}' would escape the extract directory; refusing to extract");
+        }
+        let out_path = dest.join(&rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).with_context(|| format!("create dir '{rel}'"))?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create dir '{}'", parent.display()))?;
+        }
+        let mut out =
+            std::fs::File::create(&out_path).with_context(|| format!("create file '{rel}'"))?;
+        std::io::copy(&mut entry, &mut out).with_context(|| format!("extract '{rel}'"))?;
     }
     Ok(())
 }
@@ -179,11 +208,17 @@ fn self_replace(new_binary: &Path) -> Result<()> {
     let old_name = match current_exe.extension().and_then(|e| e.to_str()) {
         Some(ext) => format!(
             "{}.old.{ext}",
-            current_exe.file_stem().unwrap_or_default().to_string_lossy()
+            current_exe
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
         ),
         None => format!(
             "{}.old",
-            current_exe.file_name().unwrap_or_default().to_string_lossy()
+            current_exe
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
         ),
     };
     let old_path = current_exe.with_file_name(old_name);

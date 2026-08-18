@@ -233,13 +233,26 @@ fn unzip(src: &Path, dest: &Path) -> Result<()> {
             .by_index(i)
             .map_err(|e| ProviderError::Api(format!("zip entry {i}: {e}")))?;
         let rel = entry.name().replace('\\', "/");
+        // Zip-slip guard: a hostile archive could otherwise name an entry
+        // `../victim` or `/abs/path` and `dest.join` would happily write
+        // outside the extract directory. Reject absolute paths and any `..`
+        // component outright instead of trying to normalize them.
+        let rel_path = Path::new(&rel);
+        if rel_path.is_absolute() || rel.split('/').any(|c| c == "..") {
+            return Err(ProviderError::Api(format!(
+                "zip entry '{rel}' would escape the extract directory; refusing to extract"
+            )));
+        }
         let out_path = dest.join(&rel);
         if entry.is_dir() {
-            std::fs::create_dir_all(&out_path).ok();
+            std::fs::create_dir_all(&out_path)
+                .map_err(|e| ProviderError::Api(format!("create dir '{rel}': {e}")))?;
             continue;
         }
         if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ProviderError::Api(format!("create dir '{}': {e}", parent.display()))
+            })?;
         }
         let mut out = std::fs::File::create(&out_path)
             .map_err(|e| ProviderError::Api(format!("write {rel}: {e}")))?;
@@ -459,5 +472,53 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("nope");
         assert!(locate_server_binary(Some(missing.to_str().unwrap()), tmp.path()).is_none());
+    }
+
+    #[test]
+    fn unzip_rejects_zip_slip_entries() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let zip_path = tmp.path().join("evil.zip");
+        let f = std::fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        // Absolute path entry.
+        zw.start_file("C:/escaped.txt", opts).unwrap();
+        zw.write_all(b"pwned").unwrap();
+        zw.start_file("../outside.txt", opts).unwrap();
+        zw.write_all(b"pwned").unwrap();
+        zw.finish().unwrap();
+
+        let dest = tmp.path().join("out");
+        let err = unzip(&zip_path, &dest).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to extract"),
+            "expected a zip-slip rejection, got: {msg}"
+        );
+        assert!(
+            !tmp.path().join("escaped.txt").exists() && !tmp.path().join("outside.txt").exists(),
+            "zip-slip entry escaped the extract directory"
+        );
+    }
+
+    #[test]
+    fn unzip_extracts_normal_entries() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let zip_path = tmp.path().join("ok.zip");
+        let f = std::fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("nested/hello.txt", opts).unwrap();
+        zw.write_all(b"hi").unwrap();
+        zw.finish().unwrap();
+
+        let dest = tmp.path().join("out");
+        unzip(&zip_path, &dest).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("nested/hello.txt")).unwrap(),
+            "hi"
+        );
     }
 }

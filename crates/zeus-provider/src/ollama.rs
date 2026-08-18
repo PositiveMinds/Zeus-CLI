@@ -609,37 +609,37 @@ server.serve_forever()
         /// which can only ever be produced by *this* server. The child is killed
         /// even if the readiness wait fails, so no process leaks on panic.
         fn start() -> Self {
-        let dir = tempfile::TempDir::new().expect("create test server temp dir");
-        let script_path = dir.path().join("server.py");
-        let port_file = dir.path().join("port");
-        std::fs::write(&script_path, server_script()).unwrap();
-        let mut child = Command::new(python_cmd())
-            .arg(&script_path)
-            .arg(&port_file)
-            .spawn()
-            .expect("failed to spawn test server");
-        // If anything below panics, still kill the child before unwinding.
-        let mut guard = KillOnDrop(&mut child, true);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let port = loop {
-            if let Ok(contents) = std::fs::read_to_string(&port_file) {
-                if let Ok(port) = contents.trim().parse::<u16>() {
-                    break port;
+            let dir = tempfile::TempDir::new().expect("create test server temp dir");
+            let script_path = dir.path().join("server.py");
+            let port_file = dir.path().join("port");
+            std::fs::write(&script_path, server_script()).unwrap();
+            let mut child = Command::new(python_cmd())
+                .arg(&script_path)
+                .arg(&port_file)
+                .spawn()
+                .expect("failed to spawn test server");
+            // If anything below panics, still kill the child before unwinding.
+            let mut guard = KillOnDrop(&mut child, true);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let port = loop {
+                if let Ok(contents) = std::fs::read_to_string(&port_file) {
+                    if let Ok(port) = contents.trim().parse::<u16>() {
+                        break port;
+                    }
                 }
+                if std::time::Instant::now() >= deadline {
+                    panic!("test server did not report its port in time");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            };
+            guard.disarm();
+            drop(guard);
+            Self {
+                child,
+                base_url: format!("http://127.0.0.1:{port}"),
+                _dir: dir,
             }
-            if std::time::Instant::now() >= deadline {
-                panic!("test server did not report its port in time");
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        };
-        guard.disarm();
-        drop(guard);
-        Self {
-            child,
-            base_url: format!("http://127.0.0.1:{port}"),
-            _dir: dir,
         }
-    }
     }
 
     /// Kills the spawned child when it goes out of scope (used as a panic
