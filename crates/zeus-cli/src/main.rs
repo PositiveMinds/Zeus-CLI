@@ -1124,7 +1124,7 @@ fn render_session_transcript(state: &ConversationState) -> String {
 }
 
 /// Render a conversation as a readable Markdown transcript.
-fn render_session_markdown(state: &ConversationState) -> String {
+pub(crate) fn render_session_markdown(state: &ConversationState) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Session {}\n\n", state.session_id));
     for msg in &state.messages {
@@ -1172,6 +1172,34 @@ fn render_session_markdown(state: &ConversationState) -> String {
         }
     }
     out
+}
+
+/// Render a conversation to Markdown and write it to disk (the shared core of
+/// `zeus sessions export <id>`, the REPL `/export`, and the TUI `/export`).
+fn export_session_conversation(
+    session_id: &str,
+    messages: &[Message],
+    output: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if messages.is_empty() {
+        bail!("nothing to export yet — send a message first");
+    }
+    let state = ConversationState {
+        session_id: session_id.to_string(),
+        messages: messages.to_vec(),
+        last_activity: 0,
+    };
+    let md = render_session_markdown(&state);
+    let path = output.unwrap_or_else(|| PathBuf::from(format!("{session_id}.md")));
+    std::fs::write(&path, md)?;
+    Ok(path)
+}
+
+/// Render the *current* agent conversation to Markdown and write it to disk
+/// — backs the REPL and TUI `/export` command (the interactive sibling of
+/// `zeus sessions export <id>`).
+pub(crate) fn export_current_session(agent: &Agent, output: Option<PathBuf>) -> Result<PathBuf> {
+    export_session_conversation(agent.session_id(), agent.messages(), output)
 }
 
 /// `zeus key set/list` — the one-shot equivalent of the REPL's `/provider
@@ -1979,6 +2007,10 @@ const REPL_BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "list saved sessions (opens a resume picker in the TUI)",
     ),
     (
+        "export",
+        "save the current conversation to Markdown: /export [file.md]",
+    ),
+    (
         "agents",
         "list the specialist-agents roster grouped by department (/agents count)",
     ),
@@ -2559,6 +2591,15 @@ async fn run_plain_repl(config: &Config, mut agent: Agent, yes: bool) -> Result<
                     Ok(text) => println!("{text}"),
                     Err(e) => eprintln!("couldn't list sessions: {e:#}"),
                 },
+                "export" => {
+                    let output = arg.split_whitespace().next().map(PathBuf::from);
+                    match export_current_session(&agent, output) {
+                        Ok(path) => {
+                            println!("exported session {} to {}", agent.session_id(), path.display())
+                        }
+                        Err(e) => eprintln!("export failed: {e:#}"),
+                    }
+                }
                 "agents" => {
                     if arg.eq_ignore_ascii_case("count") {
                         let pools = personas_by_department();
@@ -5308,5 +5349,24 @@ mod tests {
         // Continuation lines are indented by the width of the "[user] " role
         // marker so they align under the first line's body.
         assert!(out.contains("line one\n       line two"), "{out}");
+    }
+
+    #[test]
+    fn export_session_conversation_writes_markdown_or_errors_on_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("transcript.md");
+        let path = export_session_conversation(
+            "sess-5",
+            &[Message::user("hello"), Message::assistant("hi")],
+            Some(out.clone()),
+        )
+        .unwrap();
+        assert_eq!(path, out);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("# Session sess-5"));
+        assert!(text.contains("hello"));
+
+        let err = export_session_conversation("sess-empty", &[], Some(out)).unwrap_err();
+        assert!(err.to_string().contains("nothing to export"));
     }
 }

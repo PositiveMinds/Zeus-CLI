@@ -4375,6 +4375,20 @@ async fn handle_key(
                             Err(e) => state.push_error(format!("couldn't list sessions: {e:#}")),
                         }
                     }
+                    "export" => {
+                        let output = arg.split_whitespace().next().map(std::path::PathBuf::from);
+                        match agent_slot.as_ref() {
+                            Some(agent) => match crate::export_current_session(agent, output) {
+                                Ok(path) => state.push_info(format!(
+                                    "exported session {} to {}",
+                                    agent.session_id(),
+                                    path.display()
+                                )),
+                                Err(e) => state.push_error(format!("export failed: {e:#}")),
+                            },
+                            None => state.push_error("no active agent to export".to_string()),
+                        }
+                    }
                     "understand" => {
                         if arg.is_empty() {
                             state.push_error(
