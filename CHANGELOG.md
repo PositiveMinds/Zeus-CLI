@@ -5,7 +5,7 @@ for the newest release before asking to install it; the full history lives in
 this file. Versions follow `major.minor.patch`; each entry covers the
 user-visible changes since the previous release.
 
-## Unreleased
+## 0.1.10
 
 - **Sessions housekeeping**: `zeus sessions remove|rm <id>`, `prune
   --older-than <days>`, and `label <id> <name>` (empty name clears the
@@ -20,6 +20,10 @@ user-visible changes since the previous release.
   later auth error mid-chat.
 - **`zeus update` release notes**: `zeus update`/`--check` prints what's new
   in the pending release fetched from GitHub before installing.
+- **`zeus bg logs` exit codes**: a background task's exit status is now
+  propagated to `zeus bg logs <id>`'s own exit code, so scripts can react
+  to a failed dev-server/build the way they would if it ran in the
+  foreground.
 - **`/export` everywhere**: the current conversation can be exported to
   Markdown from the REPL (`/export`) and the TUI, including finished
   sessions via `zeus sessions export <id>`.
