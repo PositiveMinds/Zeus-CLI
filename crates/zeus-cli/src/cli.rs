@@ -457,6 +457,11 @@ pub enum KeyCmd {
 pub enum SessionsCmd {
     /// List saved sessions (id, message count, last user message)
     List,
+    /// Print a saved session's conversation as a readable terminal transcript
+    Show {
+        /// Session id — see `zeus sessions list`
+        id: String,
+    },
     /// Export a saved session's conversation to Markdown
     Export {
         /// Session id — see `zeus sessions list`

@@ -137,6 +137,7 @@ async fn run() -> Result<()> {
         }
         Some(Commands::Sessions { action }) => match action {
             Some(SessionsCmd::List) | None => cmd_sessions(&config),
+            Some(SessionsCmd::Show { id }) => cmd_sessions_show(&config, &id),
             Some(SessionsCmd::Export { id, output }) => cmd_sessions_export(&config, &id, output),
         },
         Some(Commands::Update { check }) => {
@@ -1049,6 +1050,77 @@ fn cmd_sessions_export(config: &Config, id: &str, output: Option<PathBuf>) -> Re
     std::fs::write(&path, md)?;
     println!("exported session {id} to {}", path.display());
     Ok(())
+}
+
+/// `zeus sessions show <id>` — print a saved conversation as a plain-text
+/// transcript (the terminal sibling of `sessions export`, which writes
+/// Markdown to a file).
+fn cmd_sessions_show(config: &Config, id: &str) -> Result<()> {
+    let store = SessionStore::new(config.global.sessions.clone());
+    let state = store.load(id).context("load session")?;
+    if state.messages.is_empty() {
+        bail!("session {id} has no messages to show");
+    }
+    print!("{}", render_session_transcript(&state));
+    Ok(())
+}
+
+/// Render a conversation as a compact, pipe-friendly transcript with one
+/// message per block and a plain-text role marker per line.
+fn render_session_transcript(state: &ConversationState) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "session {} — {} message(s)\n",
+        state.session_id,
+        state.messages.len()
+    ));
+    let mut last_role = None;
+    for msg in &state.messages {
+        let role = match msg.role {
+            zeus_provider::Role::System => "system",
+            zeus_provider::Role::User => "user",
+            zeus_provider::Role::Assistant => "assistant",
+            zeus_provider::Role::Tool => "tool",
+        };
+        if last_role != Some(role) {
+            out.push('\n');
+            last_role = Some(role);
+        }
+        let body = msg.content.trim();
+        if body.is_empty() && msg.tool_calls.is_empty() {
+            continue;
+        }
+        let mut line = format!("[{role}] ");
+        let continuation = line.len();
+        if !body.is_empty() {
+            for (i, l) in body.lines().enumerate() {
+                if i == 0 {
+                    line.push_str(l);
+                } else {
+                    line.push('\n');
+                    line.push_str(&" ".repeat(continuation));
+                    line.push_str(l);
+                }
+            }
+        }
+        for call in &msg.tool_calls {
+            if !line.ends_with('\n') {
+                line.push('\n');
+            }
+            line.push_str(&" ".repeat(continuation));
+            line.push_str(&format!("→ {} {}", call.name, call.arguments));
+        }
+        if !msg.images.is_empty() {
+            if !line.ends_with('\n') {
+                line.push('\n');
+            }
+            line.push_str(&" ".repeat(continuation));
+            line.push_str(&format!("[{} image(s), omitted]", msg.images.len()));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Render a conversation as a readable Markdown transcript.
@@ -5195,5 +5267,46 @@ mod tests {
     fn render_session_markdown_empty_state_has_header_only() {
         let state = ConversationState::new("sess-2");
         assert_eq!(render_session_markdown(&state), "# Session sess-2\n\n");
+    }
+
+    #[test]
+    fn render_session_transcript_labels_roles_and_continuation() {
+        use zeus_provider::ToolCall;
+        let mut state = ConversationState::new("sess-3");
+        state.messages = vec![
+            Message::system("you are helpful"),
+            Message::user("hello"),
+            Message::assistant("hi there"),
+            Message {
+                role: zeus_provider::Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: "{\"path\": \"x\"}".into(),
+                    extra_content: None,
+                }],
+                images: Vec::new(),
+            },
+            Message::tool_result("call-1", "file contents"),
+        ];
+        let out = render_session_transcript(&state);
+        assert!(out.starts_with("session sess-3 — 5 message(s)"));
+        assert!(out.contains("[system] you are helpful"));
+        assert!(out.contains("[user] hello"));
+        assert!(out.contains("[assistant] hi there"));
+        assert!(out.contains("→ read {\"path\": \"x\"}"));
+        assert!(out.contains("[tool] file contents"));
+    }
+
+    #[test]
+    fn render_session_transcript_multiline_body_indents_continuation_lines() {
+        let mut state = ConversationState::new("sess-4");
+        state.messages = vec![Message::user("line one\nline two")];
+        let out = render_session_transcript(&state);
+        // Continuation lines are indented by the width of the "[user] " role
+        // marker so they align under the first line's body.
+        assert!(out.contains("line one\n       line two"), "{out}");
     }
 }
