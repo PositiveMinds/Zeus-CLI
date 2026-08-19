@@ -8,7 +8,8 @@
 //! this tracks tasks by persisting metadata to `<dir>/<id>.json` and
 //! redirecting each child's stdout/stderr straight to log files on disk,
 //! rather than holding pipes/`Child` handles in memory. Liveness is checked
-//! by PID (`tasklist`/`kill -0`), not by owning the process.
+//! by PID, not by owning the process; on Windows the recorded creation time
+//! also guards against PID reuse.
 
 use crate::error::{AgentError, Result};
 use crate::terminal::{kill_tree, resume_process, suspend_process};
@@ -43,6 +44,14 @@ pub struct BackgroundTask {
     /// `zeus bg list` invocation (a fresh process) can report Paused.
     #[serde(default)]
     pub paused: bool,
+    /// Windows process creation time (`FILETIME` u64) captured at spawn. The
+    /// liveness check compares it against the live process's creation time so
+    /// a recycled PID (a *different* process that reused the number) can't
+    /// keep an exited task looking `Running` forever. `None` on unix and for
+    /// metas written before this field existed.
+    #[cfg(windows)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_started_ft: Option<u64>,
 }
 
 pub struct BackgroundTaskRegistry {
@@ -145,6 +154,8 @@ impl BackgroundTaskRegistry {
             cwd: cwd.display().to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             paused: false,
+            #[cfg(windows)]
+            pid_started_ft: capture_creation_time(pid),
         };
         let text =
             serde_json::to_string_pretty(&task).map_err(|e| AgentError::Terminal(e.to_string()))?;
@@ -198,6 +209,8 @@ impl BackgroundTaskRegistry {
             cwd: cwd.display().to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             paused: false,
+            #[cfg(windows)]
+            pid_started_ft: capture_creation_time(pid),
         };
         let text =
             serde_json::to_string_pretty(&task).map_err(|e| AgentError::Terminal(e.to_string()))?;
@@ -215,7 +228,7 @@ impl BackgroundTaskRegistry {
 
     /// Derive a task's status from its persisted `paused` flag plus liveness.
     fn status_of(task: &BackgroundTask) -> TaskStatus {
-        if !is_alive(task.pid) {
+        if !task_pid_is_alive(task) {
             TaskStatus::Exited
         } else if task.paused {
             TaskStatus::Paused
@@ -424,6 +437,33 @@ fn id_desc(args: &[String]) -> String {
 #[cfg(windows)]
 fn is_alive(pid: u32) -> bool {
     crate::terminal::process_is_alive(pid)
+}
+
+#[cfg(windows)]
+fn capture_creation_time(pid: u32) -> Option<u64> {
+    crate::terminal::process_creation_time(pid)
+}
+
+#[cfg(windows)]
+fn task_pid_is_alive(task: &BackgroundTask) -> bool {
+    let alive = is_alive(task.pid);
+    if !alive {
+        return false;
+    }
+    // PID-reuse guard: on a busy machine the OS can recycle a PID within
+    // seconds, so a *fresh* process may answer for an exited task's number.
+    // When we recorded the creation time at spawn, require it to still match
+    // — otherwise the number belongs to someone else and the task is gone.
+    match task.pid_started_ft {
+        Some(expected) => crate::terminal::process_creation_time(task.pid) == Some(expected),
+        // Old metas (or an unqueryable spawn) skip the guard — trust liveness.
+        None => true,
+    }
+}
+
+#[cfg(unix)]
+fn task_pid_is_alive(task: &BackgroundTask) -> bool {
+    is_alive(task.pid)
 }
 
 #[cfg(unix)]
@@ -752,5 +792,48 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
         assert!(registry.follow(999).is_err());
+    }
+
+    /// The Windows liveness guard must reject a live PID whose recorded
+    /// creation time doesn't match (the PID-reuse failure mode this field
+    /// exists for) and accept one that does.
+    #[cfg(windows)]
+    #[test]
+    fn task_pid_is_alive_guards_against_pid_reuse() {
+        let tmp = TempDir::new().unwrap();
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping -n 600 127.0.0.1 >NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let task = BackgroundTask {
+            id: 1,
+            command: "test".into(),
+            pid,
+            cwd: tmp.path().display().to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            paused: false,
+            pid_started_ft: Some(0),
+        };
+        assert!(
+            !task_pid_is_alive(&task),
+            "a live pid whose creation time doesn't match the record must count as dead"
+        );
+
+        let task = BackgroundTask {
+            pid_started_ft: capture_creation_time(pid),
+            ..task
+        };
+        assert!(
+            task_pid_is_alive(&task),
+            "a live pid whose creation time matches must count as alive"
+        );
+
+        kill_tree(pid);
+        let _ = child.wait();
     }
 }

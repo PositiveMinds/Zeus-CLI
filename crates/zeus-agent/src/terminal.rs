@@ -813,6 +813,45 @@ pub(crate) fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+/// Windows: query a process's creation time as a raw `FILETIME` u64. Returns
+/// `None` if the process is gone or the API is unavailable. Used to guard
+/// PID-based liveness against PID reuse (see `is_task_alive`).
+#[cfg(windows)]
+pub(crate) fn process_creation_time(pid: u32) -> Option<u64> {
+    use libloading::{Library, Symbol};
+    use std::ffi::c_void;
+
+    unsafe {
+        type OpenProcess = unsafe extern "system" fn(u32, i32, u32) -> *mut c_void;
+        type GetProcessTimes =
+            unsafe extern "system" fn(*mut c_void, *mut i64, *mut i64, *mut i64, *mut i64) -> i32;
+        type CloseHandle = unsafe extern "system" fn(*mut c_void) -> i32;
+
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+        let kernel32 = Library::new("kernel32.dll").ok()?;
+        let open_process: Symbol<OpenProcess> = kernel32.get(b"OpenProcess\0").ok()?;
+        let get_times: Symbol<GetProcessTimes> = kernel32.get(b"GetProcessTimes\0").ok()?;
+        let close_handle: Symbol<CloseHandle> = kernel32.get(b"CloseHandle\0").ok()?;
+
+        let handle = open_process(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation: i64 = 0;
+        let mut exit: i64 = 0;
+        let mut kernel: i64 = 0;
+        let mut user: i64 = 0;
+        let ok = get_times(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
+        close_handle(handle);
+        if ok {
+            Some(creation as u64)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(unix)]
 fn signal_process(pid: u32, suspend: bool) -> std::io::Result<()> {
     let sig = if suspend {
