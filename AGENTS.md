@@ -5,7 +5,7 @@ Rust workspace (edition 2021 — no let-chains). Windows/PowerShell dev machine,
 ## Commands
 
 - Build: `cargo build --release -p zeus-cli` → `target/release/zeus.exe`
-- Test: `cargo test --workspace` (471 tests; warm run ~3 min, cold compile much slower — set generous timeouts)
+- Test: `cargo test --workspace` (474 tests; warm run ~3 min, cold compile much slower — set generous timeouts)
 - Lint (must be clean): `cargo clippy --workspace --all-targets -- -D warnings`
 - Format (must be clean): `cargo fmt --all`
 - CI: GitHub Actions — `Test` (ubuntu/windows/macos matrix) + `scaffold-build`. Inspect with `gh run list`, `gh run view <id> --log-failed`.
