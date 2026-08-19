@@ -22,7 +22,7 @@ use zeus_agent::{
     SessionStore, SlashCommands, TerminalRunner, ToolManager, TurnResult,
 };
 use zeus_config::{Config, KeysFile};
-use zeus_fs::{filter_out_own_index, word_boundary, IndexEngine, SymbolIndex};
+use zeus_fs::{filter_out_own_index, word_boundary, ApprovalDecision, IndexEngine, SymbolIndex};
 use zeus_fs::{
     CopyOptions, EditOptions, GitEngine, PermissionGate, ReadOptions, SearchOptions, WriteOptions,
 };
@@ -139,6 +139,11 @@ async fn run() -> Result<()> {
             Some(SessionsCmd::List) | None => cmd_sessions(&config),
             Some(SessionsCmd::Show { id }) => cmd_sessions_show(&config, &id),
             Some(SessionsCmd::Export { id, output }) => cmd_sessions_export(&config, &id, output),
+            Some(SessionsCmd::Remove { id }) => cmd_sessions_remove(&config, &id, cli.yes),
+            Some(SessionsCmd::Prune { older_than }) => {
+                cmd_sessions_prune(&config, older_than, cli.yes)
+            }
+            Some(SessionsCmd::Label { id, name }) => cmd_sessions_label(&config, &id, &name),
         },
         Some(Commands::Update { check }) => {
             update::cmd_update(check, config.settings.notify_on_completion).await
@@ -997,9 +1002,13 @@ fn render_sessions(config: &Config) -> Result<String> {
     }
     let mut lines = Vec::new();
     for s in &summaries {
+        let head = match &s.label {
+            Some(label) => format!("{label}  ({})", s.id),
+            None => s.id.clone(),
+        };
         lines.push(format!(
-            "{:<38} {} messages  {}",
-            s.id,
+            "{:<44} {} messages  {}",
+            head,
             s.message_count,
             if s.last_user.is_empty() {
                 "(no user message yet)".to_string()
@@ -1062,6 +1071,83 @@ fn cmd_sessions_show(config: &Config, id: &str) -> Result<()> {
         bail!("session {id} has no messages to show");
     }
     print!("{}", render_session_transcript(&state));
+    Ok(())
+}
+
+/// `zeus sessions rm <id>` — delete a saved session after a word-level
+/// confirmation (or immediately with `--yes`).
+fn cmd_sessions_remove(config: &Config, id: &str, yes: bool) -> Result<()> {
+    let store = SessionStore::new(config.global.sessions.clone());
+    if !store.exists(id) {
+        bail!("no such session: {id}");
+    }
+    if !yes {
+        eprint!("Delete session {id}? [approve/cancel] ");
+        io::stderr().flush().ok();
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        if !matches!(config::read_approval(&line), ApprovalDecision::Approved) {
+            println!("cancelled");
+            return Ok(());
+        }
+    }
+    if store.remove(id)? {
+        println!("deleted session {id}");
+    } else {
+        bail!("no such session: {id}");
+    }
+    Ok(())
+}
+
+/// `zeus sessions prune --older-than N` — delete sessions untouched for N
+/// days (confirmed, or immediately with `--yes`).
+fn cmd_sessions_prune(config: &Config, older_than: u64, yes: bool) -> Result<()> {
+    let store = SessionStore::new(config.global.sessions.clone());
+    let summaries = store.summaries().context("list sessions")?;
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+        - older_than as i64 * 86_400 * 1000;
+    let stale: Vec<&zeus_agent::SessionSummary> =
+        summaries.iter().filter(|s| s.modified < cutoff).collect();
+    if stale.is_empty() {
+        println!("no sessions older than {older_than} day(s) to prune");
+        return Ok(());
+    }
+    for s in &stale {
+        println!("  {}  {} message(s)", s.id, s.message_count);
+    }
+    println!("prune {} session(s)? [approve/cancel] ", stale.len());
+    io::stderr().flush().ok();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    if !yes && !matches!(config::read_approval(&line), ApprovalDecision::Approved) {
+        println!("cancelled");
+        return Ok(());
+    }
+    let removed = store.prune_older_than(older_than)?;
+    for id in &removed {
+        println!("deleted session {id}");
+    }
+    Ok(())
+}
+
+/// `zeus sessions label <id> <name>` — attach (or clear, with "") a human
+/// label so listings/pickers show something memorable instead of the id.
+fn cmd_sessions_label(config: &Config, id: &str, name: &str) -> Result<()> {
+    let store = SessionStore::new(config.global.sessions.clone());
+    let label = (!name.trim().is_empty()).then(|| name.trim().to_string());
+    if !store
+        .set_label(id, label.clone())
+        .context("label session")?
+    {
+        bail!("no such session: {id}");
+    }
+    match label {
+        Some(n) => println!("labeled session {id} as \"{n}\""),
+        None => println!("cleared label on session {id}"),
+    }
     Ok(())
 }
 
@@ -1188,6 +1274,7 @@ fn export_session_conversation(
         session_id: session_id.to_string(),
         messages: messages.to_vec(),
         last_activity: 0,
+        label: None,
     };
     let md = render_session_markdown(&state);
     let path = output.unwrap_or_else(|| PathBuf::from(format!("{session_id}.md")));

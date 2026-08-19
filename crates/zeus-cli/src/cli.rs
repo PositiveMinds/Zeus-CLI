@@ -470,6 +470,26 @@ pub enum SessionsCmd {
         #[arg(long, value_name = "FILE")]
         output: Option<PathBuf>,
     },
+    /// Delete a saved session (asks for confirmation unless --yes)
+    #[command(alias = "rm")]
+    Remove {
+        /// Session id — see `zeus sessions list`
+        id: String,
+    },
+    /// Delete sessions not touched in N days (asks for confirmation unless --yes)
+    Prune {
+        /// Only remove sessions whose last activity is older than this many days
+        #[arg(long, value_name = "DAYS")]
+        older_than: u64,
+    },
+    /// Set (or clear, with an empty name) a session's human label
+    Label {
+        /// Session id — see `zeus sessions list`
+        id: String,
+        /// Label text; empty quotes ("") clears the label
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

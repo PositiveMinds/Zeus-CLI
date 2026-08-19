@@ -23,6 +23,12 @@ pub struct ConversationState {
     /// Unix millis of the last save; used for session-recency sorting.
     #[serde(default)]
     pub last_activity: i64,
+    /// Optional human label shown in listings/pickers instead of the opaque
+    /// id. Kept in the state file (not a sidecar) so it travels with the
+    /// session, but `set_label` writes the file directly without touching
+    /// `last_activity`, so labeling never bumps a session to "most recent".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl ConversationState {
@@ -31,6 +37,7 @@ impl ConversationState {
             session_id: session_id.into(),
             messages: Vec::new(),
             last_activity: 0,
+            label: None,
         }
     }
 }
@@ -42,8 +49,13 @@ pub struct SessionSummary {
     pub message_count: usize,
     /// The last user message text, truncated for a one-line preview.
     pub last_user: String,
-    /// Unix seconds of the file's last write (recency for resumes).
+    /// Unix *millis* of the session's last activity (from `last_activity`
+    /// when present, else the file's mtime), used for recency sorting and
+    /// prune cutoffs. Millis, not seconds, so two sessions saved close
+    /// together keep a stable relative order.
     pub modified: i64,
+    /// Human label set via `zeus sessions label`, if any.
+    pub label: Option<String>,
 }
 
 /// Loads/saves `ConversationState` as `<sessions_dir>/<id>.json`.
@@ -121,17 +133,21 @@ impl SessionStore {
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
+                .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             let mut message_count = 0;
             let mut last_user = String::new();
             let mut activity = modified;
+            let mut label = None;
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
                 if let Ok(state) = serde_json::from_str::<ConversationState>(&text) {
                     message_count = state.messages.len();
+                    // `last_activity` is already millis; a stale stamp of 0
+                    // falls back to the file mtime above.
                     if state.last_activity > 0 {
                         activity = state.last_activity;
                     }
+                    label = state.label;
                     last_user = state
                         .messages
                         .iter()
@@ -151,6 +167,7 @@ impl SessionStore {
                 message_count,
                 last_user,
                 modified: activity,
+                label,
             });
         }
         out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
@@ -161,6 +178,54 @@ impl SessionStore {
     pub fn most_recent(&self) -> Result<Option<String>> {
         Ok(self.summaries()?.into_iter().next().map(|s| s.id))
     }
+
+    /// Whether a session file exists for this id.
+    pub fn exists(&self, session_id: &str) -> bool {
+        self.path(session_id).exists()
+    }
+
+    /// Delete a saved session. Returns whether a file was actually removed
+    /// (false when the id doesn't exist). Backs `zeus sessions rm <id>`.
+    pub fn remove(&self, session_id: &str) -> Result<bool> {
+        let path = self.path(session_id);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Delete sessions whose last activity is older than `days` days,
+    /// returning the removed ids. Backs `zeus sessions prune --older-than`.
+    pub fn prune_older_than(&self, days: u64) -> Result<Vec<String>> {
+        let cutoff = unix_millis() - days as i64 * 86_400 * 1000;
+        let mut removed = Vec::new();
+        for s in self.summaries()? {
+            if s.modified < cutoff {
+                self.remove(&s.id)?;
+                removed.push(s.id);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Set (or clear, with `None`) a session's human label, without bumping
+    /// its recency stamp. Returns whether the session exists.
+    pub fn set_label(&self, session_id: &str, label: Option<String>) -> Result<bool> {
+        let path = self.path(session_id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut state = self.load(session_id)?;
+        state.label = label;
+        let text =
+            serde_json::to_string_pretty(&state).map_err(|e| AgentError::Session(e.to_string()))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(true)
+    }
 }
 
 /// A fresh, timestamp-derived session id — not `Date.now()`-style
@@ -170,7 +235,7 @@ pub fn new_session_id() -> String {
     format!("session-{}", chrono::Utc::now().format("%Y%m%d%H%M%S%3f"))
 }
 
-/// Unix milliseconds, for session-recency stamps.
+/// Unix milliseconds, for session-recency stamps and prune cutoffs.
 fn unix_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -284,5 +349,76 @@ mod tests {
         let store = SessionStore::new(tmp.path().to_path_buf());
         assert!(store.summaries().unwrap().is_empty());
         assert_eq!(store.most_recent().unwrap(), None);
+    }
+
+    #[test]
+    fn remove_deletes_only_that_session() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf());
+        store.save(&ConversationState::new("a")).unwrap();
+        store.save(&ConversationState::new("b")).unwrap();
+
+        assert!(store.remove("a").unwrap());
+        assert!(!store.remove("a").unwrap(), "second remove is a no-op");
+
+        let mut ids = store.list_session_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn prune_removes_old_sessions_but_keeps_recent() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf());
+
+        let mut old = ConversationState::new("old");
+        old.messages.push(Message::user("ancient"));
+        store.save(&old).unwrap();
+
+        // Backdate the old session's activity stamp to 40 days ago.
+        let old_path = tmp.path().join("old.json");
+        let mut on_disk: ConversationState =
+            serde_json::from_str(&std::fs::read_to_string(&old_path).unwrap()).unwrap();
+        on_disk.last_activity = unix_millis() - 40 * 86_400 * 1000;
+        std::fs::write(&old_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
+
+        store.save(&ConversationState::new("recent")).unwrap();
+
+        let removed = store.prune_older_than(30).unwrap();
+        assert_eq!(removed, vec!["old".to_string()]);
+
+        let mut ids = store.list_session_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["recent".to_string()]);
+    }
+
+    #[test]
+    fn set_label_persists_without_bumping_recency() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path().to_path_buf());
+
+        let mut state = ConversationState::new("labelled");
+        state.messages.push(Message::user("hi"));
+        store.save(&state).unwrap();
+        let original_activity = store.load("labelled").unwrap().last_activity;
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(store
+            .set_label("labelled", Some("my label".into()))
+            .unwrap());
+        assert!(!store.set_label("missing", Some("x".into())).unwrap());
+
+        let loaded = store.load("labelled").unwrap();
+        assert_eq!(loaded.label.as_deref(), Some("my label"));
+        assert_eq!(
+            loaded.last_activity, original_activity,
+            "labeling must not change recency"
+        );
+
+        let summary = store.summaries().unwrap().remove(0);
+        assert_eq!(summary.label.as_deref(), Some("my label"));
+
+        store.set_label("labelled", None).unwrap();
+        assert_eq!(store.load("labelled").unwrap().label, None);
     }
 }
