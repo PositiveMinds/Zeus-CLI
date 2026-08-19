@@ -7,6 +7,7 @@
 
 use super::pickers::{is_free_model, model_picker_filtered, PickerEntry, ProviderEntry};
 use super::theme;
+use super::transcript::Block_;
 use super::tui_text::{
     centered_rect, char_count, cost_per_million_tokens, fmt_price, format_token_count, mask_secret,
     textwrap_len, wrap_text,
@@ -54,6 +55,64 @@ pub(crate) fn session_picker_filtered(picker: &SessionPickerState) -> Vec<&Sessi
                 || s.last_user.to_lowercase().contains(&q)
         })
         .collect()
+}
+
+/// A saved session opened read-only for browsing: its messages rendered as
+/// transcript blocks, scrolled with ↑/↓ and paging. `v` in the session
+/// picker opens it; Esc returns to the live chat (which is untouched).
+pub(crate) struct SessionViewerState {
+    pub(crate) id: String,
+    pub(crate) blocks: Vec<Block_>,
+    pub(crate) scroll: usize,
+}
+
+/// The read-only session viewer modal: a centered popup showing the saved
+/// conversation with the same block rendering as the live chat column.
+/// The render clamps `scroll` to the real line count; the key handler just
+/// nudges it. Esc closes it (handled in the key path, not here).
+pub(crate) fn render_session_viewer(
+    f: &mut Frame,
+    area: Rect,
+    viewer: &SessionViewerState,
+) -> Rect {
+    let width = area.width.saturating_sub(8).clamp(60, 140);
+    let max_h = area.height.saturating_sub(4);
+    let height = max_h.max(12);
+    let popup = centered_rect(width, height, area);
+
+    let inner = Popup::new(popup)
+        .border(Style::default().fg(theme::border()))
+        .title(Line::from(vec![
+            Span::styled(
+                format!(" Session — {} message(s) ", viewer.blocks.len()),
+                theme::teal().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(viewer.id.clone(), theme::faint()),
+        ]))
+        .corner(Line::from(Span::styled(" read-only ", theme::dim())))
+        .bottom(
+            Line::from(Span::styled(
+                " esc close · ↑/↓ (pgup/pgdn) scroll ",
+                theme::dim(),
+            ))
+            .alignment(Alignment::Center),
+        )
+        .render(f);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for block in &viewer.blocks {
+        lines.extend(block.to_lines(inner.width));
+        lines.push(Line::from(""));
+    }
+    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    let scroll = viewer.scroll.min(max_scroll);
+    let end = (scroll + inner.height as usize).min(lines.len());
+    f.render_widget(
+        Paragraph::new(lines[scroll..end].to_vec()).wrap(Wrap { trim: false }),
+        inner,
+    );
+
+    inner
 }
 
 /// Any provider not listed here (custom entries in `providers.toml`) still
@@ -240,7 +299,7 @@ pub(crate) fn render_session_picker(
         ]))
         .bottom(
             Line::from(Span::styled(
-                " ↑/↓ navigate · enter resume · esc dismiss ",
+                " ↑/↓ navigate · enter resume · v view · esc dismiss ",
                 theme::dim(),
             ))
             .alignment(Alignment::Center),

@@ -872,6 +872,9 @@ struct AppState {
     search: Option<SearchState>,
     /// Open while the `/sessions` picker is up; `None` otherwise.
     session_picker: Option<SessionPickerState>,
+    /// A saved session opened read-only for browsing (`v` in the session
+    /// picker). The live chat is untouched underneath; Esc closes it.
+    session_viewer: Option<SessionViewerState>,
     /// Specialist persona currently driving an Auto-mode plan step or
     /// `/workflow` phase, shown as a topbar chip — `None` outside an
     /// orchestrated run (Build/Plan turns have no persona of their own) or
@@ -1005,6 +1008,7 @@ impl AppState {
             transcript_block_rows: Vec::new(),
             search: None,
             session_picker: None,
+            session_viewer: None,
             session_picker_area: None,
             active_persona: None,
             tool_call_meta: std::collections::HashMap::new(),
@@ -2122,6 +2126,41 @@ async fn resume_session(
     }
 }
 
+/// Load a saved session into the read-only viewer (the `v` key in the
+/// `/sessions` picker). The live agent and its transcript are untouched
+/// underneath; Esc in the viewer returns to them unchanged.
+fn open_session_viewer(id: String, config: &Config, state: &mut AppState) {
+    let store = SessionStore::new(config.global.sessions.clone());
+    match store.load(&id) {
+        Ok(saved) if !saved.messages.is_empty() => {
+            let blocks = saved
+                .messages
+                .iter()
+                .map(|m| {
+                    let (role, text) = match m.role {
+                        zeus_provider::Role::User => (Role::User, m.content.clone()),
+                        zeus_provider::Role::Assistant => (Role::Assistant, m.content.clone()),
+                        zeus_provider::Role::Tool => (Role::Tool, m.content.clone()),
+                        zeus_provider::Role::System => (Role::Info, m.content.clone()),
+                    };
+                    Block_::new(role, text)
+                })
+                .collect();
+            state.session_picker = None;
+            state.session_viewer = Some(SessionViewerState {
+                id,
+                blocks,
+                scroll: 0,
+            });
+        }
+        Ok(_) => {
+            state.session_picker = None;
+            state.push_info(format!("session {id} is empty — nothing to view"));
+        }
+        Err(e) => state.push_error(format!("couldn't load session '{id}': {e:#}")),
+    }
+}
+
 /// The chat column: scrolling transcript on top, the slash-command dropdown
 /// and the pinned input bar + hint row at the bottom — mirroring the HTML's
 /// `.chatcol` layout.
@@ -3060,6 +3099,10 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
         .as_ref()
         .map(|picker| render_session_picker(f, area, picker));
     state.session_picker_area = session_picker_area;
+
+    if let Some(viewer) = state.session_viewer.as_ref() {
+        render_session_viewer(f, area, viewer);
+    }
 }
 
 type TurnJoin = JoinHandle<(Agent, zeus_agent::Result<TurnResult>)>;
@@ -3535,6 +3578,21 @@ async fn handle_key(
         return Ok(());
     }
 
+    // ---- Read-only session viewer ----
+    // Takes priority over the composer while open; the render clamps `scroll`
+    // to the real line count, so the keys just nudge it here.
+    if let Some(viewer) = state.session_viewer.as_mut() {
+        match key.code {
+            KeyCode::Esc => state.session_viewer = None,
+            KeyCode::Up => viewer.scroll = viewer.scroll.saturating_sub(1),
+            KeyCode::Down => viewer.scroll = viewer.scroll.saturating_add(1),
+            KeyCode::PageUp => viewer.scroll = viewer.scroll.saturating_sub(20),
+            KeyCode::PageDown => viewer.scroll = viewer.scroll.saturating_add(20),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // ---- Session-resume picker ----
     if let Some(picker) = state.session_picker.as_ref() {
         let filtered_len = session_picker_filtered(picker).len();
@@ -3559,6 +3617,16 @@ async fn handle_key(
                 state.session_picker = None;
                 if let Some(id) = id {
                     resume_session(id, config, agent_slot, state).await;
+                }
+            }
+            // Open the selected session read-only for browsing — the live
+            // chat stays untouched underneath.
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                let id = session_picker_filtered(picker)
+                    .get(picker.selected)
+                    .map(|s| s.id.clone());
+                if let Some(id) = id {
+                    open_session_viewer(id, config, state);
                 }
             }
             KeyCode::Backspace => {
@@ -6129,6 +6197,78 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("Permission needed")));
         assert!(rows.iter().any(|r| r.contains('│')));
         assert!(rows.iter().any(|r| r.contains("approve (y)")));
+    }
+
+    /// The read-only session viewer renders the saved messages as blocks and
+    /// labels itself read-only.
+    #[test]
+    fn session_viewer_renders_blocks_and_readonly_hint() {
+        let viewer = SessionViewerState {
+            id: "session-1".to_string(),
+            blocks: vec![
+                Block_::new(Role::User, "hello".to_string()),
+                Block_::new(Role::Assistant, "hi there".to_string()),
+            ],
+            scroll: 0,
+        };
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                render_session_viewer(f, f.area(), &viewer);
+            })
+            .unwrap();
+        let rows = buffer_rows(terminal.backend().buffer());
+
+        assert!(rows.iter().any(|r| r.contains("Session")));
+        assert!(rows.iter().any(|r| r.contains("session-1")));
+        assert!(rows.iter().any(|r| r.contains("read-only")));
+        assert!(rows.iter().any(|r| r.contains("hello")));
+        assert!(rows.iter().any(|r| r.contains("hi there")));
+        assert!(rows.iter().any(|r| r.contains("esc close")));
+    }
+
+    /// ↑/↓ nudge the viewer scroll; Esc closes it back to the live chat.
+    #[tokio::test]
+    async fn session_viewer_keys_scroll_and_esc_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _config) = test_app_state(tmp.path());
+        state.session_viewer = Some(SessionViewerState {
+            id: "session-1".to_string(),
+            blocks: vec![Block_::new(Role::User, "hello".to_string())],
+            scroll: 0,
+        });
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let mut agent_slot: Option<Agent> = None;
+        let mut turn_handle: Option<TurnJoin> = None;
+        let mut cancel_tx: Option<watch::Sender<bool>> = None;
+
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &_config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.session_viewer.as_ref().unwrap().scroll, 1);
+
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &mut agent_slot,
+            &mut turn_handle,
+            &mut cancel_tx,
+            &ui_tx,
+            &_config,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(state.session_viewer.is_none());
     }
 
     /// Approval keys resolve the oneshot and return to Chat.
