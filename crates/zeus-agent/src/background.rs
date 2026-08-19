@@ -72,6 +72,13 @@ impl BackgroundTaskRegistry {
     fn stderr_path(&self, id: u64) -> PathBuf {
         self.dir.join(format!("{id}.stderr.log"))
     }
+    /// Marker file a `spawn`'d command writes its own exit code to before
+    /// it returns (see `spawn`), so a later `zeus bg logs` invocation — a
+    /// fresh process that never owned the child — can report how the task
+    /// actually ended instead of only "Running/Exited".
+    fn exit_code_path(&self, id: u64) -> PathBuf {
+        self.dir.join(format!("{id}.exit"))
+    }
     fn counter_path(&self) -> PathBuf {
         self.dir.join("next_id")
     }
@@ -124,12 +131,36 @@ impl BackgroundTaskRegistry {
             .open(self.stderr_path(id))?;
 
         let mut cmd = if cfg!(windows) {
+            // /V:ON enables delayed expansion so `!errorlevel!` reflects the
+            // exit code at *run* time (a parse-time `%errorlevel%` would
+            // always capture 0). The capture marker is appended with `&` so
+            // a nonzero command exit still records itself before returning.
+            // The marker path rides in a `set` variable (`set` takes the
+            // value verbatim, spaces included) rather than a quoted literal
+            // — Rust escapes embedded `"` as `\"` when argv-quoting the
+            // `/C` argument, which cmd then misparses as a broken redirect
+            // target. A user command containing literal `!` would be mangled
+            // by delayed expansion — a documented limitation of exit-code
+            // capture, since the record otherwise has to live in the child.
             let mut c = Command::new("cmd");
-            c.args(["/C", command]);
+            c.args([
+                "/V:ON",
+                "/C",
+                &format!(
+                    "set EXITFILE={} & {command} & echo !errorlevel!>!EXITFILE!",
+                    self.exit_code_path(id).display()
+                ),
+            ]);
             c
         } else {
             let mut c = Command::new("sh");
-            c.args(["-c", command]);
+            c.args([
+                "-c",
+                &format!(
+                    "{command}; echo $? > \"{}\"",
+                    self.exit_code_path(id).display()
+                ),
+            ]);
             c
         };
         cmd.current_dir(cwd);
@@ -318,6 +349,19 @@ impl BackgroundTaskRegistry {
             std::fs::read_to_string(self.stdout_path(id)).unwrap_or_default(),
             std::fs::read_to_string(self.stderr_path(id)).unwrap_or_default(),
         )
+    }
+
+    /// The exit code a task recorded for itself on its way out (`Some`),
+    /// read from the marker `spawn` appends to the command. `None` when the
+    /// task is still running, was started without the capture wrapper
+    /// (`spawn_argv`), or the marker is missing/unparsable — meaning "unknown
+    /// or not applicable", never a crash.
+    pub fn exit_code(&self, id: u64) -> Option<i32> {
+        std::fs::read_to_string(self.exit_code_path(id))
+            .ok()?
+            .trim()
+            .parse::<i32>()
+            .ok()
     }
 
     /// Stream a task's captured output live (`tail -f` style): print
@@ -565,6 +609,16 @@ mod tests {
         }
     }
 
+    /// A command that exits promptly with a nonzero status on every platform
+    /// (`ping` to a bogus address → 1 on Windows, `false` → 1 on unix).
+    fn failing_cmd() -> &'static str {
+        if cfg!(windows) {
+            "ping -n 1 999.999.999.999 >NUL"
+        } else {
+            "false"
+        }
+    }
+
     #[test]
     fn next_id_is_monotonic_across_registry_instances() {
         let tmp = TempDir::new().unwrap();
@@ -625,6 +679,40 @@ mod tests {
         assert_eq!(status, TaskStatus::Exited);
         let (stdout, _) = registry.output(id);
         assert!(stdout.contains("hi"));
+    }
+
+    /// `spawn` wraps the command so it records its own exit code before
+    /// returning; a later (fresh-process) registry can read it back — the
+    /// basis for `zeus bg logs <id>` propagating a failed task's exit code.
+    /// Polls for the marker itself (not just "task exited") so a slow spawn
+    /// under parallel test load can't outrun the read.
+    #[test]
+    fn exit_code_records_nonzero_after_task_exits() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = BackgroundTaskRegistry::new(root.join(".agent/background"));
+
+        // No marker → unknown: matches running tasks and `spawn_argv` tasks.
+        assert_eq!(registry.exit_code(999), None);
+
+        // A task that fails records its own nonzero exit code. (Not `exit 7`:
+        // `cmd`'s built-in `exit` terminates the shell itself, so the `& echo`
+        // capture chain never runs — the wrapper captures real background
+        // workloads, not a shell that was told to quit.) `ping` to a bogus
+        // address resolves instantly and returns 1 on Windows, `false`
+        // returns 1 on unix.
+        let fail = registry.spawn(failing_cmd(), &root).unwrap();
+        wait_for(
+            || registry.exit_code(fail).is_some(),
+            Duration::from_secs(20),
+        );
+        assert_eq!(registry.exit_code(fail), Some(1));
+
+        // And a clean exit records 0. (Not `exit 0`: same cmd `exit` trap.)
+        let ok = registry.spawn("echo done", &root).unwrap();
+        wait_for(|| registry.exit_code(ok).is_some(), Duration::from_secs(20));
+        assert_eq!(registry.exit_code(ok), Some(0));
     }
 
     #[test]
@@ -773,7 +861,11 @@ mod tests {
         let id = registry.spawn(cmd, &root).unwrap();
 
         // Follow should return by the time the task has exited on its own.
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // The budget is generous because Windows `ping -n 2` pacing is
+        // erratic (observed 1s-11s per invocation on a quiet dev box), and
+        // two of them make up most of this task's runtime — but a genuinely
+        // hung task still trips the deadline.
+        let deadline = Instant::now() + Duration::from_secs(45);
         registry.follow(id).unwrap();
         assert!(
             Instant::now() < deadline,

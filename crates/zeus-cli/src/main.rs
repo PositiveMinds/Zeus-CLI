@@ -4405,6 +4405,16 @@ fn cmd_bg(config: &Config, action: BgCmd) -> Result<()> {
         }
         BgCmd::Logs { id } => {
             registry.follow(id).context("follow background task")?;
+            // Propagate how the task actually ended into zeus's own exit
+            // code, so a `zeus bg logs <id>` in a script can react to a
+            // failed dev-server/build the same way it would to the task
+            // having run in the foreground. `spawn_argv` (orchestration)
+            // tasks record no marker and stay exit 0.
+            if let Some(code) = registry.exit_code(id) {
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
             Ok(())
         }
         BgCmd::Pause { id } => {
