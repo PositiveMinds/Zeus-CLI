@@ -18,8 +18,8 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use zeus_agent::{
     discover_workflows, personas_by_department, Agent, AgentEvent, AgentOptions,
-    BackgroundTaskRegistry, ContextManager, ExpandResult, HookRunner, McpClient, SessionStore,
-    SlashCommands, TerminalRunner, ToolManager, TurnResult,
+    BackgroundTaskRegistry, ContextManager, ConversationState, ExpandResult, HookRunner, McpClient,
+    SessionStore, SlashCommands, TerminalRunner, ToolManager, TurnResult,
 };
 use zeus_config::{Config, KeysFile};
 use zeus_fs::{filter_out_own_index, word_boundary, IndexEngine, SymbolIndex};
@@ -36,7 +36,7 @@ mod cli;
 mod config;
 pub use cli::{
     BgCmd, Cli, CodeintCmd, Commands, ConfigCmd, GitCmd, KeyCmd, ProjectCmd, PullCmd, RagindexCmd,
-    ResetModeArg, UserCommandCmd,
+    ResetModeArg, SessionsCmd, UserCommandCmd,
 };
 use config::{
     approver, get_toml_path, load_config, load_toml_or_empty, parse_toml_scalar, set_toml_path,
@@ -135,7 +135,10 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Some(Commands::Sessions) => cmd_sessions(&config),
+        Some(Commands::Sessions { action }) => match action {
+            Some(SessionsCmd::List) | None => cmd_sessions(&config),
+            Some(SessionsCmd::Export { id, output }) => cmd_sessions_export(&config, &id, output),
+        },
         Some(Commands::Update { check }) => {
             update::cmd_update(check, config.settings.notify_on_completion).await
         }
@@ -1030,6 +1033,73 @@ fn cmd_sessions(config: &Config) -> Result<()> {
     print!("{}", text);
     println!();
     Ok(())
+}
+
+/// `zeus sessions export <id> [--output <file>]` — render a saved
+/// conversation as Markdown so it can be shared, archived, or grepped
+/// outside the TUI.
+fn cmd_sessions_export(config: &Config, id: &str, output: Option<PathBuf>) -> Result<()> {
+    let store = SessionStore::new(config.global.sessions.clone());
+    let state = store.load(id).context("load session")?;
+    if state.messages.is_empty() {
+        bail!("session {id} has no messages to export");
+    }
+    let md = render_session_markdown(&state);
+    let path = output.unwrap_or_else(|| PathBuf::from(format!("{id}.md")));
+    std::fs::write(&path, md)?;
+    println!("exported session {id} to {}", path.display());
+    Ok(())
+}
+
+/// Render a conversation as a readable Markdown transcript.
+fn render_session_markdown(state: &ConversationState) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Session {}\n\n", state.session_id));
+    for msg in &state.messages {
+        match msg.role {
+            zeus_provider::Role::System => {
+                out.push_str(&format!("> **system**\n\n{}\n\n", msg.content.trim()));
+            }
+            zeus_provider::Role::User => {
+                out.push_str(&format!("## User\n\n{}\n\n", msg.content.trim()));
+                if !msg.images.is_empty() {
+                    out.push_str(&format!(
+                        "*[{} image attachment(s) omitted]*\n\n",
+                        msg.images.len()
+                    ));
+                }
+            }
+            zeus_provider::Role::Assistant => {
+                out.push_str("## Assistant\n\n");
+                if !msg.content.trim().is_empty() {
+                    out.push_str(&format!("{}\n\n", msg.content.trim()));
+                }
+                for call in &msg.tool_calls {
+                    out.push_str(&format!(
+                        "```\n[call] {} ({})\n{}\n```\n\n",
+                        call.name, call.id, call.arguments
+                    ));
+                }
+                if !msg.images.is_empty() {
+                    out.push_str(&format!(
+                        "*[{} image attachment(s) omitted]*\n\n",
+                        msg.images.len()
+                    ));
+                }
+            }
+            zeus_provider::Role::Tool => {
+                out.push_str(&format!(
+                    "## Tool{} result\n\n{}\n\n",
+                    msg.tool_call_id
+                        .as_deref()
+                        .map(|id| format!(" ({id})"))
+                        .unwrap_or_default(),
+                    msg.content.trim()
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// `zeus key set/list` — the one-shot equivalent of the REPL's `/provider
@@ -5070,5 +5140,60 @@ mod tests {
             err.to_string().contains("symlink"),
             "expected a symlink refusal, got: {err}"
         );
+    }
+
+    #[test]
+    fn render_session_markdown_covers_all_roles() {
+        use zeus_provider::{ImagePart, Role, ToolCall};
+        let mut state = ConversationState::new("sess-1");
+        state.messages = vec![
+            Message::system("you are helpful"),
+            Message::user("hello"),
+            Message::assistant("hi there"),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: "{\"path\": \"x\"}".into(),
+                    extra_content: None,
+                }],
+                images: Vec::new(),
+            },
+            Message {
+                role: Role::Tool,
+                content: "file contents".into(),
+                tool_call_id: Some("call-1".into()),
+                tool_calls: Vec::new(),
+                images: Vec::new(),
+            },
+            Message::user_with_images(
+                "look at this",
+                vec![ImagePart {
+                    mime_type: "image/png".into(),
+                    data_base64: "AAAA".into(),
+                }],
+            ),
+        ];
+        let md = render_session_markdown(&state);
+        assert!(md.starts_with("# Session sess-1"));
+        assert!(md.contains("> **system**"));
+        assert!(md.contains("you are helpful"));
+        assert!(md.contains("## User"));
+        assert!(md.contains("hello"));
+        assert!(md.contains("## Assistant"));
+        assert!(md.contains("hi there"));
+        assert!(md.contains("[call] read (call-1)"));
+        assert!(md.contains("## Tool (call-1) result"));
+        assert!(md.contains("file contents"));
+        assert!(md.contains("1 image attachment(s) omitted"));
+    }
+
+    #[test]
+    fn render_session_markdown_empty_state_has_header_only() {
+        let state = ConversationState::new("sess-2");
+        assert_eq!(render_session_markdown(&state), "# Session sess-2\n\n");
     }
 }

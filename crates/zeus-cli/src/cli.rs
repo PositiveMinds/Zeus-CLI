@@ -145,8 +145,11 @@ pub enum Commands {
         workflow: Option<String>,
     },
 
-    /// List saved sessions (id, message count, last user message)
-    Sessions,
+    /// List saved sessions, or export one to Markdown
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsCmd>,
+    },
 
     /// Check for (and optionally install) a newer zeus release
     Update {
@@ -448,6 +451,20 @@ pub enum KeyCmd {
     },
     /// Show which configured providers have a key set
     List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionsCmd {
+    /// List saved sessions (id, message count, last user message)
+    List,
+    /// Export a saved session's conversation to Markdown
+    Export {
+        /// Session id — see `zeus sessions list`
+        id: String,
+        /// Output file path (defaults to <id>.md in the current directory)
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
