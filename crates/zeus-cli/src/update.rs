@@ -54,6 +54,7 @@ pub fn detect_install_method() -> InstallMethod {
 #[derive(Deserialize)]
 struct GhRelease {
     tag_name: String,
+    body: Option<String>,
 }
 
 fn http_client() -> Result<reqwest::Client> {
@@ -64,8 +65,9 @@ fn http_client() -> Result<reqwest::Client> {
         .context("build http client")
 }
 
-/// Latest published version, tag-prefix (`v`) stripped.
-pub async fn latest_version() -> Result<String> {
+/// Latest published release: version (tag-prefix stripped) and its markdown
+/// notes body, if the release was written with one.
+async fn latest_release() -> Result<(String, Option<String>)> {
     let url =
         format!("https://api.github.com/repos/{RELEASES_OWNER}/{RELEASES_REPO}/releases/latest");
     let resp = http_client()?
@@ -77,7 +79,12 @@ pub async fn latest_version() -> Result<String> {
         .error_for_status()
         .context("GitHub API error — no release published yet?")?;
     let rel: GhRelease = resp.json().await.context("parse release response")?;
-    Ok(rel.tag_name.trim_start_matches('v').to_string())
+    Ok((rel.tag_name.trim_start_matches('v').to_string(), rel.body))
+}
+
+/// Latest published version, tag-prefix (`v`) stripped.
+pub async fn latest_version() -> Result<String> {
+    Ok(latest_release().await?.0)
 }
 
 /// Parses a `major.minor.patch`-shaped version into a comparable tuple;
@@ -312,7 +319,7 @@ pub async fn cmd_update(check_only: bool, notify_on_completion: bool) -> Result<
     println!("current version: {current}");
 
     let method = detect_install_method();
-    let latest = latest_version().await?;
+    let (latest, notes) = latest_release().await?;
 
     if !is_newer(&latest, current) {
         println!("already up to date (latest: {latest}).");
@@ -320,6 +327,11 @@ pub async fn cmd_update(check_only: bool, notify_on_completion: bool) -> Result<
     }
 
     println!("update available: {current} -> {latest}");
+    if let Some(notes) = notes.filter(|n| !n.trim().is_empty()) {
+        println!();
+        println!("what's new in v{latest}:");
+        println!("{notes}");
+    }
 
     if check_only {
         println!("run `zeus update` (without --check) to install it.");
@@ -363,6 +375,17 @@ mod tests {
     #[test]
     fn version_compare_tolerates_garbage() {
         assert!(!is_newer("not-a-version", "1.0.0"));
+    }
+
+    #[test]
+    fn release_parses_tag_and_optional_notes() {
+        let with_notes: GhRelease =
+            serde_json::from_str(r#"{"tag_name":"v1.2.0","body":"- fix the thing"}"#).unwrap();
+        assert_eq!(with_notes.tag_name, "v1.2.0");
+        assert_eq!(with_notes.body.as_deref(), Some("- fix the thing"));
+
+        let without_notes: GhRelease = serde_json::from_str(r#"{"tag_name":"v1.2.0"}"#).unwrap();
+        assert_eq!(without_notes.body, None);
     }
 
     #[test]
