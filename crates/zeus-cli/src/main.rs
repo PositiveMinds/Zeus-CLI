@@ -4526,60 +4526,34 @@ struct ProviderHealth {
     detail: String,
 }
 
-async fn provider_health(cfg: &zeus_config::ProviderConfig) -> ProviderHealth {
-    if matches!(cfg.kind.as_str(), "ollama" | "lmstudio" | "llamacpp") {
-        let Some(base) = &cfg.base_url else {
-            return ProviderHealth {
-                ok: false,
-                detail: "local provider has no base_url configured".to_string(),
-            };
-        };
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(1500))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return ProviderHealth {
-                    ok: false,
-                    detail: format!("couldn't build http client: {e}"),
-                }
-            }
-        };
-        // Any response at all (2xx, 404, whatever) means something is
-        // listening — that's the actual question, not whether the root
-        // path happens to be a valid route for this server.
-        match client.get(base).send().await {
-            Ok(_) => ProviderHealth {
-                ok: true,
-                detail: format!("reachable at {base}"),
-            },
-            Err(e) => ProviderHealth {
-                ok: false,
-                detail: format!("unreachable at {base} ({e}) — is it running?"),
-            },
-        }
-    } else if cfg.headers.contains_key("Authorization") {
-        ProviderHealth {
-            ok: true,
-            detail: "auth header configured".to_string(),
-        }
-    } else {
-        match &cfg.api_key_env {
-            Some(var) => match std::env::var(var) {
-                Ok(k) if !k.is_empty() => ProviderHealth {
+async fn provider_health(name: &str, providers: &zeus_config::ProvidersFile) -> ProviderHealth {
+    match create_provider(name, providers) {
+        Err(e) => ProviderHealth {
+            ok: false,
+            detail: format!("not configured: {e:#}"),
+        },
+        Ok(provider) => {
+            // A real live model-list call — this validates the key, the
+            // reachability, *and* that the account can actually serve
+            // models. A dead/revoked key or an out-of-credits account shows
+            // up here as a failed request instead of an auth error minutes
+            // later in chat. Local providers hit their server the same way.
+            match tokio::time::timeout(std::time::Duration::from_secs(12), provider.list_models())
+                .await
+            {
+                Ok(Ok(models)) => ProviderHealth {
                     ok: true,
-                    detail: format!("key set via ${var}"),
+                    detail: format!("live: {} model(s) reachable", models.len()),
                 },
-                _ => ProviderHealth {
+                Ok(Err(e)) => ProviderHealth {
                     ok: false,
-                    detail: format!("no key — set ${var}"),
+                    detail: format!("live check failed: {e:#}"),
                 },
-            },
-            None => ProviderHealth {
-                ok: true,
-                detail: "no key required".to_string(),
-            },
+                Err(_) => ProviderHealth {
+                    ok: false,
+                    detail: "live check timed out (12s)".to_string(),
+                },
+            }
         }
     }
 }
@@ -4655,8 +4629,7 @@ async fn cmd_doctor(config: &Config) -> Result<()> {
     names.sort();
     let mut default_ready = false;
     for name in &names {
-        let cfg = &config.providers.providers[*name];
-        let health = provider_health(cfg).await;
+        let health = provider_health(name, &config.providers).await;
         if **name == default_provider {
             default_ready = health.ok;
         }
@@ -4668,7 +4641,7 @@ async fn cmd_doctor(config: &Config) -> Result<()> {
         };
         println!(
             "  [{icon}] {name}{marker} — {}: {}",
-            cfg.kind, health.detail
+            config.providers.providers[*name].kind, health.detail
         );
     }
     println!();
