@@ -4199,11 +4199,14 @@ fn cmd_user_commands(config: &Config, action: UserCommandCmd, yes: bool) -> Resu
             // path outside the project root), so this asks directly rather
             // than routing through the Permission Gate.
             if !yes {
-                eprint!("Delete {}? [y/N] ", path.display());
+                eprint!("Delete {}? [approve/cancel] ", path.display());
                 io::stderr().flush().ok();
                 let mut line = String::new();
                 io::stdin().read_line(&mut line)?;
-                if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                if !matches!(
+                    line.trim().to_ascii_lowercase().as_str(),
+                    "approve" | "confirm" | "allow" | "ok" | "yes" | "y"
+                ) {
                     println!("cancelled");
                     return Ok(());
                 }

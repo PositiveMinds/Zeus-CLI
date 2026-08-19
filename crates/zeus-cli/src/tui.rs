@@ -6128,7 +6128,7 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("Allow editing src/main.rs")));
         assert!(rows.iter().any(|r| r.contains("Permission needed")));
         assert!(rows.iter().any(|r| r.contains('│')));
-        assert!(rows.iter().any(|r| r.contains("y approve")));
+        assert!(rows.iter().any(|r| r.contains("approve (y)")));
     }
 
     /// Approval keys resolve the oneshot and return to Chat.

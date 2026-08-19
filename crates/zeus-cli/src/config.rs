@@ -54,17 +54,25 @@ pub fn approver(yes: bool) -> impl FnMut(&PermissionRequest) -> ApprovalDecision
                 }
             );
         }
-        eprint!("Allow {}? [y/N/s(session)] ", req.description);
+        eprint!("Allow {}? [approve / session / cancel] ", req.description);
         let _ = io::stderr().flush();
         let mut line = String::new();
         if io::stdin().read_line(&mut line).is_err() {
             return ApprovalDecision::Denied;
         }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => ApprovalDecision::Approved,
-            "s" | "session" => ApprovalDecision::ApprovedForSession,
-            _ => ApprovalDecision::Denied,
-        }
+        read_approval(&line)
+    }
+}
+
+/// Map one approval-answer line to a decision. Whole words are the primary
+/// interface — `approve`, `session`, `cancel` — with the old single-letter
+/// keys (`y`/`s`/`n`) kept as shorthand for muscle memory. Anything else
+/// (or an empty/EOF line) is treated as cancel.
+pub fn read_approval(line: &str) -> ApprovalDecision {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "approve" | "confirm" | "allow" | "ok" | "yes" | "y" => ApprovalDecision::Approved,
+        "session" | "s" => ApprovalDecision::ApprovedForSession,
+        _ => ApprovalDecision::Denied,
     }
 }
 
@@ -152,6 +160,33 @@ mod tests {
         assert_eq!(got, &toml::Value::Integer(7));
         // Missing path returns None rather than panicking.
         assert!(get_toml_path(&root, &["a", "nope"]).is_none());
+    }
+
+    #[test]
+    fn read_approval_accepts_whole_words_and_short_keys() {
+        use zeus_fs::ApprovalDecision;
+        assert!(matches!(
+            read_approval("approve"),
+            ApprovalDecision::Approved
+        ));
+        assert!(matches!(
+            read_approval("CONFIRM"),
+            ApprovalDecision::Approved
+        ));
+        assert!(matches!(read_approval("y"), ApprovalDecision::Approved));
+        assert!(matches!(
+            read_approval("session"),
+            ApprovalDecision::ApprovedForSession
+        ));
+        assert!(matches!(
+            read_approval("s"),
+            ApprovalDecision::ApprovedForSession
+        ));
+        // Anything else — including empty/EOF lines — is a cancel.
+        assert!(matches!(read_approval("cancel"), ApprovalDecision::Denied));
+        assert!(matches!(read_approval("n"), ApprovalDecision::Denied));
+        assert!(matches!(read_approval("maybe?"), ApprovalDecision::Denied));
+        assert!(matches!(read_approval(""), ApprovalDecision::Denied));
     }
 
     #[test]

@@ -579,7 +579,7 @@ pub(crate) fn render_approval_modal(
         )]))
         .bottom(
             Line::from(Span::styled(
-                " y approve · s for session · n/esc deny · ↑/↓ scroll ",
+                " ↑/↓ scroll · approve (y) · approve for session (s) · cancel (n/esc) ",
                 theme::dim(),
             ))
             .alignment(Alignment::Center),
