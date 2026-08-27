@@ -2103,7 +2103,7 @@ impl Agent {
                 }
                 degenerate_retries += 1;
                 let nudge = format!(
-                    "\n\n(The model returned an empty response. This can happen with smaller models. \n                     Please reply with a concrete answer or use a tool. Attempt {}/{})",
+                    "\n\n(Model returned an empty response — attempt {}/{}). Please reply with a concrete answer or use a tool.",
                     degenerate_retries, MAX_DEGENERATE_RETRIES
                 );
                 on_event(AgentEvent::TextDelta(nudge.clone()));
@@ -2142,8 +2142,7 @@ impl Agent {
                 if is_degenerate {
                     let note = "
 
-(Model returned an empty response. Try: /model to switch to a larger model,
-                     or rephrase your request to be more specific.)";
+(Model returned an empty response. Try /model to switch providers, or rephrase your request.)";
                     final_text.push_str(note);
                 }
                 self.state
@@ -3408,7 +3407,7 @@ mod tests {
         assert!(!result.cancelled);
         assert!(events
             .iter()
-            .any(|e| matches!(e, AgentEvent::TextDelta(t) if t.contains("empty or malformed"))));
+            .any(|e| matches!(e, AgentEvent::TextDelta(t) if t.contains("empty response"))));
     }
 
     #[tokio::test]
