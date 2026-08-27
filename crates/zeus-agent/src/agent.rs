@@ -2103,10 +2103,7 @@ impl Agent {
                 }
                 degenerate_retries += 1;
                 let nudge = format!(
-                    "\n\nYour previous response came back empty or malformed. \
-                     This usually happens when a small model chokes on a large tool list. \
-                     Reply with a concrete answer, or make a valid tool call \
-                     (attempt {} of {}).",
+                    "\n\n(The model returned an empty response. This can happen with smaller models. \n                     Please reply with a concrete answer or use a tool. Attempt {}/{})",
                     degenerate_retries, MAX_DEGENERATE_RETRIES
                 );
                 on_event(AgentEvent::TextDelta(nudge.clone()));
@@ -2143,10 +2140,10 @@ impl Agent {
                             .all(|c| c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']')));
                 let mut final_text = text;
                 if is_degenerate {
-                    let note = "\n\n(that came back empty/malformed instead of a real answer — \
-                        small local models sometimes struggle with a large tool list. Try \
-                        rephrasing, or switch models with /model.)";
-                    on_event(AgentEvent::TextDelta(note.to_string()));
+                    let note = "
+
+(Model returned an empty response. Try: /model to switch to a larger model,
+                     or rephrase your request to be more specific.)";
                     final_text.push_str(note);
                 }
                 self.state
