@@ -1,23 +1,67 @@
 //! Full interactive chat interface — an alternate-screen ratatui TUI
-//! modeled after opencode/Claude Code's own CLI: a centered splash logo and
-//! bordered input box on first launch, then a scrolling transcript pane with
-//! the input box pinned at the bottom once the conversation starts.
+//! modeled after opencode/Claude Code's own CLI.
 //!
-//! Only entered when stdin+stdout are both a real terminal (checked by the
-//! caller in `main.rs`); piped/scripted sessions use the plain REPL instead,
-//! since raw-mode/alternate-screen control only makes sense against a real
-//! console.
+//! ## Layout
 //!
-//! One turn runs at a time. While a turn is in flight, the `Agent` is moved
-//! into a spawned task (so its streamed events/tool calls don't block
-//! rendering or key handling) and handed back once the turn completes.
-//! Permission prompts from inside that task are bridged back to this render
-//! loop as a modal: the tool-dispatch code's synchronous approver closure
-//! waits on a `tokio::sync::oneshot` reply channel until a keypress here
-//! answers it, wrapped in `tokio::task::block_in_place` so the wait never
-//! pins a runtime worker thread — waiting on a human is inherently slow, so
-//! this bounded bridge is the deliberate exception to "never block an async
-//! task".
+//! - **First launch**: Centered splash logo and bordered input box
+//! - **Active conversation**: Scrolling transcript pane with input pinned at bottom
+//! - **Sidebar**: Shows session info, token usage, files touched, TODO checklist
+//!
+//! ## Mode Switching
+//!
+//! The TUI supports three agent modes, toggled with Tab:
+//! - **Build** (cyan): Normal operation — full tool access
+//! - **Plan** (gold): Read-only research/proposal mode
+//! - **Auto** (magenta): Autonomous plan-then-execute workflows
+//!
+//! ## Key Interactions
+//!
+//! ### Keyboard
+//! - **Enter**: Submit message
+//! - **Tab**: Cycle agent mode (Build/Plan/Auto)
+//! - **Esc**: Cancel turn, clear input/selection, close picker
+//! - **↑/↓**: Browse command history
+//! - **Ctrl+C/Ctrl+Y**: Copy selection to clipboard
+//! - **Ctrl+F**: Find in transcript
+//! - **Ctrl+P**: Command palette
+//! - **Ctrl+O**: File picker
+//!
+//! ### Mouse
+//! - **Click**: Select transcript block
+//! - **Shift+Click/Drag**: Extend selection
+//! - **Scroll**: Navigate transcript
+//!
+//! ## Architecture
+//!
+//! - `AppState`: Central state (transcript, input, mode, selection, etc.)
+//! - `UiEvent`: Events from agent task to render loop
+//! - `Mode`: Current UI mode (Chat, Approval, ModelPicker, etc.)
+//! - `AgentMode`: Agent operating mode (Build/Plan/Auto)
+//!
+//! ## Agent Integration
+//!
+//! While a turn is in flight:
+//! - The `Agent` is moved into a spawned task
+//! - Streamed events/tool calls don't block rendering
+//! - Permission prompts are bridged as modals via oneshot channels
+//! - `tokio::task::block_in_place` prevents worker thread starvation
+//!
+//! ## Features
+//!
+//! - **Slash commands**: `/help`, `/model`, `/provider`, `/plan`, `/compact`, etc.
+//! - **Model picker**: Browse and select models across providers
+//! - **Provider picker**: Switch between configured providers
+//! - **Session picker**: Browse and resume saved sessions
+//! - **File picker**: Insert file paths into composer (Ctrl+O)
+//! - **Background tasks**: `/bg list`, `/bg output`, `/bg stop`, etc.
+//! - **Export**: Save conversation to Markdown
+//! - **Search**: Find in transcript (Ctrl+F)
+//! - **Approval modal**: Review tool calls before execution
+//!
+//! ## Empty State
+//!
+//! When the transcript is empty, shows a splash with example prompts.
+//! Clicking an example chip or typing a message transitions to the chat view.
 
 use crate::{
     build_agent_repl_with, build_agent_repl_with_session, expand_slash_command,
@@ -156,11 +200,13 @@ enum Mode {
     /// `/upload`) without typing paths. Enter descends into a dir or inserts
     /// a file's quoted path into the composer (multi-select: stay open until
     /// esc). Backspace/← go up a level. ctrl+h toggles hidden files.
+    /// Type-to-filter narrows entries by name (case-insensitive substring).
     FilePicker {
         cwd: std::path::PathBuf,
         entries: Vec<FileEntry>,
         selected: usize,
         show_hidden: bool,
+        search: String,
     },
 }
 
@@ -253,6 +299,10 @@ fn apply_picker_choice(
     let Some(agent) = agent_slot.as_mut() else {
         return;
     };
+    // Capture the old context window before switching for comparison
+    let old_window = state.context_window;
+    let _old_model = state.model.clone();
+    let _old_provider = state.provider.clone();
     if provider != state.provider {
         match create_provider(&provider, &config.providers) {
             Ok(handle) => {
@@ -270,12 +320,57 @@ fn apply_picker_choice(
     state.model = model_id;
     state.context_window = None;
     match persist_default_provider(config, &state.provider, Some(&state.model)) {
-        Ok(path) => state.push_info(format!(
-            "picked {}: {} — saved to {}",
-            state.provider,
-            state.model,
-            path.display()
-        )),
+        Ok(path) => {
+            state.push_info(format!(
+                "picked {}: {} — saved to {}",
+                state.provider,
+                state.model,
+                path.display()
+            ));
+            // Show context window comparison if we had the old window info
+            if let Some(old_w) = old_window {
+                // Look up the new model's context window from the cache
+                let new_window = state.model_cache.as_ref().and_then(|groups| {
+                    groups
+                        .iter()
+                        .find(|(p, _)| p == &state.provider)
+                        .and_then(|(_, models)| models.iter().find(|m| m.id == state.model))
+                        .and_then(|m| m.context_window)
+                });
+                if let Some(new_w) = new_window {
+                    // Update the agent's ContextManager so compaction
+                    // thresholds stay accurate after the model switch.
+                    agent.set_context_window(new_w);
+                    let ratio = new_w as f64 / old_w as f64;
+                    if ratio < 0.5 {
+                        state.push_info(format!(
+                            "⚠ context window: {} → {} tokens ({:.0}% smaller) — auto-compaction will trigger if needed",
+                            format_token_count(old_w),
+                            format_token_count(new_w),
+                            (1.0 - ratio) * 100.0
+                        ));
+                    } else if ratio > 2.0 {
+                        state.push_info(format!(
+                            "↑ context window: {} → {} tokens ({:.0}× larger)",
+                            format_token_count(old_w),
+                            format_token_count(new_w),
+                            ratio
+                        ));
+                    } else {
+                        state.push_info(format!(
+                            "context window: {} → {} tokens",
+                            format_token_count(old_w),
+                            format_token_count(new_w)
+                        ));
+                    }
+                } else {
+                    state.push_info(format!(
+                        "context window was {} tokens (new model's window unknown until first turn)",
+                        format_token_count(old_w)
+                    ));
+                }
+            }
+        }
         Err(e) => state.push_info(format!(
             "switched, but saving default provider/model failed: {e:#}"
         )),
@@ -635,6 +730,8 @@ async fn handle_provider_tui(
         ),
         [name] => match create_provider(name, &config.providers) {
             Ok(handle) => {
+                let old_window = state.context_window;
+                let _old_model = state.model.clone();
                 if let Some(agent) = agent_slot.as_mut() {
                     agent.set_provider(handle);
                 }
@@ -650,10 +747,53 @@ async fn handle_provider_tui(
                 state.model = model.clone();
                 state.context_window = None;
                 match persist_default_provider(config, name, Some(&model)) {
-                    Ok(path) => state.push_info(format!(
-                        "switched to provider: {name} (model: {model}) — saved to {}",
-                        path.display()
-                    )),
+                    Ok(path) => {
+                        state.push_info(format!(
+                            "switched to provider: {name} (model: {model}) — saved to {}",
+                            path.display()
+                        ));
+                        // Show context window comparison if available
+                        if let Some(old_w) = old_window {
+                            let new_window = state.model_cache.as_ref().and_then(|groups| {
+                                groups
+                                    .iter()
+                                    .find(|(p, _)| p == &state.provider)
+                                    .and_then(|(_, models)| {
+                                        models.iter().find(|m| m.id == state.model)
+                                    })
+                                    .and_then(|m| m.context_window)
+                            });
+                            if let Some(new_w) = new_window {
+                                // Update the agent's ContextManager so compaction
+                                // thresholds stay accurate after the provider switch.
+                                if let Some(agent) = agent_slot.as_mut() {
+                                    agent.set_context_window(new_w);
+                                }
+                                let ratio = new_w as f64 / old_w as f64;
+                                if ratio < 0.5 {
+                                    state.push_info(format!(
+                                        "⚠ context window: {} → {} tokens ({:.0}% smaller) — auto-compaction will trigger if needed",
+                                        format_token_count(old_w),
+                                        format_token_count(new_w),
+                                        (1.0 - ratio) * 100.0
+                                    ));
+                                } else if ratio > 2.0 {
+                                    state.push_info(format!(
+                                        "↑ context window: {} → {} tokens ({:.0}× larger)",
+                                        format_token_count(old_w),
+                                        format_token_count(new_w),
+                                        ratio
+                                    ));
+                                } else {
+                                    state.push_info(format!(
+                                        "context window: {} → {} tokens",
+                                        format_token_count(old_w),
+                                        format_token_count(new_w)
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     Err(e) => state.push_info(format!(
                         "switched to provider {name}, but saving default failed: {e:#}"
                     )),
@@ -731,6 +871,11 @@ struct AppState {
     /// Char index (not byte index) into `input`.
     cursor: usize,
     busy: bool,
+    /// Undo stack for the composer input: (text, cursor) pairs. Capped at
+    /// 100 entries to avoid unbounded memory growth on long sessions.
+    input_undo: Vec<(String, usize)>,
+    /// Redo stack — cleared on every new edit (typing, paste, undo).
+    input_redo: Vec<(String, usize)>,
     /// Messages submitted while a turn was already in flight — matches the
     /// reference product's own queued-message behavior: Enter while busy
     /// doesn't get dropped, it appears in the transcript immediately and
@@ -921,6 +1066,19 @@ struct AppState {
     /// mouse-tracking mode at the terminal level via `UiEvent::SetMouseCapture`
     /// so the terminal emulator's native click-drag selection works again.
     mouse_capture_enabled: bool,
+    /// Timestamp of the last clipboard copy — drives a brief green flash
+    /// in the status line so the user gets visual confirmation without
+    /// reading the transcript info message.
+    clipboard_flash: Option<std::time::Instant>,
+    /// Active tool call being displayed in the sidebar as in-progress —
+    /// populated from the most recent `ToolCallStarted` event, cleared on
+    /// `ToolCallFinished`. Shows the tool name and elapsed time.
+    active_tool: Option<ActiveTool>,
+}
+
+struct ActiveTool {
+    name: String,
+    started: std::time::Instant,
 }
 
 /// Transcript search — an overlay on top of `Mode::Chat`, not a `Mode`
@@ -967,6 +1125,8 @@ impl AppState {
             input: String::new(),
             cursor: 0,
             busy: false,
+            input_undo: Vec::new(),
+            input_redo: Vec::new(),
             queued_messages: std::collections::VecDeque::new(),
             pending_plan_goal: None,
             quit: false,
@@ -1017,6 +1177,8 @@ impl AppState {
             selection: None,
             selection_anchor: None,
             mouse_capture_enabled: true,
+            clipboard_flash: None,
+            active_tool: None,
         };
         state
     }
@@ -1038,6 +1200,38 @@ impl AppState {
         } else {
             Some(next)
         };
+    }
+
+    /// Push the current input state onto the undo stack before making a
+    /// change. Capped at 100 entries; clears the redo stack (a new edit
+    /// after undo discards the redo branch, same as every standard editor).
+    fn push_undo(&mut self) {
+        self.input_redo.clear();
+        self.input_undo.push((self.input.clone(), self.cursor));
+        if self.input_undo.len() > 100 {
+            self.input_undo.remove(0);
+        }
+    }
+
+    /// Undo the last composer edit — restores the previous (text, cursor)
+    /// from the undo stack and pushes the current state onto redo.
+    fn undo(&mut self) {
+        if let Some((text, cursor)) = self.input_undo.pop() {
+            self.input_redo.push((self.input.clone(), self.cursor));
+            self.input = text;
+            self.cursor = cursor;
+            self.push_info("undone");
+        }
+    }
+
+    /// Redo a previously undone composer edit.
+    fn redo(&mut self) {
+        if let Some((text, cursor)) = self.input_redo.pop() {
+            self.input_undo.push((self.input.clone(), self.cursor));
+            self.input = text;
+            self.cursor = cursor;
+            self.push_info("redone");
+        }
     }
 
     /// Appends a submitted input to history (skipping exact-duplicate
@@ -1109,8 +1303,13 @@ impl AppState {
             } => {
                 self.flush_current_reply();
                 let path = touched_path(&name, &arguments);
-                self.tool_call_meta
-                    .insert(id, (std::time::Instant::now(), path, name.clone()));
+                let start = std::time::Instant::now();
+                self.tool_call_meta.insert(id, (start, path, name.clone()));
+                // Track the most recent active tool for sidebar display
+                self.active_tool = Some(ActiveTool {
+                    name: name.clone(),
+                    started: start,
+                });
                 self.transcript
                     .push(Block_::new(Role::Tool, format!("{name} {arguments}")));
             }
@@ -1138,6 +1337,10 @@ impl AppState {
                     role,
                     format!("{name} ({marker}{timing})\n{result}"),
                 ));
+                // Clear the active tool indicator when the last tool finishes
+                if self.tool_call_meta.is_empty() {
+                    self.active_tool = None;
+                }
                 if !is_error {
                     if let Some(path) = path {
                         self.touch_file(path);
@@ -1569,7 +1772,10 @@ fn copy_last_response(state: &mut AppState) {
         .find(|b| matches!(b.role, Role::Assistant | Role::Tool));
     match block {
         Some(b) => match super::clipboard::copy(&b.plain_text()) {
-            Ok(()) => state.push_info("copied last block to clipboard"),
+            Ok(()) => {
+                state.push_info("copied last block to clipboard");
+                state.clipboard_flash = Some(std::time::Instant::now());
+            }
             Err(e) => state.push_error(format!("copy failed: {e}")),
         },
         None => state.push_error("nothing to copy yet"),
@@ -1645,6 +1851,7 @@ fn copy_selection(state: &mut AppState) {
             state.push_info(format!(
                 "copied {count} char(s) from {len} block(s) to clipboard{suffix}"
             ));
+            state.clipboard_flash = Some(std::time::Instant::now());
             state.selection = None;
             state.selection_anchor = None;
         }
@@ -1806,7 +2013,10 @@ fn render_input_box(f: &mut Frame, area: Rect, state: &AppState, input_text_h: u
     } else {
         Text::from(Line::from(vec![
             Span::styled("Ask anything… ", placeholder_style()),
-            Span::styled("\"Fix a TODO in the codebase\"", placeholder_style()),
+            Span::styled(
+                "\"Fix a TODO\"  Ctrl+O files  Shift+Enter newline",
+                theme::empty_faint(),
+            ),
         ]))
     };
     f.render_widget(
@@ -2654,13 +2864,40 @@ fn render_side_foot(f: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 
-    let vals: [(String, String); 4] = [
-        ("Session".into(), session),
+    // Show the active tool with elapsed time when a tool is running,
+    // clipboard flash confirmation, or session duration.
+    let status_line = if let Some(tool) = &state.active_tool {
+        let tool_elapsed = tool.started.elapsed().as_secs();
+        Line::from(vec![
+            Span::styled("Running  ", theme::faint()),
+            Span::styled(
+                tool.name.clone(),
+                theme::violet().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {:02}s", tool_elapsed), theme::dim()),
+        ])
+    } else if state
+        .clipboard_flash
+        .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500))
+    {
+        Line::from(vec![Span::styled(
+            "\u{2714} copied to clipboard",
+            theme::green().add_modifier(Modifier::BOLD),
+        )])
+    } else {
+        Line::from(vec![
+            Span::styled("Session  ", theme::faint()),
+            Span::styled(session.clone(), theme::dim()),
+        ])
+    };
+    f.render_widget(Paragraph::new(status_line), rows[0]);
+
+    let vals: [(String, String); 3] = [
         ("Tokens".into(), tokens),
         ("Cost".into(), cost),
         ("Branch".into(), branch),
     ];
-    let slot: [usize; 4] = [0, 1, 4, 5];
+    let slot: [usize; 3] = [1, 4, 5];
     for (i, (k, v)) in vals.iter().enumerate() {
         let line = Line::from(vec![
             Span::styled(k.clone(), theme::faint()),
@@ -3085,9 +3322,10 @@ fn render(f: &mut Frame, state: &mut AppState, config: &Config) {
         entries,
         selected,
         show_hidden,
+        search,
     } = &state.mode
     {
-        render_file_picker(f, area, cwd, entries, *selected, *show_hidden);
+        render_file_picker(f, area, cwd, entries, *selected, *show_hidden, search);
     }
 
     if let Some(search) = &state.search {
@@ -3463,6 +3701,7 @@ async fn handle_key(
             entries,
             selected: 0,
             show_hidden: false,
+            search: String::new(),
         };
         return Ok(());
     }
@@ -3470,7 +3709,18 @@ async fn handle_key(
     // ---- Filesystem picker navigation (ctrl+o) ----
     if let Mode::FilePicker { .. } = &state.mode {
         match key.code {
-            KeyCode::Esc => state.mode = Mode::Chat,
+            KeyCode::Esc => {
+                if let Mode::FilePicker { search, .. } = &state.mode {
+                    if !search.is_empty() {
+                        // Clear search first, then esc closes picker
+                        if let Mode::FilePicker { search, .. } = &mut state.mode {
+                            search.clear();
+                        }
+                    } else {
+                        state.mode = Mode::Chat;
+                    }
+                }
+            }
             KeyCode::Up => {
                 if let Mode::FilePicker { selected, .. } = &mut state.mode {
                     *selected = selected.saturating_sub(1);
@@ -3505,6 +3755,7 @@ async fn handle_key(
                     entries,
                     selected,
                     show_hidden,
+                    search: _,
                 } = &mut state.mode
                 {
                     *show_hidden = !*show_hidden;
@@ -3512,9 +3763,64 @@ async fn handle_key(
                     *selected = 0;
                 }
             }
-            KeyCode::Backspace | KeyCode::Left => {
+            KeyCode::Backspace => {
+                if let Mode::FilePicker { search, .. } = &mut state.mode {
+                    if !search.is_empty() {
+                        search.pop();
+                        // Re-filter entries after search changes
+                        if let Mode::FilePicker {
+                            cwd,
+                            entries,
+                            selected,
+                            show_hidden,
+                            search,
+                        } = &mut state.mode
+                        {
+                            let all =
+                                load_dir_entries(cwd, *show_hidden, &staged_upload_names(config));
+                            if search.is_empty() {
+                                *entries = all;
+                            } else {
+                                let q = search.to_lowercase();
+                                *entries = all
+                                    .into_iter()
+                                    .filter(|e| e.name.to_lowercase().contains(&q))
+                                    .collect();
+                            }
+                            *selected = 0;
+                        }
+                    } else {
+                        // Empty search: Backspace goes up a level
+                        let parent = match &state.mode {
+                            Mode::FilePicker { cwd, .. } => cwd.parent().map(|p| p.to_path_buf()),
+                            _ => None,
+                        };
+                        if let Some(parent) = parent {
+                            if let Mode::FilePicker {
+                                cwd,
+                                entries,
+                                selected,
+                                show_hidden,
+                                search: _,
+                            } = &mut state.mode
+                            {
+                                *cwd = parent;
+                                *entries = load_dir_entries(
+                                    cwd,
+                                    *show_hidden,
+                                    &staged_upload_names(config),
+                                );
+                                *selected = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Left => {
                 let parent = match &state.mode {
-                    Mode::FilePicker { cwd, .. } => cwd.parent().map(|p| p.to_path_buf()),
+                    Mode::FilePicker { cwd, search, .. } if search.is_empty() => {
+                        cwd.parent().map(|p| p.to_path_buf())
+                    }
                     _ => None,
                 };
                 if let Some(parent) = parent {
@@ -3523,6 +3829,7 @@ async fn handle_key(
                         entries,
                         selected,
                         show_hidden,
+                        search: _,
                     } = &mut state.mode
                     {
                         *cwd = parent;
@@ -3530,6 +3837,25 @@ async fn handle_key(
                             load_dir_entries(cwd, *show_hidden, &staged_upload_names(config));
                         *selected = 0;
                     }
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Mode::FilePicker {
+                    cwd,
+                    entries,
+                    selected,
+                    show_hidden,
+                    search,
+                } = &mut state.mode
+                {
+                    search.push(c);
+                    let all = load_dir_entries(cwd, *show_hidden, &staged_upload_names(config));
+                    let q = search.to_lowercase();
+                    *entries = all
+                        .into_iter()
+                        .filter(|e| e.name.to_lowercase().contains(&q))
+                        .collect();
+                    *selected = 0;
                 }
             }
             KeyCode::Enter => {
@@ -3551,9 +3877,11 @@ async fn handle_key(
                             entries,
                             selected,
                             show_hidden,
+                            search,
                         } = &mut state.mode
                         {
                             *cwd = full;
+                            *search = String::new(); // Clear search when entering a directory
                             *entries =
                                 load_dir_entries(cwd, *show_hidden, &staged_upload_names(config));
                             *selected = 0;
@@ -3885,6 +4213,99 @@ async fn handle_key(
         } else {
             copy_last_response(state);
         }
+        return Ok(());
+    }
+
+    // Composer undo (Ctrl+Z) and redo (Alt+Z) — standard editor muscle
+    // memory. Ctrl+Z undoes the last text edit in the composer; Alt+Z
+    // redoes it. Both are no-ops when the stacks are empty. These only
+    // apply when the composer is focused (Mode::Chat) and not in a
+    // picker/modal where the keys have other meanings.
+    if matches!(state.mode, Mode::Chat)
+        && key.code == KeyCode::Char('z')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
+        state.undo();
+        state.command_selected = 0;
+        return Ok(());
+    }
+    if matches!(state.mode, Mode::Chat)
+        && key.code == KeyCode::Char('z')
+        && key.modifiers.contains(KeyModifiers::ALT)
+    {
+        state.redo();
+        state.command_selected = 0;
+        return Ok(());
+    }
+
+    // Global shortcuts — work from any non-modal Chat mode.
+    // Ctrl+S opens the session picker (same as /sessions).
+    if matches!(state.mode, Mode::Chat)
+        && key.code == KeyCode::Char('s')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let store = SessionStore::new(config.global.sessions.clone());
+        match store.summaries() {
+            Ok(entries) if entries.is_empty() => {
+                state.push_info("no saved sessions yet — send a message to create one")
+            }
+            Ok(entries) => {
+                state.session_picker = Some(SessionPickerState {
+                    entries,
+                    selected: 0,
+                    search: String::new(),
+                });
+            }
+            Err(e) => state.push_error(format!("couldn't list sessions: {e:#}")),
+        }
+        return Ok(());
+    }
+    // Ctrl+M opens the model picker (same as /model).
+    if matches!(state.mode, Mode::Chat)
+        && key.code == KeyCode::Char('m')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        state.model_picker_search.clear();
+        if let Some(groups) = state.model_cache.clone() {
+            let (entries, selected) = build_model_picker_entries(
+                &groups,
+                &state.provider,
+                &state.model,
+                &state.recent_models,
+                &state.favorite_models,
+            );
+            if entries.is_empty() {
+                state.push_error(
+                    "no models found on any configured provider (check they're running)",
+                );
+            } else {
+                state.mode = Mode::ModelPicker { entries, selected };
+            }
+        } else {
+            state.fetching_providers = true;
+            state.push_info("fetching models…");
+            let cfg = config.clone();
+            let provider = state.provider.clone();
+            let model = state.model.clone();
+            let recent = state.recent_models.clone();
+            let favorites = state.favorite_models.clone();
+            let tx = ui_tx.clone();
+            tokio::spawn(async move {
+                let groups = list_models_by_provider(&cfg).await;
+                let (entries, selected) =
+                    build_model_picker_entries(&groups, &provider, &model, &recent, &favorites);
+                let _ = tx.send(UiEvent::ModelPickerReady(entries, selected, groups));
+            });
+        }
+        return Ok(());
+    }
+    // Ctrl+D opens the provider picker (same as /provider).
+    if matches!(state.mode, Mode::Chat)
+        && key.code == KeyCode::Char('d')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        open_provider_picker(state, config);
         return Ok(());
     }
 
@@ -4322,15 +4743,24 @@ async fn handle_key(
                         let path = &config.global.settings_toml;
                         match arg.trim() {
                             "" => {
-                                state.push_info(format!(
-                                    "theme: {} (available: {})",
-                                    theme::current_theme().label(),
-                                    theme::ThemeKind::ALL
-                                        .iter()
-                                        .map(|k| k.label())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ));
+                                let current = theme::current_theme();
+                                let mut lines =
+                                    vec![format!("current theme: {}\n", current.label())];
+                                lines.push("available themes:".to_string());
+                                for kind in theme::ThemeKind::ALL {
+                                    let is_current = kind == current;
+                                    let marker = if is_current { "●" } else { "○" };
+                                    // Show a color swatch using the theme's accent color
+                                    let preview = match kind {
+                                        theme::ThemeKind::Dark => "  #a78bfa violet accent",
+                                        theme::ThemeKind::Light => "  #6366f1 indigo accent",
+                                        theme::ThemeKind::HighContrast => "  #22d3ee cyan accent",
+                                    };
+                                    let line = format!("  {marker} {}{preview}", kind.label());
+                                    lines.push(line);
+                                }
+                                lines.push("\nuse /theme <name> to switch".to_string());
+                                state.push_info(lines.join("\n"));
                             }
                             name => match theme::ThemeKind::from_label(name) {
                                 Some(kind) => {
@@ -4406,6 +4836,8 @@ async fn handle_key(
                                 });
                             }
                         } else if let Some(agent) = agent_slot.as_mut() {
+                            let old_window = state.context_window;
+                            let _old_model = state.model.clone();
                             agent.set_model(arg.to_string());
                             state.model = arg.to_string();
                             match persist_default_provider(
@@ -4413,11 +4845,50 @@ async fn handle_key(
                                 &state.provider,
                                 Some(&state.model),
                             ) {
-                                Ok(path) => state.push_info(format!(
-                                    "switched to model: {} — saved to {}",
-                                    state.model,
-                                    path.display()
-                                )),
+                                Ok(path) => {
+                                    state.push_info(format!(
+                                        "switched to model: {} — saved to {}",
+                                        state.model,
+                                        path.display()
+                                    ));
+                                    // Show context window comparison
+                                    if let Some(old_w) = old_window {
+                                        let new_window =
+                                            state.model_cache.as_ref().and_then(|groups| {
+                                                groups
+                                                    .iter()
+                                                    .find(|(p, _)| p == &state.provider)
+                                                    .and_then(|(_, models)| {
+                                                        models.iter().find(|m| m.id == state.model)
+                                                    })
+                                                    .and_then(|m| m.context_window)
+                                            });
+                                        if let Some(new_w) = new_window {
+                                            let ratio = new_w as f64 / old_w as f64;
+                                            if ratio < 0.5 {
+                                                state.push_info(format!(
+                                                    "⚠ context window: {} → {} tokens ({:.0}% smaller) — auto-compaction will trigger if needed",
+                                                    format_token_count(old_w),
+                                                    format_token_count(new_w),
+                                                    (1.0 - ratio) * 100.0
+                                                ));
+                                            } else if ratio > 2.0 {
+                                                state.push_info(format!(
+                                                    "↑ context window: {} → {} tokens ({:.0}× larger)",
+                                                    format_token_count(old_w),
+                                                    format_token_count(new_w),
+                                                    ratio
+                                                ));
+                                            } else {
+                                                state.push_info(format!(
+                                                    "context window: {} → {} tokens",
+                                                    format_token_count(old_w),
+                                                    format_token_count(new_w)
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
                                 Err(e) => state.push_info(format!(
                                     "switched to model, but saving default failed: {e:#}"
                                 )),
@@ -4781,6 +5252,7 @@ async fn handle_key(
         }
         KeyCode::Backspace => {
             if state.cursor > 0 {
+                state.push_undo();
                 remove_char_at(&mut state.input, state.cursor - 1);
                 state.cursor -= 1;
                 state.command_selected = 0;
@@ -4824,6 +5296,7 @@ async fn handle_key(
             state.cursor = char_count(&state.input);
         }
         KeyCode::Char(c) => {
+            state.push_undo();
             insert_char_at(&mut state.input, state.cursor, c);
             state.cursor += 1;
             state.command_selected = 0;

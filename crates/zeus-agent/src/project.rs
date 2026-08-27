@@ -98,6 +98,9 @@ pub fn load_or_analyze(root: &Path) -> RepoFingerprint {
 
     let fp = crate::analyze::analyze_repo(root);
     persist(root, &fp, sig.as_deref());
+    // Mark generated docs as potentially stale (M5).
+    let docs_dir = ensure_agent_dir(root);
+    let _ = std::fs::write(docs_dir.join(".docs_stale"), "");
     fp
 }
 
@@ -153,6 +156,16 @@ pub struct WrittenDocs {
     pub conventions: bool,
 }
 
+/// Check if generated docs might be stale (fingerprint was regenerated).
+pub fn docs_are_stale(root: &Path) -> bool {
+    agent_dir(root).join(".docs_stale").exists()
+}
+
+/// Clear the stale marker after docs are regenerated.
+pub fn clear_docs_stale(root: &Path) {
+    let _ = std::fs::remove_file(agent_dir(root).join(".docs_stale"));
+}
+
 /// Write a model-generated doc (`.agent/architecture.md` /
 /// `.agent/conventions.md`). Returns whether it was written.
 pub fn write_generated_doc(root: &Path, name: &str, content: &str) -> bool {
@@ -167,10 +180,18 @@ pub fn write_generated_doc(root: &Path, name: &str, content: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Memory notes: `.agent/memory/<name>.md`
+// Memory notes: `.agent/memory/<name>.md` + global `~/.zeus/memory/<name>.md`
 // ---------------------------------------------------------------------------
 fn memory_dir(root: &Path) -> PathBuf {
     ensure_agent_dir(root).join("memory")
+}
+
+/// Global memory directory at `~/.zeus/memory/`.
+fn global_memory_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".zeus")
+        .join("memory")
 }
 
 pub(crate) fn safe_memory_name(name: &str) -> Option<String> {
@@ -187,10 +208,36 @@ pub(crate) fn safe_memory_name(name: &str) -> Option<String> {
     Some(trimmed)
 }
 
-/// `(name, first meaningful line)` for every memory note, sorted by name.
+/// `(name, first meaningful line, category)` for every memory note,
+/// merged from project and global directories, sorted by name.
+/// Project notes take precedence over global notes with the same name.
+/// Category is extracted from the first line if it starts with `[category]`.
 pub fn memory_index(root: &Path) -> Vec<(String, String)> {
-    let dir = memory_dir(root);
-    let Ok(entries) = std::fs::read_dir(&dir).map(|e| e.flatten().collect::<Vec<_>>()) else {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    // Project-level notes first (higher priority).
+    for (name, first) in memory_dir_entries(&memory_dir(root)) {
+        if seen.insert(name.clone()) {
+            out.push((name, first));
+        }
+    }
+    // Global notes (lower priority, only if not already in project).
+    for (name, first) in memory_dir_entries(&global_memory_dir()) {
+        if seen.insert(name.clone()) {
+            out.push((name, first));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Known memory categories for display (L9).
+#[allow(dead_code)]
+pub const MEMORY_CATEGORIES: &[&str] = &["decision", "gotcha", "convention", "todo"];
+
+fn memory_dir_entries(dir: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(dir).map(|e| e.flatten().collect::<Vec<_>>()) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -210,14 +257,19 @@ pub fn memory_index(root: &Path) -> Vec<(String, String)> {
             .unwrap_or("");
         out.push((stem, first.chars().take(180).collect()));
     }
-    out.sort();
     out
 }
 
 pub fn memory_read(root: &Path, name: &str) -> Option<String> {
     let name = safe_memory_name(name)?;
-    let p = memory_dir(root).join(format!("{name}.md"));
-    let body = read_ok(&p);
+    // Check project memory first, then global.
+    let project_path = memory_dir(root).join(format!("{name}.md"));
+    let body = read_ok(&project_path);
+    if !body.is_empty() {
+        return Some(body);
+    }
+    let global_path = global_memory_dir().join(format!("{name}.md"));
+    let body = read_ok(&global_path);
     if body.is_empty() {
         None
     } else {

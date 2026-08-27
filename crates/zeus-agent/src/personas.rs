@@ -57,8 +57,26 @@ impl Persona {
     }
 
     pub fn matches(&self, topic: &str) -> bool {
+        self.score(topic) > 0
+    }
+
+    /// Score how well this persona matches the topic. Higher = better match.
+    /// Counts keyword occurrences, with exact-word matches weighted higher
+    /// than substring matches.
+    pub fn score(&self, topic: &str) -> u32 {
         let topic = topic.to_lowercase();
-        self.keywords.iter().any(|k| topic.contains(k))
+        let mut score = 0u32;
+        for kw in self.keywords {
+            let kw_lower = kw.to_lowercase();
+            if topic == kw_lower {
+                // Exact match
+                score += 10;
+            } else if topic.contains(&kw_lower) {
+                // Substring match — prefer longer keywords (more specific)
+                score += 3 + kw_lower.len() as u32;
+            }
+        }
+        score
     }
 
     /// Whether this persona only inspects and never mutates the workspace.
@@ -687,12 +705,14 @@ pub fn personas_by_department() -> Vec<(&'static str, Vec<&'static Persona>)> {
 /// order. Falls back to `software-architect` for unknown software work and
 /// `None` (generic) when nothing looks like a dispatch.
 pub fn recommend_persona(topic: &str) -> Option<&'static Persona> {
-    let dispatched = all_personas()
+    // Score all non-reviewer personas and pick the best match.
+    let best = all_personas()
         .into_iter()
-        .find(|p| !p.reviewer && p.matches(topic));
-    match dispatched {
-        Some(p) => Some(p),
-        None => {
+        .filter(|p| !p.reviewer)
+        .max_by_key(|p| p.score(topic));
+    match best {
+        Some(p) if p.score(topic) > 0 => Some(p),
+        _ => {
             if looks_like_software(topic) {
                 Some(&ALL_PERSONAS[0]) // software-architect
             } else {
@@ -799,14 +819,20 @@ fn all_personas() -> Vec<&'static Persona> {
 /// falls back to a generically-useful reviewer when nothing matches, and
 /// `None` when there is no reviewer at all.
 pub fn recommend_reviewer(topic: &str) -> Option<&'static Persona> {
-    all_personas()
+    // Score all reviewer personas and pick the best match.
+    let best = all_personas()
         .into_iter()
-        .find(|p| p.reviewer && p.matches(topic))
-        .or_else(|| {
+        .filter(|p| p.reviewer)
+        .max_by_key(|p| p.score(topic));
+    match best {
+        Some(p) if p.score(topic) > 0 => Some(p),
+        _ => {
+            // Fallback to the architectural reviewer
             all_personas()
                 .into_iter()
                 .find(|p| p.id == "architectural-reviewer")
-        })
+        }
+    }
 }
 
 /// Cheap intent guard: does this step look like software work at all?

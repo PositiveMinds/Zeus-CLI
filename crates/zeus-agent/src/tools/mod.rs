@@ -1,7 +1,76 @@
-//! Tool registry: bridges Phase 2 file operations + search + Phase 3
-//! terminal execution into named tools the agent loop dispatches by name
-//! with JSON-object arguments — this is the bridge layer the blueprint's
-//! Agent Loop calls "Tool Manager".
+//! Tool registry: bridges file operations, search, terminal execution, and
+//! external integrations into named tools the agent loop dispatches by name.
+//!
+//! This module is the bridge layer the blueprint's Agent Loop calls "Tool Manager".
+//! It provides a unified interface for all tool operations the agent can perform.
+//!
+//! ## Tool Categories
+//!
+//! ### Core Tools (always available)
+//! - **File operations**: `read`, `write`, `edit`, `delete`, `rename`, `copy`, `mkdir`, `listdir`
+//! - **Search**: `grep`, `glob`, `code_symbols`, `code_defs`, `code_refs`, `code_graph`, `code_rename`
+//! - **Terminal**: `bash`, `test`, `verify`
+//! - **Web**: `web_fetch`, `web_search`, `browser`
+//! - **Git**: `git_*` tools for status, diff, commit, branch, etc.
+//! - **Background**: `bg_list`, `bg_output`, `bg_stop`, `bg_pause`, `bg_resume`
+//! - **RAG**: `rag_search`, `rag_index` for retrieval-augmented generation
+//! - **Skills**: `list_skills`, `read_skill`
+//! - **Memory**: `memory`, `memory_write`
+//! - **Other**: `todowrite`, `current_time`, `understand_repo`
+//!
+//! ### Platform Tools (conditional on CLI presence)
+//! - GitHub (`gh_*`): issues, PRs, releases, workflows
+//! - Supabase (`supabase_*`): projects, database, functions
+//! - Vercel (`vercel_*`): projects, deploy, logs
+//! - Docker (`docker_*`): containers, compose
+//! - Kubernetes (`k8s_*`): pods, deployments
+//! - Terraform (`tf_*`): plan, apply
+//! - AWS, Azure, GCP, Helm, Fly, Railway, Render, Netlify, Firebase
+//!
+//! ### MCP Tools (from connected servers)
+//! - Dynamically discovered from MCP servers via `mcp__<server>__<tool>` naming
+//!
+//! ### Native Plugin Tools
+//! - From loaded native plugins via `plugin__<plugin>__<tool>` naming
+//!
+//! ## Permission System
+//!
+//! Tools are classified by their mutation risk:
+//! - **Read-only**: Safe to run in Plan mode (file reads, search, git status, etc.)
+//! - **Mutating**: Requires approval (file writes, bash execution, git commits, etc.)
+//!
+//! The `PermissionGate` enforces these rules based on project settings.
+//!
+//! ## Tool Dispatch
+//!
+//! Tools are dispatched via `ToolManager::dispatch_with_approver`:
+//! 1. Pre-tool-use hooks can block or rewrite arguments
+//! 2. Permission gate checks if the tool is allowed
+//! 3. Tool implementation executes
+//! 4. Post-tool-use hooks can append diagnostic output
+//!
+//! ## Background Tasks
+//!
+//! Long-running commands (dev servers, builds) can run as background tasks:
+//! - Started via `bash` with `background=true`
+//! - Monitored via `bg_list` and `bg_output`
+//! - Paused/resumed/stopped via dedicated tools
+//!
+//! ## Code Intelligence
+//!
+//! - `code_index`: Build symbol index from tree-sitter AST parsing
+//! - `code_symbols`: Find symbols by name
+//! - `code_defs`: Find definitions
+//! - `code_refs`: Find references via ripgrep
+//! - `code_graph`: Call graph analysis (who calls what)
+//! - `code_rename`: Propose rename plan (read-only)
+
+mod git;
+mod helpers;
+mod platform;
+mod specs;
+#[cfg(test)]
+mod tests;
 
 use crate::background::BackgroundTaskRegistry;
 use crate::error::{AgentError, Result};
@@ -9,23 +78,27 @@ use crate::hooks::{HookRunner, PreToolUseOutcome};
 use crate::mcp::McpClient;
 use crate::plugin::LoadedPlugin;
 use crate::terminal::{CommandProfile, Sandbox, TerminalOptions, TerminalRunner};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashSet;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use zeus_fs::{
     filter_out_own_index, word_boundary, ApprovalDecision, CallEdge, CopyOptions, DeviceEngine,
-    EditOptions, GitEngine, GitOutput, IndexEngine, PermissionGate, PermissionRequest,
-    PlatformEngine, PlatformOutput, ReadOptions, ResetMode, SearchOptions, SymbolIndex, Workspace,
-    WriteOptions,
+    EditOptions, GitEngine, IndexEngine, PermissionGate, PermissionRequest, PlatformEngine,
+    PlatformOutput, ReadOptions, ResetMode, SearchOptions, SymbolIndex, Workspace, WriteOptions,
 };
 use zeus_provider::{ModelProvider, ToolSpec};
 
-mod git;
-mod platform;
+// Re-export from sub-modules
+pub(crate) use helpers::{detect_test_command, git_result, strip_html_with_tables};
+pub use specs::builtin_tool_specs;
+#[allow(unused_imports)] // re-exported for tools::tests
+pub(crate) use specs::platform_cli_for;
+pub use specs::platform_tool_specs;
+pub(crate) use specs::PLATFORM_TOOLS;
+use specs::{core_tool_specs, detect_platform_clis, filter_platform_specs};
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -51,1666 +124,6 @@ impl ToolResult {
             images: Vec::new(),
         }
     }
-}
-
-/// Tool specs advertised to the model. Kept in sync with `ToolManager`'s
-/// `dispatch_with_approver` match arms below — every name here must have a
-/// handler, and vice versa.
-fn core_tool_specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: "todowrite".into(),
-            description: "Replace your own progress checklist for this session with the given list — call this whenever you break a request into multiple steps, and again every time a step's status changes. You own this list entirely: pass the FULL list every time (not a diff), including items already completed. Mark exactly one item in_progress at a time (the one you're actively working on), never more; mark an item completed only once you've actually verified it, not just attempted it. Skip this tool for a single trivial action.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "todos": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": {"type": "string", "description": "Short imperative description of the step"},
-                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
-                            },
-                            "required": ["content", "status"]
-                        }
-                    }
-                },
-                "required": ["todos"]
-            }),
-        },
-        ToolSpec {
-            name: "current_time".into(),
-            description: "Return the current local date and time (with UTC offset, ISO week, and day of year). Use whenever the user asks what date/time it is, or whenever a task depends on the current date (naming files with today's date, scheduling, 'is X released yet' comparisons). Always fresh — never assume a date or time from your training data; the value is read from the clock at call time.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "read".into(),
-            description: "Read a project file (line-numbered output). The result is prefixed with the exact line window shown (e.g. lines 1-500 of 3200) — if it says the file continues, pass offset=<next line> to keep reading; never treat a partial read as the whole file.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "offset": {"type": "integer"},
-                    "limit": {"type": "integer"}
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "read_multiple".into(),
-            description: "Read several project files in one call. `paths` is a JSON array of strings (up to 20, each read with its own `limit`, default 1500 lines). Each file is returned as a separate block headed with `=== path ===`; a missing file yields a `--- path: <error> ---` block instead of failing the whole call. Use when you need several related files (a module, its types, its tests) at once — one round-trip instead of N reads.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "maxItems": 20
-                    },
-                    "limit": {"type": "integer"}
-                },
-                "required": ["paths"]
-            }),
-        },
-        ToolSpec {
-            name: "write".into(),
-            description: "Create or overwrite a project file. Must read an existing file first."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "path": {"type": "string"}, "content": {"type": "string"} },
-                "required": ["path", "content"]
-            }),
-        },
-        ToolSpec {
-            name: "edit".into(),
-            description: "Targeted string replace in a file — you MUST read the file first. `old_string` must match the file's text exactly; include enough surrounding context (unique lines) so it matches once. Multiple matches are rejected unless `replace_all` is set — if you get an 'ambiguous' error, re-read the file and widen `old_string` with neighboring lines. The change goes through the approval prompt as a diff you can apply or reject. Stale files (changed on disk since your last read) are refused — re-read and retry.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old_string": {"type": "string", "description": "Exact text to replace; must match uniquely (or set replace_all)"},
-                    "new_string": {"type": "string"},
-                    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of erroring on multiple matches"}
-                },
-                "required": ["path", "old_string", "new_string"]
-            }),
-        },
-        ToolSpec {
-            name: "delete".into(),
-            description: "Delete a file or directory. Always requires user approval.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "path": {"type": "string"} },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "rename".into(),
-            description: "Rename or move a file/directory.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "from": {"type": "string"}, "to": {"type": "string"} },
-                "required": ["from", "to"]
-            }),
-        },
-        ToolSpec {
-            name: "copy".into(),
-            description: "Copy a file.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "from": {"type": "string"},
-                    "to": {"type": "string"},
-                    "overwrite": {"type": "boolean"}
-                },
-                "required": ["from", "to"]
-            }),
-        },
-        ToolSpec {
-            name: "grep".into(),
-            description: "Search file contents by regex.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "glob": {"type": "string"},
-                    "ignore_case": {"type": "boolean"},
-                    "max": {"type": "integer"}
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolSpec {
-            name: "glob".into(),
-            description: "Find files by glob pattern.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "pattern": {"type": "string"}, "max": {"type": "integer"} },
-                "required": ["pattern"]
-            }),
-        },
-        ToolSpec {
-            name: "mkdir".into(),
-            description: "Create a directory (and any missing parents) inside the project. Use to scaffold project structure (e.g. src/components, public/assets, models/) before writing files into it — `write` also creates parents automatically, but empty directories need this.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "path": {"type": "string"} },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "listdir".into(),
-            description: "List a directory's immediate contents (files and subdirectories, one per line; directories show a trailing '/'). Pass recursive=true for a full tree — the fast way to analyze a project's structure before reading specific files.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "recursive": {"type": "boolean"}
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "bash".into(),
-            description: "Run a shell command in the project root (foreground, bounded) and wait for it to finish. Use for builds/tests/read-only commands. For a command that doesn't exit on its own (a dev server, `docker compose up`), set background=true instead of using this in foreground mode.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "timeout_secs": {"type": "integer"},
-                    "background": {"type": "boolean", "description": "Run detached and return immediately with a task id, instead of waiting for exit."}
-                },
-                "required": ["command"]
-            }),
-        },
-        ToolSpec {
-            name: "bg_list".into(),
-            description: "List background tasks started with bash(background=true) in this project, with their running/exited status.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "bg_output".into(),
-            description: "Read the captured stdout/stderr so far for a background task by id.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "id": {"type": "integer"} },
-                "required": ["id"]
-            }),
-        },
-        ToolSpec {
-            name: "bg_stop".into(),
-            description: "Stop a running (or paused) background task by id.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "id": {"type": "integer"} },
-                "required": ["id"]
-            }),
-        },
-        ToolSpec {
-            name: "bg_pause".into(),
-            description: "Suspend a running background task in place (freezes it without killing the process); resume it later with bg_resume using the same id.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "id": {"type": "integer"} },
-                "required": ["id"]
-            }),
-        },
-        ToolSpec {
-            name: "bg_resume".into(),
-            description: "Continue a previously-paused background task, exactly where it stopped.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "id": {"type": "integer"} },
-                "required": ["id"]
-            }),
-        },
-        // --- Verification: tests + visual (browser) ---
-        ToolSpec {
-            name: "test".into(),
-            description: "Run the project's test suite. Auto-detects the test runner from the repo (cargo test / npm|pnpm|yarn test / python -m pytest / go test / make test); pass an explicit `command` to override when a targeted run is needed (single test, extra flags). Bounded by timeout_secs (default 300). Returns the exit code plus a parsed pass/fail summary — treat a nonzero exit as a failing suite and read the stderr below it.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Explicit test command to run instead of auto-detection"},
-                    "timeout_secs": {"type": "integer"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "verify".into(),
-            description: "Verify the project compiles/builds (and tests pass) using the build and test commands detected for the project's language (cargo build, go build, npm run build, dotnet build, tsc, ...). Runs build then test by default; `steps` narrows to just \"build\" or \"test\", and an explicit `command` overrides detection entirely. A nonzero exit means verification failed — read the stderr below it. Bounded by timeout_secs (default 600). Use this after writing or editing code to prove it still compiles.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Explicit command to run instead of the detected build/test"},
-                    "steps": {"type": "string", "enum": ["build", "test", "all"], "description": "Which steps to run (default all)"},
-                    "timeout_secs": {"type": "integer"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "browser".into(),
-            description: "Open a URL in the user's default web browser so the running app can be visually inspected. Use AFTER starting a dev server (bash background=true + bg_output). Accepts http(s):// URLs and localhost:port-style addresses (http:// scheme is added automatically for bare host:port). The human looks at the page — tell them what to check and ask what they see.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "url": {"type": "string"} },
-                "required": ["url"]
-            }),
-        },
-        ToolSpec {
-            name: "web_fetch".into(),
-            description: "Fetch a URL over HTTP(S) and return its content as text. Use to scrape docs, read an API/endpoint response, download raw source, or inspect a web page the model needs to act on (the browser tool just opens it for a human — web_fetch returns the actual content here). max_chars caps the returned body (default 20000); selective=true strips HTML to approximate markdown text instead of returning raw HTML. Errors on non-2xx status and on obviously non-text content. Requires network access.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Absolute http(s) URL to fetch"},
-                    "max_chars": {"type": "integer", "description": "Cap on returned characters (default 20000)"},
-                    "selective": {"type": "boolean", "description": "Strip HTML tags to text (default true)"}
-                },
-                "required": ["url"]
-            }),
-        },
-        ToolSpec {
-            name: "web_search".into(),
-            description: "Search the web and return the top result titles, URLs, and snippets. Use when you need current or external information (latest library versions, API docs, third-party package details, known issues) rather than relying on possibly-stale training knowledge. `query` is the search string; `max_results` caps the returned results (default 6). Then call web_fetch on the most promising URL for full content. Requires network access.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "max_results": {"type": "integer", "description": "Max results to return (default 10)"}
-                },
-                "required": ["query"]
-            }),
-        },
-        ToolSpec {
-            name: "list_skills".into(),
-            description: "List available skills (project `<project>/.agent/skills`, user `~/.zeus/skills`, and built-ins). Skills are just-in-time expertise packages — SKILL.md directories with instructions and bundled resources. Returns <tier> name — description plus tags. Call read_skill before acting on a skill you intend to use.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "search": {"type": "string", "description": "Optional substring to filter names/descriptions/tags by"}
-                }
-            }),
-        },
-ToolSpec {
-            name: "read_skill".into(),
-            description: "Load a skill's full SKILL.md instructions into context by name. Use when a listed skill is relevant to the current task — it returns markdown instructions plus any bundled resource file names (which can then be read directly from the skill directory via the read tool). The skill's instructions may change HOW you approach the task, so read the full body, not just the description.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Skill name as printed by list_skills"},
-                    "include_resources": {"type": "boolean", "description": "Also return bundled resource file contents (default true)"},
-                    "recursive": {"type": "boolean", "description": "Also load depends_on skills the skill composes (default true)"}
-                },
-                "required": ["name"]
-            }),
-        },
-ToolSpec {
-            name: "read_document".into(),
-            description: "Extract text from binary/office documents for the model to act on: PDF, DOCX, XLSX (each worksheet as a row grid), PPTX (slides), EPUB (chapters in reading order). HTML is also handled with tables rendered as pipe-delimited row grids. Also handles plain-text formats via the read tool. max_chars caps returned text (default 20000). Use instead of read for .pdf/.docx/.pptx/.xlsx/.epub/.html files — read would return binary garbage for those. Returns unsupported/missing files as errors. For scanned/image PDFs (no text layer) it errors and you should use read_image + the ui-design skill.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or project-relative path to the document"},
-                    "max_chars": {"type": "integer", "description": "Cap on returned characters (default 100000)"}
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "read_image".into(),
-            description: "Read a local image file so a vision-capable model can SEE it (the binary image data is attached to the message). Supports PNG, JPEG, GIF, WEBP, BMP. Use for screenshots, UI mockups/design images, diagrams, scanned docs — anything you must inspect visually or recreate/design from. The companion text result states the resolved path and dimensions hint if known. For scanned PDFs (no text layer) pair with the ui-design + document-reading skills.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute or project-relative path to the image file"}
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "understand_repo".into(),
-            description: "Repository understanding: returns a deterministic snapshot of the project (language stack, frameworks, package manager, database, entry points, build/test commands, git status) plus — when a `topic` is given (e.g. \"authentication\") — a list of existing files/modules whose names relate to that topic. Read this or a targeted grep BEFORE writing new code, so you reuse existing modules instead of duplicating them.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "topic": {"type": "string", "description": "Optional subject to find existing related code for"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "rag_search".into(),
-            description: "Keyword-based retrieval over the project's source files: chunks each file and ranks chunks against the query with BM25-style term weights (no model call, read-only, works offline). Use when you need to find code that is about a concept but may not contain the exact identifier/string you would grep for — e.g. \"where is connection retry handled\" or \"which code touches rate limiting\". Returns the top-k matching chunks with file paths. For exact-string lookup prefer grep; for symbol names use code_symbols.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The concept/terms to find code for"},
-                    "k": {"type": "integer", "description": "How many top chunks to return (default 5)"}
-                },
-                "required": ["query"]
-            }),
-        },
-        ToolSpec {
-            name: "rag_index".into(),
-            description: "Build or refresh the persistent RAG chunk index at .agent/rag_index.json: chunks every source file (same walk as rag_search) and saves the index to disk so later rag_search calls reuse it instead of re-chunking the whole project. Uses the current file set; a later rag_search rebuilds automatically if the index is stale. Pass force=true to rebuild unconditionally; pass embed=true to also embed every chunk with the configured provider (best-effort: if no embeddings are available the index stays keyword-only).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "force": {"type": "boolean", "description": "Rebuild even if a fresh index already exists (default false)"},
-                    "embed": {"type": "boolean", "description": "Also embed every chunk with the configured provider (best-effort, default false)"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "memory".into(),
-            description: "Long-term project memory under .agent/memory/: `list` shows note names + first lines; `read <name>` returns a note's full body. Used to persist decisions, conventions, and gotchas across sessions. Read before large/unknown tasks; check what the project already decided before exploring anew.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["list", "read"]},
-                    "name": {"type": "string", "description": "note name (required for read)"}
-                },
-                "required": ["action"]
-            }),
-        },
-        ToolSpec {
-            name: "memory_write".into(),
-            description: "Write a long-term project memory note under .agent/memory/<name>.md (name: letters/digits/-/_). Content is a short markdown plan/decision/gotcha you want to persist across sessions. Overwrites the note if it exists. Ask the user first before writing non-obvious memories.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "content": {"type": "string"}
-                },
-                "required": ["name", "content"]
-            }),
-        },
-        ToolSpec {
-            name: "device".into(),
-            description: "Test on an Android device via adb — over USB debugging or wireless (adb connect). Actions: devices (list USB+wireless), connect <host:port> (wireless debug), disconnect <host:port>, install <apk_path>, uninstall <package>, launch <package> [activity] (start the app), screenshot [out] (PNG into the project), screenrecord [out] [seconds] (MP4 screen capture, 1-30s, default 10), logcat [filter] [max_lines] (bounded crash/console dump), logcat_clear (reset the buffer), shell <command> (arbitrary device shell — the escape hatch), pair <host_port> <code> (wireless pairing), info (model / Android version / SDK), reverse [local_port] [device_port] (expose a host port on the device — needed for app/webview debugging), forward [local_port] [device_port] (expose a device port on the host), input <event> (UI automation: tap/swipe/keyevent/type), pull <remote> [out] (copy a file off the device), push <out> <remote> (copy a file onto the device). Requires the Android platform-tools `adb` on PATH and a device authorized for debugging.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["devices", "connect", "disconnect", "install", "uninstall", "launch", "screenshot", "screenrecord", "logcat", "logcat_clear", "shell", "pair", "info", "reverse", "forward", "input", "pull", "push"]},
-                    "target": {"type": "string", "description": "host:port for connect/disconnect"},
-                    "path": {"type": "string", "description": "APK path for install"},
-                    "package": {"type": "string", "description": "app package for uninstall/launch"},
-                    "activity": {"type": "string", "description": "optional activity (relative or fully-qualified) for launch"},
-                    "command": {"type": "string", "description": "device shell command for action=shell"},
-                    "filter": {"type": "string", "description": "logcat filter for action=logcat"},
-                    "max_lines": {"type": "integer", "description": "logcat tail length (default 200)"},
-                    "out": {"type": "string", "description": "output path relative to project root (screenshot/screenrecord/pull) or local file to push"},
-                    "seconds": {"type": "integer", "description": "screenrecord duration in seconds (1-30, default 10)"},
-                    "host_port": {"type": "string", "description": "host:port for wireless pairing"},
-                    "code": {"type": "string", "description": "6-digit pairing code for action=pair"},
-                    "local_port": {"type": "integer", "description": "host-side port for reverse/forward"},
-                    "device_port": {"type": "integer", "description": "device-side port for reverse/forward"},
-                    "event": {"type": "string", "description": "input event for action=input, e.g. 'tap 540 1200' or 'swipe 100 500 300 500 200' or 'text hello' or 'keyevent 4'"},
-                    "remote": {"type": "string", "description": "device path for pull/push"}
-                },
-                "required": ["action"]
-            }),
-        },
-        // --- Git: read-only ---
-        ToolSpec {
-            name: "git_status".into(),
-            description: "git status (porcelain), with branch info.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "git_diff".into(),
-            description: "git diff. staged=true for the index; refs=[\"a\"] diffs against a commit, refs=[\"a\",\"b\"] diffs a..b.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "staged": {"type": "boolean"},
-                    "refs": {"type": "array", "items": {"type": "string"}}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "git_blame".into(),
-            description: "git blame for a single file.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "path": {"type": "string"} },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "git_log".into(),
-            description: "git log --oneline, optionally scoped to one path.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "max": {"type": "integer"}, "path": {"type": "string"} }
-            }),
-        },
-        ToolSpec {
-            name: "git_show".into(),
-            description: "git show <commit-or-ref> — full diff/details for one commit.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "target": {"type": "string"} },
-                "required": ["target"]
-            }),
-        },
-        ToolSpec {
-            name: "git_branch_list".into(),
-            description: "List local and remote branches.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "git_remote_list".into(),
-            description: "List configured remotes (git remote -v).".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "git_tag_list".into(),
-            description: "List tags.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "git_stash_list".into(),
-            description: "List stash entries.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        // --- Git: reversible write ---
-        ToolSpec {
-            name: "git_add".into(),
-            description: "Stage one or more paths.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "paths": {"type": "array", "items": {"type": "string"}} },
-                "required": ["paths"]
-            }),
-        },
-        ToolSpec {
-            name: "git_commit".into(),
-            description: "Commit staged changes (or all tracked changes if all=true) with the given message. Read the diff first (git_diff) so the message actually reflects what changed.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "message": {"type": "string"}, "all": {"type": "boolean"} },
-                "required": ["message"]
-            }),
-        },
-        ToolSpec {
-            name: "git_stash_push".into(),
-            description: "Stash the working tree changes.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "message": {"type": "string"} }
-            }),
-        },
-        ToolSpec {
-            name: "git_stash_pop".into(),
-            description: "Apply and drop the most recent stash entry.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "git_branch_create".into(),
-            description: "Create a new branch at HEAD.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "name": {"type": "string"} },
-                "required": ["name"]
-            }),
-        },
-        ToolSpec {
-            name: "git_branch_delete".into(),
-            description: "Delete a branch. force=true uses -D (needed for an unmerged branch) instead of -d.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "name": {"type": "string"}, "force": {"type": "boolean"} },
-                "required": ["name"]
-            }),
-        },
-        ToolSpec {
-            name: "git_tag_create".into(),
-            description: "Create a tag, annotated if a message is given.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "name": {"type": "string"}, "message": {"type": "string"} },
-                "required": ["name"]
-            }),
-        },
-        // --- Git: working-tree-changing ---
-        ToolSpec {
-            name: "git_checkout".into(),
-            description: "Check out an existing branch or commit.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "target": {"type": "string"} },
-                "required": ["target"]
-            }),
-        },
-        // --- Git: network / shared-state ---
-        ToolSpec {
-            name: "git_fetch".into(),
-            description: "Fetch from a remote (or the default remote) without merging.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "remote": {"type": "string"} }
-            }),
-        },
-        ToolSpec {
-            name: "git_pull".into(),
-            description: "git pull (fetch + merge/rebase per repo config).".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "git_push".into(),
-            description: "git push. force=true is denied by a built-in safety rule regardless of approval — force-pushing needs an explicit, narrower rule in project settings.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "remote": {"type": "string"},
-                    "branch": {"type": "string"},
-                    "force": {"type": "boolean"}
-                }
-            }),
-        },
-        // --- Git: history-rewriting / conflict-prone ---
-        ToolSpec {
-            name: "git_reset".into(),
-            description: "git reset. mode=\"hard\" is denied by a built-in safety rule regardless of approval (it discards working-tree changes) — use \"soft\" or \"mixed\" instead.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "mode": {"type": "string", "enum": ["soft", "mixed", "hard"]},
-                    "target": {"type": "string"}
-                },
-                "required": ["mode"]
-            }),
-        },
-        ToolSpec {
-            name: "git_revert".into(),
-            description: "Create a new commit that undoes the given commit (safer than reset — doesn't rewrite history).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "target": {"type": "string"} },
-                "required": ["target"]
-            }),
-        },
-        ToolSpec {
-            name: "git_cherry_pick".into(),
-            description: "Apply the changes from one commit onto the current branch.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "target": {"type": "string"} },
-                "required": ["target"]
-            }),
-        },
-        ToolSpec {
-            name: "git_rebase".into(),
-            description: "Rebase the current branch onto another (rewrites history — use with care).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "onto": {"type": "string"} },
-                "required": ["onto"]
-            }),
-        },
-        ToolSpec {
-            name: "git_merge".into(),
-            description: "Merge a branch into the current one. On conflict, the raw git output (naming the conflicting files) is returned — read those files to see the conflict markers.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "branch": {"type": "string"} },
-                "required": ["branch"]
-            }),
-        },
-        // --- Phase 6: Code Intelligence (database-free symbol index) ---
-        ToolSpec {
-            name: "code_index".into(),
-            description: "Scan the project's source files and write .agent/index.json (symbol index). Run before code_symbols/code_defs when no index exists yet.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "force": {"type": "boolean"} }
-            }),
-        },
-        ToolSpec {
-            name: "code_symbols".into(),
-            description: "Look up symbols (functions/structs/classes/enums/...) in the project index by name (substring, case-insensitive). Returns kind, file, line.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "name": {"type": "string"} },
-                "required": ["name"]
-            }),
-        },
-        ToolSpec {
-            name: "code_defs".into(),
-            description: "Go-to-definition: same as code_symbols but reports the matching definitions only, suitable for 'where is X defined?'.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "name": {"type": "string"} },
-                "required": ["name"]
-            }),
-        },
-        ToolSpec {
-            name: "code_refs".into(),
-            description: "Find references to a symbol across the project (and configured extra project roots) via ripgrep. Word-boundary matching, file:line:text output.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "max": {"type": "integer"}
-                },
-                "required": ["name"]
-            }),
-        },
-        ToolSpec {
-            name: "code_graph".into(),
-            description: "Call graph: who calls this symbol, and/or what does it call. Built from tree-sitter AST parsing (not text search), so it only covers languages with a wired grammar (rust/python/go/js/ts/c/cpp/java/cs/rb) and misses dynamic dispatch/reflection. Run code_index first.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "direction": {"type": "string", "enum": ["callers", "callees", "both"]}
-                },
-                "required": ["name"]
-            }),
-        },
-        ToolSpec {
-            name: "code_rename".into(),
-            description: "Propose a reference-update plan for renaming symbol `old` to `new` (word-boundary). Reports each file and the affected lines. It never writes — applying the edits is left to a separate review step.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "old": {"type": "string"},
-                    "new": {"type": "string"}
-                },
-                "required": ["old", "new"]
-            }),
-        },
-    ]
-}
-
-/// Every built-in tool (core + platform) — the full registry. Used by the
-/// dispatch-completeness test and re-exported for tooling. This is
-/// deliberately *not* the list the model sees: `ToolManager::all_tool_specs`
-/// filters platform tools down to those whose CLI is actually on PATH (see
-/// `platform_cli_for`/`filter_platform_specs`), so a small/free model isn't
-/// asked to weigh 80+ deployment tools it can't use — a 147-tool list is
-/// enough to make a small model burn every tool-call iteration without ever
-/// converging to a final answer (the "(no final answer after N tool calls)"
-/// failure, and the per-turn latency that makes simple tasks feel slow).
-pub fn builtin_tool_specs() -> Vec<ToolSpec> {
-    let mut specs = core_tool_specs();
-    specs.extend(platform_tool_specs());
-    specs
-}
-
-/// The single source of truth for platform-CLI tool names. `dispatch_inner`
-/// routes any name in this list to `do_platform`, and the test suite asserts
-/// this list matches both `platform_tool_specs()` and the `do_platform`
-/// match arms — so adding a platform tool in one place without the others
-/// is a test failure, not a silent drift.
-pub const PLATFORM_TOOLS: &[&str] = &[
-    "gh_issue_list",
-    "gh_issue_view",
-    "gh_issue_create",
-    "gh_issue_close",
-    "gh_pr_list",
-    "gh_pr_view",
-    "gh_pr_create",
-    "gh_pr_merge",
-    "gh_release_list",
-    "gh_release_create",
-    "gh_workflow_list",
-    "gh_workflow_run",
-    "gh_run_list",
-    "supabase_login",
-    "supabase_link",
-    "supabase_projects_list",
-    "supabase_status",
-    "supabase_db_push",
-    "supabase_db_diff",
-    "supabase_functions_list",
-    "supabase_functions_deploy",
-    "vercel_whoami",
-    "vercel_projects_list",
-    "vercel_env_list",
-    "vercel_deploy",
-    "vercel_logs",
-    "docker_ps",
-    "docker_images",
-    "docker_compose_up",
-    "docker_compose_down",
-    "docker_compose_logs",
-    "k8s_get",
-    "k8s_logs",
-    "k8s_apply",
-    "k8s_rollout_status",
-    "tf_init",
-    "tf_validate",
-    "tf_plan",
-    "tf_apply",
-    "circleci_validate",
-    "circleci_builds",
-    "aws_whoami",
-    "aws_s3_ls",
-    "aws_s3_sync",
-    "aws_ecr_login",
-    "aws_lambda_list",
-    "aws_lambda_invoke",
-    "aws_ecs_list_clusters",
-    "aws_ecs_force_deploy",
-    "sam_build",
-    "sam_deploy",
-    "cloudformation_describe",
-    "cloudformation_deploy",
-    "az_whoami",
-    "az_webapp_list",
-    "az_webapp_deploy",
-    "az_functionapp_deploy",
-    "gcloud_whoami",
-    "gcloud_app_deploy",
-    "gcloud_run_deploy",
-    "gcloud_run_services",
-    "helm_list",
-    "helm_status",
-    "helm_install",
-    "helm_upgrade",
-    "helm_uninstall",
-    "fly_whoami",
-    "fly_apps_list",
-    "fly_deploy",
-    "fly_status",
-    "railway_whoami",
-    "railway_status",
-    "railway_up",
-    "render_whoami",
-    "render_services",
-    "render_deploy",
-    "netlify_whoami",
-    "netlify_sites",
-    "netlify_deploy",
-    "firebase_projects",
-    "firebase_deploy",
-    "firebase_functions",
-];
-
-/// Tool specs for the platform-CLI integrations (gh/supabase/vercel/aws/…).
-/// Kept separate so the file stays navigable. Names must match the
-/// `do_platform` dispatch arms exactly.
-pub fn platform_tool_specs() -> Vec<ToolSpec> {
-    vec![
-        // --- GitHub ---
-        ToolSpec {
-            name: "gh_issue_list".into(),
-            description: "List GitHub issues (state=open/closed).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "state": {"type": "string"},
-                    "limit": {"type": "integer"},
-                    "label": {"type": "string"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "gh_issue_view".into(),
-            description: "View a single GitHub issue.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "number": {"type": "string"} },
-                "required": ["number"]
-            }),
-        },
-        ToolSpec {
-            name: "gh_issue_create".into(),
-            description: "Create a GitHub issue (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "body": {"type": "string"},
-                    "label": {"type": "string"}
-                },
-                "required": ["title"]
-            }),
-        },
-        ToolSpec {
-            name: "gh_issue_close".into(),
-            description: "Close a GitHub issue (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "number": {"type": "string"} },
-                "required": ["number"]
-            }),
-        },
-        ToolSpec {
-            name: "gh_pr_list".into(),
-            description: "List GitHub pull requests (state=open/closed).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "state": {"type": "string"},
-                    "limit": {"type": "integer"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "gh_pr_view".into(),
-            description: "View a single GitHub pull request.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "number": {"type": "string"} },
-                "required": ["number"]
-            }),
-        },
-        ToolSpec {
-            name: "gh_pr_create".into(),
-            description: "Create a GitHub pull request (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "body": {"type": "string"},
-                    "base": {"type": "string"}
-                },
-                "required": ["title"]
-            }),
-        },
-        ToolSpec {
-            name: "gh_pr_merge".into(),
-            description:
-                "Merge a GitHub pull request (requires approval). method=merge/squash/rebase."
-                    .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "number": {"type": "string"},
-                    "method": {"type": "string"},
-                    "delete_branch": {"type": "boolean"}
-                },
-                "required": ["number"]
-            }),
-        },
-        ToolSpec {
-            name: "gh_release_list".into(),
-            description: "List GitHub releases.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "limit": {"type": "integer"} }
-            }),
-        },
-        ToolSpec {
-            name: "gh_release_create".into(),
-            description: "Create a GitHub release (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "tag": {"type": "string"},
-                    "title": {"type": "string"},
-                    "notes": {"type": "string"}
-                },
-                "required": ["tag"]
-            }),
-        },
-        ToolSpec {
-            name: "gh_workflow_list".into(),
-            description: "List GitHub Actions workflows.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "gh_workflow_run".into(),
-            description: "Trigger a GitHub Actions workflow (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "workflow": {"type": "string"},
-                    "ref": {"type": "string"}
-                },
-                "required": ["workflow"]
-            }),
-        },
-        ToolSpec {
-            name: "gh_run_list".into(),
-            description: "List GitHub Actions runs.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "workflow": {"type": "string"},
-                    "limit": {"type": "integer"}
-                }
-            }),
-        },
-        // --- Supabase ---
-        ToolSpec {
-            name: "supabase_login".into(),
-            description: "Log in to Supabase (opens browser, requires approval).".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "supabase_link".into(),
-            description: "Link the project to a Supabase remote (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "project_ref": {"type": "string"} }
-            }),
-        },
-        ToolSpec {
-            name: "supabase_projects_list".into(),
-            description: "List Supabase projects.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "supabase_status".into(),
-            description: "Show local Supabase dev service status.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "supabase_db_push".into(),
-            description: "Push local migrations to the linked remote database (requires approval)."
-                .into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "supabase_db_diff".into(),
-            description: "Generate a DB diff against the linked remote.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "schema": {"type": "string"},
-                    "linked": {"type": "boolean"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "supabase_functions_list".into(),
-            description: "List Supabase Edge Functions.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "supabase_functions_deploy".into(),
-            description: "Deploy a Supabase Edge Function (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "function": {"type": "string"},
-                    "project_ref": {"type": "string"},
-                    "no_verify_jwt": {"type": "boolean"}
-                },
-                "required": ["function"]
-            }),
-        },
-        // --- Vercel ---
-        ToolSpec {
-            name: "vercel_whoami".into(),
-            description: "Show the logged-in Vercel user.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "vercel_projects_list".into(),
-            description: "List Vercel projects.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "vercel_env_list".into(),
-            description: "List Vercel environment variables.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "env": {"type": "string"},
-                    "project": {"type": "string"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "vercel_deploy".into(),
-            description: "Deploy to Vercel (requires approval). prod=true deploys to production."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "prod": {"type": "boolean"},
-                    "target": {"type": "string"},
-                    "project": {"type": "string"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "vercel_logs".into(),
-            description: "Show Vercel deployment logs.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "deployment": {"type": "string"},
-                    "project": {"type": "string"},
-                    "follow": {"type": "boolean"}
-                }
-            }),
-        },
-        // --- Docker ---
-        ToolSpec {
-            name: "docker_ps".into(),
-            description: "List docker containers (all=true includes stopped).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "all": {"type": "boolean"} }
-            }),
-        },
-        ToolSpec {
-            name: "docker_images".into(),
-            description: "List docker images.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "docker_compose_up".into(),
-            description: "docker compose up (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "services": {"type": "array", "items": {"type": "string"}},
-                    "detached": {"type": "boolean"},
-                    "build": {"type": "boolean"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "docker_compose_down".into(),
-            description: "docker compose down (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "volumes": {"type": "boolean"} }
-            }),
-        },
-        ToolSpec {
-            name: "docker_compose_logs".into(),
-            description: "docker compose logs.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "service": {"type": "string"},
-                    "follow": {"type": "boolean"}
-                }
-            }),
-        },
-        // --- Kubernetes ---
-        ToolSpec {
-            name: "k8s_get".into(),
-            description: "kubectl get resources (pods/services/deployments/…).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "resource": {"type": "string"},
-                    "name": {"type": "string"},
-                    "namespace": {"type": "string"},
-                    "all_namespaces": {"type": "boolean"}
-                },
-                "required": ["resource"]
-            }),
-        },
-        ToolSpec {
-            name: "k8s_logs".into(),
-            description: "kubectl logs for a pod.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "pod": {"type": "string"},
-                    "container": {"type": "string"},
-                    "namespace": {"type": "string"},
-                    "follow": {"type": "boolean"}
-                },
-                "required": ["pod"]
-            }),
-        },
-        ToolSpec {
-            name: "k8s_apply".into(),
-            description: "kubectl apply -f a manifest (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "namespace": {"type": "string"}
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "k8s_rollout_status".into(),
-            description: "kubectl rollout status for a deployment.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "resource": {"type": "string"},
-                    "namespace": {"type": "string"}
-                },
-                "required": ["resource"]
-            }),
-        },
-        // --- Terraform ---
-        ToolSpec {
-            name: "tf_init".into(),
-            description: "terraform init (requires approval).".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "tf_validate".into(),
-            description: "terraform validate.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "tf_plan".into(),
-            description: "terraform plan (optionally -out=<file>).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "out": {"type": "string"} }
-            }),
-        },
-        ToolSpec {
-            name: "tf_apply".into(),
-            description: "terraform apply (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "plan_file": {"type": "string"},
-                    "auto_approve": {"type": "boolean"}
-                }
-            }),
-        },
-        // --- CircleCI ---
-        ToolSpec {
-            name: "circleci_validate".into(),
-            description: "circleci config validate.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "config": {"type": "string"} }
-            }),
-        },
-        ToolSpec {
-            name: "circleci_builds".into(),
-            description: "List CircleCI builds for a project.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "project": {"type": "string"},
-                    "branch": {"type": "string"},
-                    "limit": {"type": "integer"}
-                },
-                "required": ["project"]
-            }),
-        },
-        // --- AWS ---
-        ToolSpec {
-            name: "aws_whoami".into(),
-            description: "Show the active AWS identity (sts get-caller-identity).".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "aws_s3_ls".into(),
-            description: "List S3 buckets or objects under a prefix.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "path": {"type": "string"} }
-            }),
-        },
-        ToolSpec {
-            name: "aws_s3_sync".into(),
-            description: "Sync files to/from S3 (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string"},
-                    "dest": {"type": "string"}
-                },
-                "required": ["source", "dest"]
-            }),
-        },
-        ToolSpec {
-            name: "aws_ecr_login".into(),
-            description: "Print an ECR docker login token (requires approval).".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "aws_lambda_list".into(),
-            description: "List AWS Lambda functions.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "aws_lambda_invoke".into(),
-            description: "Invoke an AWS Lambda function (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "function": {"type": "string"},
-                    "payload": {"type": "string"}
-                },
-                "required": ["function"]
-            }),
-        },
-        ToolSpec {
-            name: "aws_ecs_list_clusters".into(),
-            description: "List ECS clusters.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "aws_ecs_force_deploy".into(),
-            description: "Force a new deployment of an ECS service (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "cluster": {"type": "string"},
-                    "service": {"type": "string"}
-                },
-                "required": ["cluster", "service"]
-            }),
-        },
-        // --- AWS SAM / CloudFormation ---
-        ToolSpec {
-            name: "sam_build".into(),
-            description: "sam build (requires approval).".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "sam_deploy".into(),
-            description: "sam deploy (requires approval). guided=true for interactive prompts."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "guided": {"type": "boolean"},
-                    "stack_name": {"type": "string"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "cloudformation_describe".into(),
-            description: "aws cloudformation describe-stacks for a stack.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "stack": {"type": "string"} },
-                "required": ["stack"]
-            }),
-        },
-        ToolSpec {
-            name: "cloudformation_deploy".into(),
-            description: "aws cloudformation deploy a template to a stack (requires approval)."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "template": {"type": "string"},
-                    "stack": {"type": "string"}
-                },
-                "required": ["template", "stack"]
-            }),
-        },
-        // --- Azure ---
-        ToolSpec {
-            name: "az_whoami".into(),
-            description: "Show the active Azure account.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "az_webapp_list".into(),
-            description: "List Azure App Service web apps.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "az_webapp_deploy".into(),
-            description: "Deploy to an Azure web app (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "resource_group": {"type": "string"},
-                    "source": {"type": "string"}
-                },
-                "required": ["name", "resource_group", "source"]
-            }),
-        },
-        ToolSpec {
-            name: "az_functionapp_deploy".into(),
-            description: "Deploy an Azure Functions app (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "resource_group": {"type": "string"},
-                    "source": {"type": "string"}
-                },
-                "required": ["name", "resource_group", "source"]
-            }),
-        },
-        // --- Google Cloud ---
-        ToolSpec {
-            name: "gcloud_whoami".into(),
-            description: "Show the active gcloud config/account.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "gcloud_app_deploy".into(),
-            description: "Deploy to Google App Engine (requires approval).".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "gcloud_run_deploy".into(),
-            description: "Deploy a container image to Cloud Run (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "service": {"type": "string"},
-                    "image": {"type": "string"},
-                    "region": {"type": "string"}
-                },
-                "required": ["service", "image"]
-            }),
-        },
-        ToolSpec {
-            name: "gcloud_run_services".into(),
-            description: "List Cloud Run services.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        // --- Helm ---
-        ToolSpec {
-            name: "helm_list".into(),
-            description: "helm list releases.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "namespace": {"type": "string"} }
-            }),
-        },
-        ToolSpec {
-            name: "helm_status".into(),
-            description: "helm status for a release.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "release": {"type": "string"},
-                    "namespace": {"type": "string"}
-                },
-                "required": ["release"]
-            }),
-        },
-        ToolSpec {
-            name: "helm_install".into(),
-            description: "helm install a chart (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "release": {"type": "string"},
-                    "chart": {"type": "string"},
-                    "namespace": {"type": "string"}
-                },
-                "required": ["release", "chart"]
-            }),
-        },
-        ToolSpec {
-            name: "helm_upgrade".into(),
-            description: "helm upgrade a release (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "release": {"type": "string"},
-                    "chart": {"type": "string"},
-                    "namespace": {"type": "string"}
-                },
-                "required": ["release", "chart"]
-            }),
-        },
-        ToolSpec {
-            name: "helm_uninstall".into(),
-            description: "helm uninstall a release (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "release": {"type": "string"},
-                    "namespace": {"type": "string"}
-                },
-                "required": ["release"]
-            }),
-        },
-        // --- Fly.io ---
-        ToolSpec {
-            name: "fly_whoami".into(),
-            description: "Show the logged-in Fly.io user.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "fly_apps_list".into(),
-            description: "List Fly.io apps.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "fly_deploy".into(),
-            description: "Deploy to Fly.io (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "image": {"type": "string"},
-                    "app": {"type": "string"}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "fly_status".into(),
-            description: "Show Fly.io app status.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "app": {"type": "string"} },
-                "required": ["app"]
-            }),
-        },
-        // --- Railway ---
-        ToolSpec {
-            name: "railway_whoami".into(),
-            description: "Show the logged-in Railway user.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "railway_status".into(),
-            description: "Show Railway project status.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "railway_up".into(),
-            description: "Deploy to Railway (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "detach": {"type": "boolean"} }
-            }),
-        },
-        // --- Render ---
-        ToolSpec {
-            name: "render_whoami".into(),
-            description: "Show the logged-in Render user.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "render_services".into(),
-            description: "List Render services.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "render_deploy".into(),
-            description: "Trigger a deploy for a Render service (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "service_id": {"type": "string"} },
-                "required": ["service_id"]
-            }),
-        },
-        // --- Netlify ---
-        ToolSpec {
-            name: "netlify_whoami".into(),
-            description: "Show the logged-in Netlify user.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "netlify_sites".into(),
-            description: "List Netlify sites.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "netlify_deploy".into(),
-            description: "Deploy to Netlify (requires approval). prod=true deploys to production."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "dir": {"type": "string"},
-                    "prod": {"type": "boolean"},
-                    "site": {"type": "string"}
-                },
-                "required": ["dir"]
-            }),
-        },
-        // --- Firebase ---
-        ToolSpec {
-            name: "firebase_projects".into(),
-            description: "List Firebase projects.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "firebase_deploy".into(),
-            description: "Deploy to Firebase Hosting / Functions (requires approval).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "only": {"type": "string"} }
-            }),
-        },
-        ToolSpec {
-            name: "firebase_functions".into(),
-            description: "List Firebase Functions.".into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-    ]
-}
-
-/// The CLI binary a platform tool needs on PATH before it's worth
-/// advertising to the model. `None` for core (non-platform) tools — those
-/// are always advertised. Tools whose CLI isn't present would fail at
-/// dispatch anyway, and carrying their specs is pure dead weight on every
-/// model request: ~80 deployment tools is a big enough list to slow
-/// time-to-first-token and push small/free models into degenerate retries
-/// and tool-call exhaustion. Dispatch still accepts these names regardless —
-/// this only controls what the model is nudged toward.
-fn platform_cli_for(name: &str) -> Option<&'static str> {
-    let (prefix, _) = name.split_once('_')?;
-    Some(match prefix {
-        "gh" => "gh",
-        "supabase" => "supabase",
-        "vercel" => "vercel",
-        "docker" => "docker",
-        "k8s" => "kubectl",
-        "tf" => "terraform",
-        "circleci" => "circleci",
-        "aws" | "cloudformation" => "aws",
-        "sam" => "sam",
-        "az" => "az",
-        "gcloud" => "gcloud",
-        "helm" => "helm",
-        "fly" => "flyctl",
-        "railway" => "railway",
-        "render" => "render",
-        "netlify" => "netlify",
-        "firebase" => "firebase",
-        _ => return None,
-    })
-}
-
-/// Drop platform-tool specs whose CLI isn't in `present`. Core tools have no
-/// CLI mapping (`platform_cli_for` returns `None`) and always survive.
-fn filter_platform_specs(specs: Vec<ToolSpec>, present: &HashSet<String>) -> Vec<ToolSpec> {
-    specs
-        .into_iter()
-        .filter(|s| platform_cli_for(&s.name).is_none_or(|cli| present.contains(cli)))
-        .collect()
-}
-
-/// Which platform CLIs are on PATH. Pure PATH walk with filesystem existence
-/// checks — no process spawns — so it's cheap enough to call from
-/// `all_tool_specs` even without caching (`ToolManager` caches it anyway).
-/// Windows checks the `.exe/.cmd/.bat/.com` variants.
-fn detect_platform_clis() -> HashSet<String> {
-    const CLIS: &[&str] = &[
-        "gh",
-        "supabase",
-        "vercel",
-        "docker",
-        "kubectl",
-        "terraform",
-        "circleci",
-        "aws",
-        "sam",
-        "az",
-        "gcloud",
-        "helm",
-        "flyctl",
-        "railway",
-        "render",
-        "netlify",
-        "firebase",
-    ];
-    CLIS.iter()
-        .filter(|c| cli_on_path(c))
-        .map(|s| (*s).to_string())
-        .collect()
-}
-
-fn cli_on_path(cli: &str) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let mut names = vec![cli.to_string()];
-    if cfg!(windows) {
-        names.extend([
-            format!("{cli}.exe"),
-            format!("{cli}.cmd"),
-            format!("{cli}.bat"),
-            format!("{cli}.com"),
-        ]);
-    }
-    for dir in std::env::split_paths(&path_var) {
-        for name in &names {
-            let full = if dir.as_os_str().is_empty() {
-                PathBuf::from(name)
-            } else {
-                dir.join(name)
-            };
-            if full.is_file() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Dispatches named tool calls against a workspace + terminal runner.
-pub struct ToolManager {
-    workspace: Workspace,
-    terminal: TerminalRunner,
-    background: BackgroundTaskRegistry,
-    hooks: HookRunner,
-    mcp_clients: Vec<McpClient>,
-    plugins: Vec<LoadedPlugin>,
-    git: GitEngine,
-    platform: PlatformEngine,
-    device: DeviceEngine,
-    cancel: Arc<AtomicBool>,
-    /// Global skills dir (`~/.zeus/skills`), injected by the CLI so the tools
-    /// can discover skills at both project and user scope.
-    global_skills_dir: Option<PathBuf>,
-    /// Plan mode: read-only research/proposal, no mutating tool calls. Set
-    /// via `set_plan_mode`; enforced centrally in `dispatch_with_approver`
-    /// rather than per-tool, so it can't be bypassed by a tool that happens
-    /// to be configured Allow in the permission settings.
-    plan_mode: AtomicBool,
-    /// Cached repository fingerprint (repository understanding), shared with
-    /// the Agent so the `understand_repo` tool doesn't rescan the tree.
-    repo: Option<crate::analyze::RepoFingerprint>,
-    /// Optional embeddings provider for `rag_index --embed`. Best-effort:
-    /// when absent or unreachable the index is simply built without vectors.
-    embedder: Option<Arc<dyn ModelProvider>>,
-    /// Embedding model name to pass to `embedder` (usually the chat model;
-    /// a provider may map it to its embedding model).
-    embed_model: Option<String>,
-    /// Which platform CLIs are on PATH, detected once and reused across
-    /// `all_tool_specs` calls (every model round trip requests the list).
-    available_clis: OnceLock<HashSet<String>>,
 }
 
 /// Tools that only observe state (files, git history, background task
@@ -1773,6 +186,40 @@ fn mcp_tool_name(server: &str, tool: &str) -> String {
 /// native plugins.
 fn plugin_tool_name(plugin: &str, tool: &str) -> String {
     format!("plugin__{plugin}__{tool}")
+}
+
+/// Dispatches named tool calls against a workspace + terminal runner.
+pub struct ToolManager {
+    workspace: Workspace,
+    terminal: TerminalRunner,
+    background: BackgroundTaskRegistry,
+    hooks: HookRunner,
+    mcp_clients: Vec<McpClient>,
+    plugins: Vec<LoadedPlugin>,
+    git: GitEngine,
+    platform: PlatformEngine,
+    device: DeviceEngine,
+    cancel: Arc<AtomicBool>,
+    /// Global skills dir (`~/.zeus/skills`), injected by the CLI so the tools
+    /// can discover skills at both project and user scope.
+    global_skills_dir: Option<PathBuf>,
+    /// Plan mode: read-only research/proposal, no mutating tool calls. Set
+    /// via `set_plan_mode`; enforced centrally in `dispatch_with_approver`
+    /// rather than per-tool, so it can't be bypassed by a tool that happens
+    /// to be configured Allow in the permission settings.
+    plan_mode: AtomicBool,
+    /// Cached repository fingerprint (repository understanding), shared with
+    /// the Agent so the `understand_repo` tool doesn't rescan the tree.
+    repo: Option<crate::analyze::RepoFingerprint>,
+    /// Optional embeddings provider for `rag_index --embed`. Best-effort:
+    /// when absent or unreachable the index is simply built without vectors.
+    embedder: Option<Arc<dyn ModelProvider>>,
+    /// Embedding model name to pass to `embedder` (usually the chat model;
+    /// a provider may map it to its embedding model).
+    embed_model: Option<String>,
+    /// Which platform CLIs are on PATH, detected once and reused across
+    /// `all_tool_specs` calls (every model round trip requests the list).
+    available_clis: OnceLock<HashSet<String>>,
 }
 
 impl ToolManager {
@@ -1960,8 +407,7 @@ impl ToolManager {
             // model sees exactly what went wrong and can retry with
             // corrected arguments in the same turn, rather than one bad
             // call via `?` killing the entire turn outright with no way
-            // for the model to self-correct. Anything else (`Provider`/
-            // `Fs`/`Terminal`/`Session`/`Io`) is a real system failure a
+            // for the model to self-correct. Anything else (`Provider`/`Fs`/`Terminal`/`Session`/`Io`) is a real system failure a
             // retry can't fix, and still aborts the turn as before.
             Err(e @ (AgentError::InvalidArguments { .. } | AgentError::UnknownTool(_))) => {
                 ToolResult::err(e.to_string())
@@ -2030,25 +476,25 @@ impl ToolManager {
             "bg_pause" => self.do_bg_pause(&args),
             "bg_resume" => self.do_bg_resume(&args),
             "bg_stop" => self.do_bg_stop(&args),
-            "git_status" => git_result(self.git.status()),
+            "git_status" => helpers::git_result(self.git.status()),
             "git_diff" => self.do_git_diff(&args),
             "git_blame" => self.do_git_blame(&args),
             "git_log" => self.do_git_log(&args),
             "git_show" => self.do_git_show(&args),
-            "git_branch_list" => git_result(self.git.branch_list()),
-            "git_remote_list" => git_result(self.git.remote_list()),
-            "git_tag_list" => git_result(self.git.tag_list()),
-            "git_stash_list" => git_result(self.git.stash_list()),
+            "git_branch_list" => helpers::git_result(self.git.branch_list()),
+            "git_remote_list" => helpers::git_result(self.git.remote_list()),
+            "git_tag_list" => helpers::git_result(self.git.tag_list()),
+            "git_stash_list" => helpers::git_result(self.git.stash_list()),
             "git_add" => self.do_git_add(&args, approver),
             "git_commit" => self.do_git_commit(&args, approver),
             "git_stash_push" => self.do_git_stash_push(&args, approver),
-            "git_stash_pop" => git_result(self.git.stash_pop(&mut *approver)),
+            "git_stash_pop" => helpers::git_result(self.git.stash_pop(&mut *approver)),
             "git_branch_create" => self.do_git_branch_create(&args, approver),
             "git_branch_delete" => self.do_git_branch_delete(&args, approver),
             "git_tag_create" => self.do_git_tag_create(&args, approver),
             "git_checkout" => self.do_git_checkout(&args, approver),
             "git_fetch" => self.do_git_fetch(&args, approver),
-            "git_pull" => git_result(self.git.pull(&mut *approver)),
+            "git_pull" => helpers::git_result(self.git.pull(&mut *approver)),
             "git_push" => self.do_git_push(&args, approver),
             "git_reset" => self.do_git_reset(&args, approver),
             "git_revert" => self.do_git_revert(&args, approver),
@@ -2070,6 +516,49 @@ impl ToolManager {
                 }
             }
         }
+    }
+
+    // --- Tool implementations are in git.rs, platform.rs, and the impl blocks below ---
+
+    fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AgentError::InvalidArguments {
+                tool: key.into(),
+                reason: format!("missing/invalid '{key}'"),
+            })
+    }
+
+    fn opt_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+        args.get(key).and_then(|v| v.as_str())
+    }
+
+    fn usize_arg(args: &Value, key: &str) -> Option<usize> {
+        args.get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
+    }
+
+    fn opt_bool_arg(args: &Value, key: &str) -> Option<bool> {
+        args.get(key).and_then(|v| v.as_bool())
+    }
+
+    fn str_array_arg(args: &Value, key: &str) -> Vec<String> {
+        args.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn u64_arg(args: &Value, key: &str) -> Result<u64> {
+        args.get(key)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| AgentError::InvalidArguments {
+                tool: key.into(),
+                reason: format!("missing/invalid '{key}'"),
+            })
     }
 
     /// Dispatch `plugin__tool` (the part after the `plugin__` prefix) to the
@@ -2171,37 +660,7 @@ impl ToolManager {
         }
     }
 
-    fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::InvalidArguments {
-                tool: key.into(),
-                reason: format!("missing/invalid '{key}'"),
-            })
-    }
-
-    fn opt_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-        args.get(key).and_then(|v| v.as_str())
-    }
-
-    fn usize_arg(args: &Value, key: &str) -> Option<usize> {
-        args.get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
-    }
-
-    fn opt_bool_arg(args: &Value, key: &str) -> Option<bool> {
-        args.get(key).and_then(|v| v.as_bool())
-    }
-
-    fn str_array_arg(args: &Value, key: &str) -> Vec<String> {
-        args.get(key)
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
+    // --- Core tool implementations ---
 
     /// The actual checklist state update happens one layer up, in
     /// `Agent::drive_turn` (it inspects this call's arguments after
@@ -2256,7 +715,11 @@ impl ToolManager {
             now.iso_week().week(),
             now.year(),
             now.ordinal(),
-            if is_leap_year(now.year()) { 366 } else { 365 },
+            if helpers::is_leap_year(now.year()) {
+                366
+            } else {
+                365
+            },
         );
         Ok(ToolResult::ok(content))
     }
@@ -2795,13 +1258,6 @@ impl ToolManager {
             .unwrap_or(false);
 
         if background {
-            // Soft-fail like every other permission ask in this file — a
-            // denial here is a normal, model-reachable outcome (the model
-            // asked to background a command and the user said no), not a
-            // system failure. The bare `.map_err(..)?` this replaced hard-
-            // aborted the whole turn on denial, same bug class already
-            // fixed for `InvalidArguments`/`UnknownTool` at the dispatch
-            // level — this one just didn't route through that catch yet.
             if let Err(e) = self.workspace.files.gate.enforce(
                 &PermissionRequest {
                     tool: "bash".into(),
@@ -2832,9 +1288,6 @@ impl ToolManager {
             timeout,
             sandbox: Sandbox::RestrictedFs,
             profile: CommandProfile::Foreground,
-            // See TerminalOptions::new's doc comment — PTY exit-detection is
-            // unreliable on this setup, so the model-facing tool stays on
-            // the well-proven piped path until that's root-caused.
             use_pty: false,
         };
         match self.terminal.run(
@@ -2909,7 +1362,7 @@ impl ToolManager {
             &mut *approver,
         ) {
             Ok(out) => {
-                let summary = summarize_test_output(&out.stdout);
+                let summary = helpers::summarize_test_output(&out.stdout);
                 let text = format!(
                     "command: {command}\nexit={:?} cancelled={} timed_out={}\n[test summary]\n{summary}\n--- stdout ---\n{}--- stderr ---\n{}{}",
                     out.exit_code,
@@ -3046,7 +1499,7 @@ impl ToolManager {
     fn do_browser(&self, args: &Value) -> Result<ToolResult> {
         let url = Self::str_arg(args, "url")?;
         let url = url.trim();
-        match open_browser_url(url) {
+        match helpers::open_browser_url(url) {
             Ok(()) => Ok(ToolResult::ok(format!(
                 "opened {url} in the default browser — the user is looking at it now. Readable Chrome DevTools-level DOM/inspection is not available from here; tell the user what to verify (layout, console errors, requests) and ask what they observe."
             ))),
@@ -3076,9 +1529,7 @@ impl ToolManager {
             .get("selective")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        // Reject inner-IP/loopback targets just like `browser` does, so the
-        // tool can't be pointed at the user's local services.
-        if let Some(reason) = reject_web_target(url) {
+        if let Some(reason) = helpers::reject_web_target(url) {
             return Ok(ToolResult::err(format!("web_fetch refused: {reason}")));
         }
 
@@ -3100,10 +1551,7 @@ impl ToolManager {
                 )))
             }
         };
-        // A redirect can bounce us onto an internal service even when the
-        // original URL was public — re-run the SSRF guard on the final URL
-        // after redirects were followed.
-        if let Some(reason) = reject_web_target(resp.url().as_str()) {
+        if let Some(reason) = helpers::reject_web_target(resp.url().as_str()) {
             return Ok(ToolResult::err(format!(
                 "web_fetch refused after redirect: {reason}"
             )));
@@ -3135,7 +1583,7 @@ impl ToolManager {
             Err(e) => return Ok(ToolResult::err(format!("body read failed for {url}: {e}"))),
         };
         let mut content = if selective && content_type.contains("html") {
-            strip_html(&body)
+            helpers::strip_html(&body)
         } else {
             body
         };
@@ -3170,7 +1618,10 @@ impl ToolManager {
             Ok(c) => c,
             Err(e) => return Ok(ToolResult::err(format!("http client init failed: {e}"))),
         };
-        let endpoint = format!("https://html.duckduckgo.com/html/?q={}", urlencode(&query));
+        let endpoint = format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            helpers::urlencode(&query)
+        );
         let resp = match client.get(&endpoint).send() {
             Ok(r) => r,
             Err(e) => return Ok(ToolResult::err(format!("search request failed: {e}"))),
@@ -3186,8 +1637,6 @@ impl ToolManager {
             Err(e) => return Ok(ToolResult::err(format!("search body read failed: {e}"))),
         };
 
-        // DuckDuckGo HTML results: <a class="result__a" href="URL">title</a>
-        // and <a class="result__snippet" ...>snippet</a>.
         let mut results: Vec<(String, String, String)> = Vec::new();
         for chunk in html.split("result__a").skip(1) {
             if results.len() >= max_results {
@@ -3204,7 +1653,7 @@ impl ToolManager {
             let Some(title_end) = chunk.find("</a>") else {
                 continue;
             };
-            let title = strip_html(&chunk[..title_end]);
+            let title = helpers::strip_html(&chunk[..title_end]);
             let snippet = chunk
                 .find("result__snippet")
                 .and_then(|s| {
@@ -3212,7 +1661,7 @@ impl ToolManager {
                     let o = seg.find(">").map(|o| o + 1);
                     o.map(|o| seg[o..seg.len().min(o + 400)].to_string())
                 })
-                .map(|s| strip_html(&s))
+                .map(|s| helpers::strip_html(&s))
                 .unwrap_or_default();
             let url_clean = url.trim_start_matches("//").to_string();
             results.push((
@@ -3258,14 +1707,12 @@ impl ToolManager {
                     .as_ref()
                     .map(|d| discover_in_dir(d, tier))
                     .unwrap_or_default(),
-                SkillTier::Builtin => vec![], // built-ins are registered below
+                SkillTier::Builtin => vec![],
             };
             for skill in candidates {
-                // Higher tiers already inserted win; lower tiers don't overwrite.
                 by_name.entry(skill.name.clone()).or_insert(skill);
             }
         }
-        // Built-in skills ship as static data, always last in precedence.
         for def in BUILTIN_SKILLS {
             by_name
                 .entry(def.0.to_string())
@@ -3274,7 +1721,6 @@ impl ToolManager {
         by_name.into_values().collect()
     }
 
-    /// `list_skills` — the model's browseable catalog of available skills.
     fn do_list_skills(&self, args: &Value) -> Result<ToolResult> {
         let search = Self::opt_str_arg(args, "search")
             .map(|s| s.to_lowercase())
@@ -3321,16 +1767,12 @@ impl ToolManager {
         }
     }
 
-    /// `read_skill` — load a skill's SKILL.md body (+ bundled resources),
-    /// and optionally its `depends_on` chain so one call can compose a whole
-    /// workflow (e.g. database → backend → frontend → security → testing).
     fn do_read_skill(&self, args: &Value) -> Result<ToolResult> {
         let name = Self::str_arg(args, "name")?.to_lowercase();
         use crate::skills::{read_skill_resource, skill_resources};
         let include_resources = Self::opt_bool_arg(args, "include_resources").unwrap_or(true);
         let recursive = Self::opt_bool_arg(args, "recursive").unwrap_or(true);
         let all = self.all_skills();
-        // Resolve the skill plus its dependency closure (BFS, cycle-safe).
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         queue.push_back(name.clone());
@@ -3416,8 +1858,6 @@ impl ToolManager {
         Ok(ToolResult::ok(out))
     }
 
-    /// `read_document` — extract text from office/binaries so the model can
-    /// read specs, reports, spreadsheets and slide decks.
     fn do_read_document(&self, args: &Value) -> Result<ToolResult> {
         let path = Self::str_arg(args, "path")?;
         let max_chars = Self::usize_arg(args, "max_chars")
@@ -3445,9 +1885,6 @@ impl ToolManager {
         }
     }
 
-    /// `read_image` — expose a local image's bytes to a vision-capable model.
-    /// The binary data rides along on the ToolResult so the agent loop can
-    /// attach it as a multimodal image part on the next request.
     fn do_read_image(&self, args: &Value) -> Result<ToolResult> {
         use base64::Engine;
         use zeus_provider::ImagePart;
@@ -3467,8 +1904,7 @@ impl ToolManager {
                 )))
             }
         };
-        // Only raster formats are safe to hand to a vision model.
-        let mime = image_mime(&resolved);
+        let mime = helpers::image_mime(&resolved);
         let Some(mime) = mime else {
             return Ok(ToolResult::err(format!(
                 "{} is not a supported image format (png/jpg/jpeg/gif/webp/bmp)",
@@ -3490,9 +1926,6 @@ impl ToolManager {
         })
     }
 
-    /// `understand_repo` — deterministic project understanding + (optionally)
-    /// existing files relevant to a subject. No model call; the fingerprint
-    /// is cached on the agent and shared so repeated calls are cheap.
     fn do_understand_repo(&self, args: &Value) -> Result<ToolResult> {
         let topic = Self::str_arg(args, "topic").unwrap_or_default();
         let root = self.project_root();
@@ -3511,12 +1944,6 @@ impl ToolManager {
         Ok(ToolResult::ok(text))
     }
 
-    /// `rag_search` — keyword-based retrieval over the project's source
-    /// files. Reuses the persisted index at `.agent/rag_index.json` when it
-    /// is still fresh; otherwise chunks every source file (see
-    /// `zeus_rag::chunker`) in memory and ranks the chunks against `query`
-    /// with BM25-style term weighting. No model call, no disk writes, so it
-    /// is safe in Plan mode.
     fn do_rag_search(&self, args: &Value) -> Result<ToolResult> {
         let query = Self::opt_str_arg(args, "query")
             .unwrap_or_default()
@@ -3564,11 +1991,6 @@ impl ToolManager {
         )))
     }
 
-    /// `rag_index` — persist the RAG chunk index to `.agent/rag_index.json`
-    /// so subsequent `rag_search` calls reuse it instead of re-chunking the
-    /// whole project. Writes below `.agent/`, so it goes through the same
-    /// permission gate as every other mutating tool (and is deliberately NOT
-    /// in `is_read_only_tool`).
     fn do_rag_index<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
@@ -3578,16 +2000,13 @@ impl ToolManager {
         let root = self.workspace.project_root.clone();
         let path = zeus_rag::PersistedRagIndex::file_path(&root);
 
-        // Fast path: a fresh index that already satisfies the request needs
-        // no write and therefore no permission gate.
         let mut persisted = zeus_rag::PersistedRagIndex::load(&root);
         if !force {
             if let Some(p) = persisted.as_ref() {
                 if p.is_fresh() && (!embed || p.has_vectors()) {
                     return Ok(ToolResult::ok(format!(
                         "index already exists and is fresh: {} chunk(s) in {} file(s); pass force=true to rebuild",
-                        p.documents.len(),
-                        p.stamps.len()
+                        p.documents.len(), p.stamps.len()
                     )));
                 }
             }
@@ -3606,7 +2025,6 @@ impl ToolManager {
             return Ok(ToolResult::err(e.to_string()));
         }
 
-        // Stale index -> incremental refresh; force or no index -> full walk.
         let mut index = if let Some(mut p) = persisted.take() {
             if !force {
                 p.refresh(800, 80);
@@ -3615,6 +2033,7 @@ impl ToolManager {
         } else {
             zeus_rag::RagIndex::from_project(&root, 800, 80)
         };
+
         if index.is_empty() {
             return Ok(ToolResult::ok("no source files to index"));
         }
@@ -3646,12 +2065,6 @@ impl ToolManager {
         }
     }
 
-    /// Best-effort embedding of every chunk in the index. Bridges the async
-    /// `embed_all` into the synchronous tool dispatch by spawning on the
-    /// current tokio runtime and waiting on a channel; any failure (no
-    /// runtime, no provider, provider error) degrades to keyword-only and is
-    /// reported, never fatal. Returns the number of vectors set, or None when
-    /// no embedding could even be attempted.
     fn embed_index(&self, index: &mut zeus_rag::RagIndex) -> Option<usize> {
         let provider = self.embedder.as_ref()?;
         let model = self.embed_model.as_ref()?;
@@ -3691,6 +2104,7 @@ impl ToolManager {
             }
         }
     }
+
     fn do_memory(&self, args: &Value) -> Result<ToolResult> {
         let action = Self::str_arg(args, "action")?.to_ascii_lowercase();
         let root = self.project_root();
@@ -3725,13 +2139,16 @@ impl ToolManager {
         }
     }
 
-    /// `memory_write` — persist a long-term project memory note.
     fn do_memory_write<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         let name = Self::str_arg(args, "name")?;
         let content = Self::str_arg(args, "content")?.to_string();
+        let global = args
+            .get("global")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let path_name = match crate::project::safe_memory_name(name) {
             Some(safe) => safe,
             None => {
@@ -3740,32 +2157,42 @@ impl ToolManager {
                 ))
             }
         };
-        let rel = format!(".agent/memory/{path_name}.md");
-        match self.workspace.files.write(
-            Path::new(&rel),
-            &content,
-            WriteOptions::default(),
-            &mut *approver,
-        ) {
-            Ok(()) => Ok(ToolResult::ok(format!(
-                "wrote .agent/memory/{path_name}.md"
-            ))),
-            Err(e) => Ok(ToolResult::err(e.to_string())),
+        if global {
+            // Write to global memory at ~/.zeus/memory/
+            let dir = dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".zeus")
+                .join("memory");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join(format!("{path_name}.md"));
+            match std::fs::write(&path, &content) {
+                Ok(()) => Ok(ToolResult::ok(format!(
+                    "wrote global memory: {path_name}.md"
+                ))),
+                Err(e) => Ok(ToolResult::err(e.to_string())),
+            }
+        } else {
+            let rel = format!(".agent/memory/{path_name}.md");
+            match self.workspace.files.write(
+                Path::new(&rel),
+                &content,
+                WriteOptions::default(),
+                &mut *approver,
+            ) {
+                Ok(()) => Ok(ToolResult::ok(format!(
+                    "wrote .agent/memory/{path_name}.md"
+                ))),
+                Err(e) => Ok(ToolResult::err(e.to_string())),
+            }
         }
     }
 
-    /// Drive an attached Android device/emulator through `adb` — USB or
-    /// wireless. Individual operations (list/connect/install/launch/logcat/
-    /// screenshot/shell) are implemented in `DeviceEngine`; this layer parses
-    /// the tool arguments and formats the result for the model.
     fn do_device<F>(&self, args: &Value, approver: &mut F) -> Result<ToolResult>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
     {
         let action = Self::str_arg(args, "action")?.to_ascii_lowercase();
         let device = &self.device;
-        // A no-op enum check so unknown actions are rejected before any adb
-        // call (and before the permission prompt).
         if !matches!(
             action.as_str(),
             "devices"
@@ -3862,20 +2289,11 @@ impl ToolManager {
         };
 
         match result {
-            Ok(out) => Ok(device_result(out)),
+            Ok(out) => Ok(helpers::device_result(out)),
             Err(e) => Ok(ToolResult::err(format!(
                 "device action '{action}' failed: {e}"
             ))),
         }
-    }
-
-    fn u64_arg(args: &Value, key: &str) -> Result<u64> {
-        args.get(key)
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| AgentError::InvalidArguments {
-                tool: key.into(),
-                reason: format!("missing/invalid '{key}'"),
-            })
     }
 
     fn do_bg_list(&self) -> Result<ToolResult> {
@@ -3924,1877 +2342,6 @@ impl ToolManager {
         match self.background.resume(id) {
             Ok(()) => Ok(ToolResult::ok(format!("resumed background task {id}"))),
             Err(e) => Ok(ToolResult::err(e.to_string())),
-        }
-    }
-}
-
-/// Render a `GitOutput` (or the permission/spawn error that prevented one)
-/// as a `ToolResult` — a non-zero exit is a soft error visible to the model
-/// (so it can read `git`'s own message and react), not a hard `Err` that
-/// would abort the tool-call cycle. Matches the same convention already
-/// used for `bash` and every other tool here.
-fn git_result(result: zeus_fs::Result<GitOutput>) -> Result<ToolResult> {
-    match result {
-        Ok(out) => {
-            let text = format!(
-                "exit={:?}\n--- stdout ---\n{}--- stderr ---\n{}",
-                out.exit_code, out.stdout, out.stderr
-            );
-            if out.success {
-                Ok(ToolResult::ok(text))
-            } else {
-                Ok(ToolResult::err(text))
-            }
-        }
-        Err(e) => Ok(ToolResult::err(e.to_string())),
-    }
-}
-
-/// Same convention as `git_result`/`platform_result` for the adb-backed
-/// device engine. `DeviceOutput.success` is false when the command exits
-/// nonzero OR the capture itself failed (no device, timeout) — in both cases
-/// zeus must present it as an error so the model can react, not shrug.
-fn device_result(out: zeus_fs::DeviceOutput) -> ToolResult {
-    let artifact = out
-        .artifact
-        .as_ref()
-        .map(|p| format!("\nartifact: {}", p.display()))
-        .unwrap_or_default();
-    let text = format!(
-        "exit={:?}\n--- stdout ---\n{}--- stderr ---\n{}{}",
-        out.exit_code, out.stdout, out.stderr, artifact
-    );
-    if out.success {
-        ToolResult::ok(text)
-    } else {
-        ToolResult::err(text)
-    }
-}
-
-/// Detect the most likely test command for a project by looking at its
-/// manifests. Best-effort; the tool falls back to an explicit override when
-/// nothing matches.
-pub(crate) fn detect_test_command(root: &Path) -> Option<String> {
-    let dir = |name: &str| root.join(name);
-    // Ordered by likelihood/portability. `cargo test` and `go test ./...`
-    // are the two that never need an extra runner installed.
-    if dir("Cargo.toml").is_file() {
-        return Some("cargo test".into());
-    }
-    if dir("go.mod").is_file() {
-        return Some("go test ./...".into());
-    }
-    if dir("pyproject.toml").is_file() {
-        return Some("python -m pytest -q".into());
-    }
-    if dir("package.json").is_file() {
-        if dir("pnpm-lock.yaml").is_file() || dir("pnpm-workspace.yaml").is_file() {
-            return Some("pnpm test".into());
-        }
-        if dir("yarn.lock").is_file() {
-            return Some("yarn test".into());
-        }
-        return Some("npm test".into());
-    }
-    if dir("Makefile").is_file() {
-        return Some("make test".into());
-    }
-    if dir("Gemfile").is_file() {
-        return Some("bundle exec rspec".into());
-    }
-    None
-}
-
-/// Pull the handful of verdict lines (e.g. `test result: ok. 12 passed; 0
-/// failed`, `12 passed in 1.2s`, `Done in 1.1s`) out of raw runner output so
-/// the model gets a compact summary instead of a wall of dots.
-fn summarize_test_output(stdout: &str) -> String {
-    let mut seen: Vec<&str> = Vec::new();
-    for raw in stdout.lines() {
-        let line = raw.trim();
-        let interesting = line.starts_with("test result:")
-            || line.starts_with("ok ")
-            || line.starts_with("FAIL")
-            || (line.contains("passed") && line.contains("failed"))
-            || line.contains(" passed in ")
-            || line.contains("Tests:")
-            || line.contains("Test Suites:")
-            || line.contains("Error:")
-            || line.starts_with("no test data")
-            || line.starts_with("All tests passed");
-        if interesting && !seen.contains(&line) {
-            seen.push(line);
-        }
-        if seen.len() >= 8 {
-            break;
-        }
-    }
-    if seen.is_empty() {
-        "(no summary lines captured)".to_string()
-    } else {
-        seen.join("\n")
-    }
-}
-
-/// Launch the platform's default browser opener for `url`, launch-and-forget.
-/// Rejects non-`{http,https}://` (and scheme-less `host:port`) targets so a
-/// stray string can't be misinterpreted as a shell flag or command. `file://`
-/// is deliberately refused — the browser tool is for *web* URLs; a local file
-/// path belongs to the file tools, which carry their own permission gates.
-fn open_browser_url(url: &str) -> std::io::Result<()> {
-    let url = url.trim();
-    if !(url.starts_with("http://")
-        || url.starts_with("https://")
-        || url.starts_with("localhost:")
-        || url.starts_with("127.0.0.1:")
-        || {
-            // Bare hostname or `host:port` (no scheme) — must look like a URL,
-            // not a filesystem path. `C:/foo.txt`, `..\secret`, or `/etc/hosts`
-            // would otherwise pass the dot check and get handed to the platform
-            // opener as a path.
-            url.contains('.')
-                && !url.contains(' ')
-                && !url.starts_with('-')
-                && !url.contains(['/', '\\'])
-        })
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("'{url}' isn't a usable web URL — expect something like http://localhost:5173"),
-        ));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("start")
-            .arg("")
-            .arg(url)
-            .spawn()
-            .map(|_| ())?;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        #[cfg(target_os = "macos")]
-        let mut cmd = std::process::Command::new("open");
-        #[cfg(all(not(target_os = "macos"), target_os = "linux"))]
-        let mut cmd = std::process::Command::new("xdg-open");
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let mut cmd = std::process::Command::new("xdg-open");
-        cmd.arg(url).spawn().map(|_| ())?;
-    }
-    Ok(())
-}
-
-/// Map an image file extension to its MIME type; `None` for non-raster
-/// formats that a vision model cannot ingest.
-fn image_mime(path: &Path) -> Option<&'static str> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" | "jpe" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
-    }
-}
-
-/// Returns `Some(reason)` if `url` points at a loopback/private target that
-/// `web_fetch` should refuse to scrape (the fetch tool retrieves content for
-/// the model, so pointing it at the user's local services would leak them).
-/// Returns the refusal reason when `url` must be blocked. Refusals cover
-/// loopback, RFC1918 private ranges, link-local, and cloud-metadata hosts —
-/// both by literal name and by resolved IP — so `127.0.0.2`, `10.x`,
-/// `192.168.x`, `[::ffff:127.0.0.1]`, trailing-dot hostnames, and a hostname
-/// that merely *resolves to* an internal address are all refused, not just
-/// the exact strings a name-only check would catch.
-fn reject_web_target(url: &str) -> Option<String> {
-    use std::net::ToSocketAddrs;
-
-    let host = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim();
-    let host = host.rsplit('@').next().unwrap_or("").trim();
-    let host = host.trim_matches(|c| c == '[' || c == ']'); // IPv6 brackets
-    if host.is_empty() {
-        return Some("no host in url".into());
-    }
-    // A single trailing dot is valid DNS but wouldn't match the literal
-    // blocklist below — normalize it away before comparing.
-    let norm = host.trim_end_matches('.');
-    if norm.is_empty() {
-        return Some("'host' has no name".into());
-    }
-    for bad in [
-        "localhost",
-        "127.0.0.1",
-        "::1",
-        "0.0.0.0",
-        "169.254.169.254",
-        "metadata.google.internal",
-    ] {
-        if norm.eq_ignore_ascii_case(bad) {
-            return Some(format!(
-                "'{host}' resolves to the loopback/metadata services"
-            ));
-        }
-    }
-
-    // Literal-IP fast path first (no DNS), then resolve the hostname and
-    // check *every* resolved address — any internal address wins the block.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip(ip) {
-            return Some(format!("'{host}' is an internal address"));
-        }
-        return None;
-    }
-    // Unresolvable hosts (DNS failure) fall through — the fetch itself will
-    // fail naturally; don't fabricate a refusal for a name we can't look up.
-    if let Ok(addrs) = norm.to_socket_addrs() {
-        for addr in addrs {
-            let ip = addr.ip();
-            if is_blocked_ip(ip) {
-                return Some(format!("'{host}' resolves to internal address '{ip}'"));
-            }
-        }
-    }
-    None
-}
-
-/// True for addresses the agent must never be pointed at: loopback, RFC1918
-/// private space, link-local (incl. cloud metadata), unspecified/broadcast,
-/// and IPv4-mapped IPv6 forms of any of the above.
-fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unicast_link_local()
-                || v6.is_unique_local()
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
-        }
-    }
-}
-
-/// Gregorian leap-year rule (a year divisible by 400 is a leap year; other
-/// centuries are not). Kept as a small local helper so the clock tool doesn't
-/// depend on chrono's date-trait gymnastics.
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
-
-/// Public alias for the doc-extraction module to reuse.
-/// HTML → text with table structure preserved: cells become `a | b | c`
-/// rows (one per `<tr>`), block elements break lines, and script/style blocks
-/// are dropped. Used for HTML documents and epub chapters, where a flat tag
-/// strip would lose tabular data.
-pub(crate) fn strip_html_with_tables(html: &str) -> String {
-    // Drop <script>/<style> blocks verbatim first — the XML reader would
-    // choke on the `<`/`>` inside their bodies.
-    let mut clipped = String::with_capacity(html.len());
-    let mut rest = html;
-    loop {
-        let mut skip = None;
-        let mut best = rest.len();
-        for tag in ["<script", "<style"] {
-            if let Some(idx) = rest.find(tag) {
-                if idx < best {
-                    best = idx;
-                    skip = Some(tag);
-                }
-            }
-        }
-        let Some(open) = skip else { break };
-        clipped.push_str(&rest[..best]);
-        let tail = &rest[best..];
-        let close = if open == "<script" {
-            "</script"
-        } else {
-            "</style"
-        };
-        match tail.find(close) {
-            Some(end) => rest = &tail[end..],
-            None => break,
-        }
-    }
-    clipped.push_str(rest);
-
-    let mut out = String::new();
-    let mut reader = quick_xml::Reader::from_str(&clipped);
-    reader.config_mut().trim_text(true);
-    let mut in_table = 0usize;
-    let mut cell_started = false;
-    let mut cell_in_row = false;
-    loop {
-        use quick_xml::events::Event;
-        match reader.read_event() {
-            Ok(Event::Start(e)) => match e.name().as_ref() {
-                b"table" => {
-                    in_table += 1;
-                    out.push('\n');
-                }
-                b"tr" => {
-                    out.push('\n');
-                    cell_in_row = false;
-                }
-                b"td" | b"th" => {
-                    if in_table > 0 {
-                        if cell_in_row {
-                            out.push_str("| ");
-                        }
-                        cell_started = true;
-                    }
-                }
-                b"br" | b"p" | b"div" | b"li" | b"blockquote" | b"h1" | b"h2" | b"h3" | b"h4"
-                | b"h5" | b"h6"
-                    if in_table == 0 =>
-                {
-                    out.push('\n');
-                }
-                _ => {}
-            },
-            Ok(Event::Empty(e)) => {
-                if e.name().as_ref() == b"br" && in_table == 0 {
-                    out.push('\n');
-                }
-            }
-            Ok(Event::Text(e)) => {
-                if let Ok(decoded) = e.unescape() {
-                    let t = decoded.trim();
-                    if !t.is_empty() {
-                        out.push_str(t);
-                        if !cell_started {
-                            out.push(' ');
-                        }
-                    }
-                }
-            }
-            Ok(Event::End(e)) => match e.name().as_ref() {
-                b"table" => {
-                    in_table = in_table.saturating_sub(1);
-                    out.push('\n');
-                }
-                b"tr" => {
-                    out.push('\n');
-                    cell_in_row = false;
-                }
-                b"td" | b"th" => {
-                    if in_table > 0 {
-                        out.push(' ');
-                        cell_in_row = true;
-                        cell_started = false;
-                    }
-                }
-                b"p" | b"div" | b"li" | b"blockquote" | b"h1" | b"h2" | b"h3" | b"h4" | b"h5"
-                | b"h6"
-                    if in_table == 0 =>
-                {
-                    out.push('\n');
-                }
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            _ => {}
-        }
-    }
-    out.split('\n')
-        .map(|l| {
-            l.trim()
-                .trim_end_matches(" |")
-                .trim_end_matches('|')
-                .trim()
-                .to_string()
-        })
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Crude-but-effective HTML → text: drops scripts/styles/head, then tags,
-/// then decodes common entities and collapses whitespace. Good enough for
-/// scraping docs/pages into something the model can read.
-fn strip_html(html: &str) -> String {
-    let mut clipped: String = html.to_string();
-    for (open_tag, close_tag) in [("<script", "</script"), ("<style", "</style")] {
-        let mut buffer = String::with_capacity(clipped.len());
-        let mut rest = clipped.as_str();
-        while let Some(start) = rest.find(open_tag) {
-            buffer.push_str(&rest[..start]);
-            rest = &rest[start..];
-            match rest.find(close_tag) {
-                Some(end) => rest = &rest[end..],
-                None => break,
-            }
-        }
-        buffer.push_str(rest);
-        clipped = buffer;
-    }
-    let without_tags = clipped;
-    let mut text = String::with_capacity(without_tags.len());
-    for seg in without_tags.split('<') {
-        match seg.find('>') {
-            Some(idx) if !seg[..idx].trim().is_empty() => text.push('\n'),
-            _ => {}
-        }
-        if let Some(idx) = seg.find('>') {
-            text.push_str(&seg[idx + 1..]);
-        } else {
-            text.push_str(seg);
-        }
-    }
-    for (entity, ch) in [
-        ("&amp;", '&'),
-        ("&lt;", '<'),
-        ("&gt;", '>'),
-        ("&quot;", '"'),
-        ("&#39;", '\''),
-        ("&nbsp;", ' '),
-    ] {
-        text = text.replace(entity, &ch.to_string());
-    }
-    let text = text.replace('\r', "");
-    text.split('\n')
-        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Percent-encode a string for use inside a URL query value.
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use base64::Engine;
-    use chrono::Datelike;
-    use tempfile::TempDir;
-    use zeus_config::{AgentSettings, Config, GlobalPaths, ProvidersFile};
-    use zeus_provider::{
-        ChatRequest, ChatResponse, ChatStream, EmbeddingRequest, EmbeddingResponse, ModelInfo,
-        TokenCountRequest, TokenCountResponse, TokenUsage,
-    };
-
-    fn approve(_: &PermissionRequest) -> ApprovalDecision {
-        ApprovalDecision::Approved
-    }
-
-    fn tool_manager(root: &Path) -> ToolManager {
-        std::fs::create_dir_all(root).unwrap();
-        let config = Config {
-            global: GlobalPaths::from_root(root.join(".zeus-home")),
-            project: None,
-            settings: AgentSettings::default(),
-            providers: ProvidersFile::default(),
-            project_root: Some(root.to_path_buf()),
-        };
-        let workspace = Workspace::from_config(&config).unwrap();
-        let terminal = TerminalRunner::new(root.join(".agent/checkpoints"));
-        let background = BackgroundTaskRegistry::new(root.join(".agent/background"));
-        let hooks = crate::hooks::HookRunner::new(root.join(".agent/hooks"), root.to_path_buf());
-        ToolManager::new(
-            workspace,
-            terminal,
-            background,
-            hooks,
-            Vec::new(),
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-        )
-    }
-
-    fn tool_manager_with_mcp(root: &Path, mcp_clients: Vec<crate::mcp::McpClient>) -> ToolManager {
-        std::fs::create_dir_all(root).unwrap();
-        let config = Config {
-            global: GlobalPaths::from_root(root.join(".zeus-home")),
-            project: None,
-            settings: AgentSettings::default(),
-            providers: ProvidersFile::default(),
-            project_root: Some(root.to_path_buf()),
-        };
-        let workspace = Workspace::from_config(&config).unwrap();
-        let terminal = TerminalRunner::new(root.join(".agent/checkpoints"));
-        let background = BackgroundTaskRegistry::new(root.join(".agent/background"));
-        let hooks = crate::hooks::HookRunner::new(root.join(".agent/hooks"), root.to_path_buf());
-        ToolManager::new(
-            workspace,
-            terminal,
-            background,
-            hooks,
-            mcp_clients,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-        )
-    }
-
-    #[test]
-    fn platform_cli_for_maps_every_platform_tool_to_a_cli() {
-        // Every platform tool must map to the CLI it needs; a `None` here
-        // means `filter_platform_specs` would let a platform tool through
-        // unconditionally, silently defeating the whole point of the gate.
-        for spec in platform_tool_specs() {
-            assert!(
-                platform_cli_for(&spec.name).is_some(),
-                "platform tool '{}' has no CLI mapping — add it to `platform_cli_for`",
-                spec.name
-            );
-        }
-    }
-
-    #[test]
-    fn core_tools_survive_platform_filter_regardless_of_clis() {
-        // Core tools have no CLI mapping and must always be advertised, even
-        // when no platform CLI is present at all.
-        let present = HashSet::new();
-        let kept: Vec<String> = filter_platform_specs(core_tool_specs(), &present)
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
-        for name in ["read", "write", "edit", "bash", "git_status", "grep"] {
-            assert!(
-                kept.contains(&name.to_string()),
-                "core tool '{name}' was filtered"
-            );
-        }
-        assert_eq!(kept.len(), core_tool_specs().len());
-    }
-
-    #[test]
-    fn platform_tools_filtered_by_cli_presence() {
-        // No CLIs present -> no platform tools advertised.
-        let none = filter_platform_specs(platform_tool_specs(), &HashSet::new());
-        assert_eq!(
-            none.len(),
-            0,
-            "no CLIs present but {} platform tools advertised",
-            none.len()
-        );
-
-        // Only `gh` present -> gh tools survive, everything else is dropped.
-        let mut present = HashSet::new();
-        present.insert("gh".to_string());
-        let kept = filter_platform_specs(platform_tool_specs(), &present);
-        assert!(
-            kept.iter().all(|s| s.name.starts_with("gh_")),
-            "unexpected non-gh tool kept: {:?}",
-            kept.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
-        );
-        assert!(
-            kept.iter().any(|s| s.name == "gh_issue_list"),
-            "expected gh_issue_list to survive"
-        );
-        assert!(
-            !kept.iter().any(|s| s.name == "supabase_projects_list"),
-            "supabase tools advertised without supabase on PATH"
-        );
-    }
-
-    #[test]
-    fn all_tool_specs_omits_platform_tools_whose_cli_is_missing() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let specs = tm.all_tool_specs();
-
-        // Every advertised platform tool maps to a CLI that must exist on PATH
-        // in this test environment (this runs on the developer's machine, so
-        // which CLIs are present varies — the invariant is the important part).
-        let present = detect_platform_clis();
-        for spec in &specs {
-            if let Some(cli) = platform_cli_for(&spec.name) {
-                assert!(
-                    present.contains(cli),
-                    "advertised platform tool '{}' requires '{cli}' which is not on PATH",
-                    spec.name
-                );
-            }
-        }
-
-        // Core tools must still be advertised unconditionally.
-        for name in ["read", "write", "edit", "bash", "grep"] {
-            assert!(
-                specs.iter().any(|s| s.name == name),
-                "core tool '{name}' missing from all_tool_specs"
-            );
-        }
-    }
-
-    #[test]
-    fn write_then_read_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let r = tm
-            .dispatch_with_approver("write", r#"{"path":"a.txt","content":"hello"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error);
-        let r = tm
-            .dispatch_with_approver("read", r#"{"path":"a.txt"}"#, approve)
-            .unwrap();
-        assert!(r.content.contains("hello"));
-    }
-
-    #[test]
-    fn read_multiple_reads_batch_and_reports_missing() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
-        std::fs::write(root.join("b.txt"), "beta\n").unwrap();
-        let tm = tool_manager(&root);
-        let r = tm
-            .dispatch_with_approver(
-                "read_multiple",
-                r#"{"paths":["a.txt","b.txt","missing.txt"]}"#,
-                approve,
-            )
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        // Both present files returned as headed blocks.
-        assert!(r.content.contains("=== a.txt"), "{}", r.content);
-        assert!(r.content.contains("=== b.txt"), "{}", r.content);
-        assert!(r.content.contains("alpha"), "{}", r.content);
-        assert!(r.content.contains("beta"), "{}", r.content);
-        // Missing file is an inline error block, not a whole-call failure.
-        assert!(r.content.contains("--- missing.txt"), "{}", r.content);
-    }
-
-    #[test]
-    fn read_multiple_errors_on_empty_or_oversized_batch() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let empty = tm
-            .dispatch_with_approver("read_multiple", r#"{"paths":[]}"#, approve)
-            .unwrap();
-        assert!(empty.is_error, "{}", empty.content);
-        let many = format!(
-            r#"{{"paths":{}}}"#,
-            serde_json::to_string(&vec!["x"; 21]).unwrap()
-        );
-        let oversized = tm
-            .dispatch_with_approver("read_multiple", &many, approve)
-            .unwrap();
-        assert!(oversized.is_error, "{}", oversized.content);
-        assert!(oversized.content.contains("20"), "{}", oversized.content);
-    }
-
-    #[test]
-    fn mkdir_tool_creates_directory_scaffold() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let r = tm
-            .dispatch_with_approver("mkdir", r#"{"path":"src/components"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(root.join("src/components").is_dir());
-        // Idempotent on an existing directory.
-        let again = tm
-            .dispatch_with_approver("mkdir", r#"{"path":"src/components"}"#, approve)
-            .unwrap();
-        assert!(!again.is_error, "{}", again.content);
-    }
-
-    #[test]
-    fn listdir_tool_lists_flat_and_recursive() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        tm.dispatch_with_approver("mkdir", r#"{"path":"src/nested"}"#, approve)
-            .unwrap();
-        tm.dispatch_with_approver("write", r#"{"path":"src/a.js","content":"x"}"#, approve)
-            .unwrap();
-        tm.dispatch_with_approver(
-            "write",
-            r#"{"path":"src/nested/b.js","content":"y"}"#,
-            approve,
-        )
-        .unwrap();
-        let flat = tm
-            .dispatch_with_approver("listdir", r#"{"path":"src"}"#, approve)
-            .unwrap();
-        assert!(!flat.is_error, "{}", flat.content);
-        assert!(flat.content.contains("nested/"), "{}", flat.content);
-        assert!(flat.content.contains("a.js"), "{}", flat.content);
-        assert!(!flat.content.contains("b.js"), "{}", flat.content);
-        let tree = tm
-            .dispatch_with_approver("listdir", r#"{"path":"src","recursive":true}"#, approve)
-            .unwrap();
-        assert!(tree.content.contains("nested/"), "{}", tree.content);
-        assert!(tree.content.contains("b.js"), "{}", tree.content);
-    }
-
-    #[test]
-    fn listdir_read_only_but_mkdir_gated() {
-        assert!(is_read_only_tool("listdir"));
-        assert!(!is_read_only_tool("mkdir"));
-        // In Plan mode listdir stays allowed while mkdir is blocked.
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        let tm = tool_manager(&root);
-        tm.set_plan_mode(true);
-        let list = tm
-            .dispatch_with_approver("listdir", r#"{"path":"src"}"#, approve)
-            .unwrap();
-        assert!(!list.is_error, "{}", list.content);
-        let blocked = tm
-            .dispatch_with_approver("mkdir", r#"{"path":"src/new"}"#, approve)
-            .unwrap();
-        assert!(blocked.is_error, "{}", blocked.content);
-        assert!(!root.join("src/new").exists());
-    }
-
-    #[test]
-    fn verify_runs_explicit_command_and_reports_exit_code() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        // Explicit command that succeeds -> not an error.
-        let ok = tm
-            .dispatch_with_approver("verify", r#"{"command":"exit 0"}"#, approve)
-            .unwrap();
-        assert!(!ok.is_error, "{}", ok.content);
-        assert!(ok.content.contains("exit=Some(0)"), "{}", ok.content);
-        // Explicit command that fails -> surfaced as a failed ToolResult.
-        let fail = tm
-            .dispatch_with_approver("verify", r#"{"command":"exit 1"}"#, approve)
-            .unwrap();
-        assert!(fail.is_error, "{}", fail.content);
-        assert!(fail.content.contains("exit=Some(1)"), "{}", fail.content);
-    }
-
-    #[test]
-    fn verify_without_detection_and_without_command_errors() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        let tm = tool_manager(&root);
-        // No language detected, no explicit command -> helpful error, not a crash.
-        let r = tm.dispatch_with_approver("verify", "{}", approve).unwrap();
-        assert!(r.is_error, "{}", r.content);
-        assert!(
-            r.content.contains("couldn't detect") || r.content.contains("no build command"),
-            "{}",
-            r.content
-        );
-    }
-
-    #[test]
-    fn verify_not_in_read_only_tool_list() {
-        // verify spawns build processes like bash/test — must not run in
-        // read-only Plan mode.
-        assert!(!is_read_only_tool("verify"));
-        assert!(!is_read_only_tool("test"));
-        assert!(!is_read_only_tool("bash"));
-    }
-
-    #[test]
-    fn plan_mode_blocks_mutating_tools_but_allows_read_only() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        tm.dispatch_with_approver("write", r#"{"path":"a.txt","content":"hello"}"#, approve)
-            .unwrap();
-
-        tm.set_plan_mode(true);
-        assert!(tm.plan_mode());
-
-        let blocked = tm
-            .dispatch_with_approver("write", r#"{"path":"a.txt","content":"changed"}"#, approve)
-            .unwrap();
-        assert!(blocked.is_error);
-        assert!(blocked.content.contains("Plan mode"));
-        // The blocked call must not have actually touched the file.
-        assert_eq!(
-            std::fs::read_to_string(root.join("a.txt")).unwrap(),
-            "hello"
-        );
-
-        let read = tm
-            .dispatch_with_approver("read", r#"{"path":"a.txt"}"#, approve)
-            .unwrap();
-        assert!(!read.is_error);
-        assert!(read.content.contains("hello"));
-
-        tm.set_plan_mode(false);
-        let write_again = tm
-            .dispatch_with_approver("write", r#"{"path":"a.txt","content":"changed"}"#, approve)
-            .unwrap();
-        assert!(!write_again.is_error);
-    }
-
-    #[test]
-    fn unknown_tool_errors() {
-        // Calling an unknown tool is the model's own mistake, and
-        // recoverable — it comes back as a failed `ToolResult` (so the
-        // model sees the mistake and can retry) rather than a hard `Err`
-        // that would kill the whole turn with no chance to self-correct.
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let result = tm
-            .dispatch_with_approver("frobnicate", "{}", approve)
-            .unwrap();
-        assert!(result.is_error);
-        assert!(result.content.contains("frobnicate"));
-    }
-
-    #[test]
-    fn builtin_skills_are_listed_and_readable() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        // list_skills includes all shipped built-ins.
-        let listed = tm
-            .dispatch_with_approver("list_skills", "{}", approve)
-            .unwrap();
-        assert!(!listed.is_error, "{}", listed.content);
-        assert!(listed.content.contains("build-app"));
-        assert!(listed.content.contains("database"));
-        assert!(listed.content.contains("ui-design"));
-        // Search narrows the catalog.
-        let searched = tm
-            .dispatch_with_approver("list_skills", r#"{"search":"xlsx"}"#, approve)
-            .unwrap();
-        assert!(!searched.is_error);
-        assert!(searched.content.contains("document-reading"));
-        assert!(!searched.content.contains("build-app"));
-        // read_skill loads instructions.
-        let read = tm
-            .dispatch_with_approver("read_skill", r#"{"name":"git-workflows"}"#, approve)
-            .unwrap();
-        assert!(!read.is_error, "{}", read.content);
-        assert!(read.content.contains("Before committing"));
-        // Unknown skill errors.
-        let missing = tm
-            .dispatch_with_approver("read_skill", r#"{"name":"nope"}"#, approve)
-            .unwrap();
-        assert!(missing.is_error);
-    }
-
-    #[test]
-    fn read_skill_recursively_composes_depends_on_chain() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        // build-app composes project-orientation, database, api, frontend,
-        // security, qa-testing, documentation — a single read_skill call
-        // loads the whole chain.
-        let r = tm
-            .dispatch_with_approver(
-                "read_skill",
-                r#"{"name":"build-app","recursive":true}"#,
-                approve,
-            )
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("skill: build-app"));
-        assert!(r.content.contains("skill: database"));
-        assert!(r.content.contains("skill: api"));
-        assert!(r.content.contains("skill: frontend"));
-        assert!(r.content.contains("skill: security"));
-        assert!(r.content.contains("skill: qa-testing"));
-        assert!(r.content.contains("skill: documentation"));
-        assert!(r.content.contains("skill: project-orientation"));
-    }
-
-    #[test]
-    fn project_skill_shadows_builtin() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(root.join(".agent/skills/database")).unwrap();
-        std::fs::write(
-            root.join(".agent/skills/database/SKILL.md"),
-            "---\nname: database\ndescription: PROJECT-OVERRIDE\n---\n# Project DB rules",
-        )
-        .unwrap();
-        let tm = tool_manager(&root);
-        let read = tm
-            .dispatch_with_approver("read_skill", r#"{"name":"database"}"#, approve)
-            .unwrap();
-        assert!(!read.is_error);
-        assert!(!read.content.contains("Design schemas, SQL, and migrations"));
-        assert!(read.content.contains("Project DB rules"));
-        assert!(read.content.contains("skill: database (tier: project)"));
-    }
-
-    #[test]
-    fn read_document_extracts_text_and_errors_on_binary() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("notes.md"), "# Notes\n\nplain markdown text here").unwrap();
-        let tm = tool_manager(&root);
-
-        let r = tm
-            .dispatch_with_approver("read_document", r#"{"path":"notes.md"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("plain markdown text here"));
-
-        let missing = tm
-            .dispatch_with_approver("read_document", r#"{"path":"nope.pdf"}"#, approve)
-            .unwrap();
-        assert!(missing.is_error);
-    }
-
-    #[test]
-    fn read_image_attaches_base64_bytes() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        // 1x1 transparent PNG.
-        let png = base64::engine::general_purpose::STANDARD
-            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
-            .unwrap();
-        std::fs::write(root.join("pixel.png"), &png).unwrap();
-        let tm = tool_manager(&root);
-
-        let r = tm
-            .dispatch_with_approver("read_image", r#"{"path":"pixel.png"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert_eq!(r.images.len(), 1);
-        assert_eq!(r.images[0].mime_type, "image/png");
-        assert!(!r.images[0].data_base64.is_empty());
-
-        // Non-image / missing paths error cleanly.
-        let bad = tm
-            .dispatch_with_approver("read_image", r#"{"path":"pixel.txt"}"#, approve)
-            .unwrap();
-        assert!(bad.is_error);
-        let missing = tm
-            .dispatch_with_approver("read_image", r#"{"path":"absent.png"}"#, approve)
-            .unwrap();
-        assert!(missing.is_error);
-    }
-
-    #[test]
-    fn understand_repo_reports_stack_and_relevance() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(root.join("src/auth")).unwrap();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname=\"x\"\n[dependencies]\naxum=\"0.7\"\nsqlx=\"0.8\"\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
-        std::fs::write(root.join("src/auth/login.rs"), "pub fn login() {}").unwrap();
-        let tm = tool_manager(&root);
-
-        let r = tm
-            .dispatch_with_approver("understand_repo", r#"{"topic":"authentication"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("Repository understanding"));
-        assert!(r.content.contains("Axum"));
-        assert!(r.content.contains("authentication") || r.content.contains("auth"));
-
-        let no_topic = tm
-            .dispatch_with_approver("understand_repo", "{}", approve)
-            .unwrap();
-        assert!(!no_topic.is_error);
-        assert!(no_topic.content.contains("Rust"));
-    }
-
-    #[test]
-    fn rag_search_ranks_concept_chunks_above_the_rest() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src/retry.rs"),
-            "fn with_retry(action) { for attempt in 0..3 { /* reconnect */ } }",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src/ui.rs"),
-            "fn render_button(label) { draw(label) }",
-        )
-        .unwrap();
-        let tm = tool_manager(&root);
-
-        let r = tm
-            .dispatch_with_approver("rag_search", r#"{"query":"retry reconnect"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("retry.rs"), "{}", r.content);
-        assert!(r.content.contains("retry"), "{}", r.content);
-
-        // Empty query is a recoverable model mistake, not a hard error.
-        let empty = tm
-            .dispatch_with_approver("rag_search", r#"{"query":""}"#, approve)
-            .unwrap();
-        assert!(empty.is_error);
-        assert!(
-            empty.content.contains("must not be empty"),
-            "{}",
-            empty.content
-        );
-    }
-
-    #[test]
-    fn rag_search_is_read_only_so_plan_mode_can_use_it() {
-        assert!(is_read_only_tool("rag_search"));
-    }
-
-    #[test]
-    fn rag_index_builds_persistent_index_and_rag_search_reuses_it() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src/retry.rs"),
-            "fn with_retry(action) { for attempt in 0..3 { /* reconnect */ } }",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src/ui.rs"),
-            "fn render_button(label) { draw(label) }",
-        )
-        .unwrap();
-        let tm = tool_manager(&root);
-        let approve = |_p: &PermissionRequest| ApprovalDecision::Approved;
-
-        // rag_index is a mutating tool (writes .agent/rag_index.json) — it
-        // must NOT be read-only, otherwise Plan mode could build it.
-        assert!(!is_read_only_tool("rag_index"));
-
-        let idx = tm
-            .dispatch_with_approver("rag_index", "{}", approve)
-            .unwrap();
-        assert!(!idx.is_error, "{}", idx.content);
-        assert!(idx.content.contains("chunk"), "{}", idx.content);
-
-        let index_path = zeus_rag::PersistedRagIndex::file_path(&root);
-        assert!(index_path.exists());
-
-        // Second call without force reports the index is already fresh.
-        let again = tm
-            .dispatch_with_approver("rag_index", "{}", approve)
-            .unwrap();
-        assert!(!again.is_error, "{}", again.content);
-        assert!(
-            again.content.contains("already exists"),
-            "{}",
-            again.content
-        );
-
-        // rag_search still works and hits the same chunk.
-        let r = tm
-            .dispatch_with_approver("rag_search", r#"{"query":"retry reconnect"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("retry.rs"), "{}", r.content);
-
-        // Editing a source file makes the persisted index stale; a plain
-        // rag_index (no force) refreshes it incrementally: the changed file
-        // is re-chunked, the untouched file's chunk is preserved.
-        std::fs::write(
-            root.join("src/retry.rs"),
-            "fn with_retry(action) { for attempt in 0..5 { /* retried */ } }",
-        )
-        .unwrap();
-        let stale = zeus_rag::PersistedRagIndex::load(&root).unwrap();
-        assert!(!stale.is_fresh());
-        assert_eq!(stale.documents.len(), 2); // retry.rs + ui.rs
-        let refresh = tm
-            .dispatch_with_approver("rag_index", "{}", approve)
-            .unwrap();
-        assert!(!refresh.is_error, "{}", refresh.content);
-        let fresh = zeus_rag::PersistedRagIndex::load(&root).unwrap();
-        assert!(fresh.is_fresh());
-        assert_eq!(fresh.documents.len(), 2);
-        assert!(fresh.documents.iter().any(|c| c.text.contains("retried")));
-        assert!(fresh
-            .documents
-            .iter()
-            .any(|c| c.text.contains("render_button")));
-
-        // force=true rebuilds from scratch.
-        let rebuild = tm
-            .dispatch_with_approver("rag_index", r#"{"force":true}"#, approve)
-            .unwrap();
-        assert!(!rebuild.is_error, "{}", rebuild.content);
-        assert!(zeus_rag::PersistedRagIndex::load(&root).unwrap().is_fresh());
-    }
-
-    #[test]
-    fn rag_index_embed_degrades_gracefully_without_provider() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/retry.rs"), "fn with_retry() {}\n").unwrap();
-        // No embedder injected -> best-effort embedding must not fail the
-        // call; the index is simply built without vectors.
-        let tm = tool_manager(&root);
-        let approve = |_p: &PermissionRequest| ApprovalDecision::Approved;
-
-        let r = tm
-            .dispatch_with_approver("rag_index", r#"{"embed":true}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("keyword-only"), "{}", r.content);
-        let persisted = zeus_rag::PersistedRagIndex::load(&root).unwrap();
-        assert!(!persisted.has_vectors());
-    }
-
-    /// Deterministic in-memory provider whose embeddings map each chunk to a
-    /// stable one-hot vector — proves the sync bridge in `embed_index` sets
-    /// and persists vectors without a network.
-    struct EmbedMock {
-        dim: usize,
-    }
-
-    #[async_trait::async_trait]
-    impl ModelProvider for EmbedMock {
-        fn supports_prompt_cache(&self) -> bool {
-            false
-        }
-        fn id(&self) -> &str {
-            "embed-mock"
-        }
-        async fn chat(&self, _req: ChatRequest) -> zeus_provider::Result<ChatResponse> {
-            unreachable!("chat not used in rag embed test")
-        }
-        async fn stream(&self, _req: ChatRequest) -> zeus_provider::Result<ChatStream> {
-            unreachable!("stream not used in rag embed test")
-        }
-        async fn list_models(&self) -> zeus_provider::Result<Vec<ModelInfo>> {
-            Ok(Vec::new())
-        }
-        async fn embeddings(
-            &self,
-            req: EmbeddingRequest,
-        ) -> zeus_provider::Result<EmbeddingResponse> {
-            let vectors = req
-                .input
-                .iter()
-                .map(|text| {
-                    let mut v = vec![0.0f32; self.dim];
-                    let bucket = text
-                        .bytes()
-                        .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64))
-                        % self.dim as u64;
-                    v[bucket as usize] = 1.0;
-                    v
-                })
-                .collect();
-            Ok(EmbeddingResponse {
-                vectors,
-                usage: TokenUsage::new(0, 0),
-            })
-        }
-        async fn count_tokens(
-            &self,
-            _req: TokenCountRequest,
-        ) -> zeus_provider::Result<TokenCountResponse> {
-            Ok(TokenCountResponse {
-                tokens: 1,
-                approximate: true,
-            })
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn rag_index_embed_persists_vectors_and_search_uses_them() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src/retry.rs"),
-            "fn with_retry() { /* reconnect */ }\n",
-        )
-        .unwrap();
-        let mut tm = tool_manager(&root);
-        tm.embedder = Some(Arc::new(EmbedMock { dim: 8 }));
-        tm.embed_model = Some("mock".into());
-        let approve = |_p: &PermissionRequest| ApprovalDecision::Approved;
-
-        let r = tm
-            .dispatch_with_approver("rag_index", r#"{"embed":true}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("embedded 1 chunk(s)"), "{}", r.content);
-
-        let persisted = zeus_rag::PersistedRagIndex::load(&root).unwrap();
-        assert!(persisted.has_vectors());
-        assert_eq!(persisted.vectors.as_ref().unwrap().len(), 1);
-
-        // rag_search reuses the persisted vectors through the same path.
-        let s = tm
-            .dispatch_with_approver("rag_search", r#"{"query":"reconnect"}"#, approve)
-            .unwrap();
-        assert!(!s.is_error, "{}", s.content);
-        assert!(s.content.contains("retry.rs"), "{}", s.content);
-    }
-
-    #[test]
-    fn urlencode_encodes_query() {
-        assert_eq!(urlencode("offline sync"), "offline+sync");
-        assert_eq!(urlencode("a&b?"), "a%26b%3F");
-        assert_eq!(urlencode("rust"), "rust");
-    }
-
-    #[test]
-    fn web_search_rejects_empty_query() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        let tm = tool_manager(&root);
-        let r = tm
-            .dispatch_with_approver("web_search", r#"{"query":""}"#, approve)
-            .unwrap();
-        assert!(r.is_error);
-        assert!(r.content.contains("non-empty"));
-        // Missing `query` is the model's own mistake, and recoverable —
-        // it comes back as a failed `ToolResult` (so the model sees the
-        // mistake and can retry) rather than a hard dispatch error that
-        // would kill the whole turn with no chance to self-correct.
-        let missing = tm
-            .dispatch_with_approver("web_search", "{}", approve)
-            .unwrap();
-        assert!(
-            missing.is_error,
-            "missing `query` should surface as a failed tool result"
-        );
-    }
-
-    #[test]
-    fn web_search_is_read_only_tool() {
-        assert!(
-            is_read_only_tool("web_search"),
-            "web_search must run in plan mode"
-        );
-        assert!(is_read_only_tool("web_fetch"));
-        assert!(!is_read_only_tool("bash"));
-    }
-
-    #[test]
-    fn memory_tools_list_read_write() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        let tm = tool_manager(&root);
-        let approve = |_p: &PermissionRequest| ApprovalDecision::Approved;
-
-        let empty = tm
-            .dispatch_with_approver("memory", r#"{"action":"list"}"#, approve)
-            .unwrap();
-        assert!(!empty.is_error);
-        assert!(empty.content.contains("No long-term memory"));
-
-        let w = tm
-            .dispatch_with_approver(
-                "memory_write",
-                r#"{"name":"auth","content":"token-based auth"}"#,
-                approve,
-            )
-            .unwrap();
-        assert!(!w.is_error, "{}", w.content);
-        let path = root.join(".agent/memory/auth.md");
-        assert!(path.exists());
-
-        let list = tm
-            .dispatch_with_approver("memory", r#"{"action":"list"}"#, approve)
-            .unwrap();
-        assert!(list.content.contains("auth"));
-
-        let read = tm
-            .dispatch_with_approver("memory", r#"{"action":"read","name":"auth"}"#, approve)
-            .unwrap();
-        assert!(read.content.contains("token-based"));
-
-        let bad_name = tm
-            .dispatch_with_approver(
-                "memory_write",
-                r#"{"name":"BAD NAME","content":"x"}"#,
-                approve,
-            )
-            .unwrap();
-        assert!(bad_name.is_error);
-    }
-
-    #[test]
-    fn memory_tools_blocked_in_plan_mode() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        let tm = tool_manager(&root);
-        tm.set_plan_mode(true);
-        let approve = |_p: &PermissionRequest| ApprovalDecision::Approved;
-        let r = tm
-            .dispatch_with_approver("memory_write", r#"{"name":"x","content":"y"}"#, approve)
-            .unwrap();
-        assert!(r.is_error, "memory_write must be blocked in plan mode");
-    }
-
-    #[test]
-    fn code_intel_tools_round_trip() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join("lib.rs"),
-            "pub struct Foo {}\nimpl Foo { pub fn bar(&self) {} }\nfn use_it(f: &Foo) -> u32 { 0 }\n",
-        )
-        .unwrap();
-
-        let tm = tool_manager(&root);
-
-        // Build the index (force so a stale one can't short-circuit).
-        let r = tm
-            .dispatch_with_approver("code_index", r#"{"force":true}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("indexed"));
-
-        // Fresh run without force reports the cached index.
-        let r = tm
-            .dispatch_with_approver("code_index", "{}", approve)
-            .unwrap();
-        assert!(!r.is_error);
-        assert!(r.content.contains("already exists"));
-
-        // Symbols lookup.
-        let r = tm
-            .dispatch_with_approver("code_symbols", r#"{"name":"Foo"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error);
-        assert!(r.content.contains("Foo") && r.content.contains("lib.rs"));
-
-        // Refs (word-boundary) find all three occurrences.
-        let r = tm
-            .dispatch_with_approver("code_refs", r#"{"name":"Foo"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error);
-        assert!(r.content.contains("3 reference(s)"), "got: {}", r.content);
-    }
-
-    #[test]
-    fn code_graph_reports_callers_and_callees() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join("lib.rs"),
-            "fn main() {\n  helper();\n}\nfn helper() {\n  leaf();\n}\nfn leaf() {}\n",
-        )
-        .unwrap();
-
-        let tm = tool_manager(&root);
-        tm.dispatch_with_approver("code_index", r#"{"force":true}"#, approve)
-            .unwrap();
-
-        let r = tm
-            .dispatch_with_approver("code_graph", r#"{"name":"helper"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("caller(s) of 'helper'"));
-        assert!(r.content.contains("main -> helper"));
-        assert!(r.content.contains("calls 1 function(s)"));
-        assert!(r.content.contains("helper -> leaf"));
-
-        let r = tm
-            .dispatch_with_approver(
-                "code_graph",
-                r#"{"name":"helper","direction":"callers"}"#,
-                approve,
-            )
-            .unwrap();
-        assert!(!r.is_error);
-        assert!(r.content.contains("main -> helper"));
-        assert!(!r.content.contains("helper -> leaf"));
-
-        let r = tm
-            .dispatch_with_approver("code_graph", r#"{"name":"nope"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error);
-        assert!(r.content.contains("no callers of 'nope' found"));
-    }
-
-    #[test]
-    fn code_verbose_rename_reports_plan_only() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("lib.rs"), "fn alpha() { leap_alpha(); }\n").unwrap();
-
-        let tm = tool_manager(&root);
-        let r = tm
-            .dispatch_with_approver("code_rename", r#"{"old":"alpha","new":"omega"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error);
-        assert!(r.content.contains("rename 'alpha' -> 'omega'"));
-        assert!(r.content.contains("Plan only"));
-        // Rename must never write.
-        assert!(std::fs::read_to_string(root.join("lib.rs"))
-            .unwrap()
-            .contains("fn alpha()"));
-    }
-
-    #[test]
-    fn bash_runs_and_denies_destructive() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let r = tm
-            .dispatch_with_approver("bash", r#"{"command":"echo hi"}"#, approve)
-            .unwrap();
-        assert!(!r.is_error);
-        assert!(r.content.contains("hi"));
-
-        let r2 = tm
-            .dispatch_with_approver("bash", r#"{"command":"rm -rf /"}"#, approve)
-            .unwrap();
-        assert!(r2.is_error);
-    }
-
-    #[test]
-    fn bash_background_spawns_and_is_listed_and_stoppable() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let sleep_cmd = if cfg!(windows) {
-            "ping -n 30 127.0.0.1 >NUL"
-        } else {
-            "sleep 30"
-        };
-
-        let started = tm
-            .dispatch_with_approver(
-                "bash",
-                &format!(r#"{{"command":"{sleep_cmd}","background":true}}"#),
-                approve,
-            )
-            .unwrap();
-        assert!(!started.is_error);
-        assert!(started.content.contains("started background task"));
-
-        let listed = tm.dispatch_with_approver("bg_list", "{}", approve).unwrap();
-        assert!(listed.content.contains("status=Running"));
-
-        // Extract the id we were given and stop it via the tool, not the registry directly.
-        let id = tm.background().list().unwrap()[0].0.id;
-        let stopped = tm
-            .dispatch_with_approver("bg_stop", &format!(r#"{{"id":{id}}}"#), approve)
-            .unwrap();
-        assert!(!stopped.is_error);
-        assert!(tm.background().get(id).unwrap().is_none());
-    }
-
-    #[test]
-    fn mcp_tool_is_advertised_and_dispatchable_end_to_end() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        let script = crate::mcp::write_test_server(&root);
-        let client = crate::mcp::McpClient::connect(
-            "testsrv",
-            crate::mcp::python_cmd(),
-            &[script.display().to_string()],
-            &root,
-        )
-        .unwrap();
-        let tm = tool_manager_with_mcp(&root, vec![client]);
-
-        // Advertised to the model with the server-prefixed name.
-        let specs = tm.all_tool_specs();
-        assert!(specs.iter().any(|s| s.name == "mcp__testsrv__echo"));
-
-        // Dispatchable through the exact same path a real tool call takes.
-        let ok = tm
-            .dispatch_with_approver("mcp__testsrv__echo", r#"{"text":"hi"}"#, approve)
-            .unwrap();
-        assert!(!ok.is_error);
-        assert_eq!(ok.content, "echo: hi");
-
-        let failed = tm
-            .dispatch_with_approver("mcp__testsrv__echo", r#"{"fail":true}"#, approve)
-            .unwrap();
-        assert!(failed.is_error);
-        assert_eq!(failed.content, "deliberate failure");
-    }
-
-    #[test]
-    fn mcp_call_denied_is_not_run() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        let script = crate::mcp::write_test_server(&root);
-        let client = crate::mcp::McpClient::connect(
-            "testsrv",
-            crate::mcp::python_cmd(),
-            &[script.display().to_string()],
-            &root,
-        )
-        .unwrap();
-        let tm = tool_manager_with_mcp(&root, vec![client]);
-
-        let denied = tm
-            .dispatch_with_approver("mcp__testsrv__echo", r#"{"text":"hi"}"#, |_| {
-                ApprovalDecision::Denied
-            })
-            .unwrap();
-        assert!(denied.is_error);
-        assert!(denied.content.contains("denied"));
-    }
-
-    #[test]
-    fn every_tool_spec_has_a_handler() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        for spec in builtin_tool_specs() {
-            let result = tm
-                .dispatch_with_approver(&spec.name, "{}", approve)
-                .unwrap();
-            // `dispatch_with_approver` now soft-fails both InvalidArguments
-            // and UnknownTool into `Ok(ToolResult::err(...))` instead of
-            // returning `Err`, so `Err(AgentError::UnknownTool(_))` can no
-            // longer surface here at all — checking for it (the old form of
-            // this test) would pass unconditionally regardless of whether a
-            // spec has a real handler. Check the error text `dispatch_inner`
-            // actually produces for an unmatched name instead: missing
-            // required args on a *wired* tool surfaces as some other
-            // message ("missing/invalid '...'" etc.), never this one.
-            assert!(
-                !(result.is_error && result.content.starts_with("unknown tool:")),
-                "tool spec '{}' has no handler: {}",
-                spec.name,
-                result.content
-            );
-        }
-    }
-
-    #[test]
-    fn git_tools_work_end_to_end_through_the_full_dispatch_path() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        std::fs::create_dir_all(&root).unwrap();
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-
-        let tm = tool_manager(&root);
-
-        // Real file, staged and committed through the tool dispatch layer —
-        // not calling GitEngine directly — proving hooks/permission
-        // wrapping and JSON argument parsing all work together, not just
-        // the underlying engine in isolation.
-        std::fs::write(root.join("a.txt"), "hello").unwrap();
-        let add = tm
-            .dispatch_with_approver("git_add", r#"{"paths":["a.txt"]}"#, approve)
-            .unwrap();
-        assert!(!add.is_error, "git_add failed: {}", add.content);
-
-        let commit = tm
-            .dispatch_with_approver("git_commit", r#"{"message":"initial commit"}"#, approve)
-            .unwrap();
-        assert!(!commit.is_error, "git_commit failed: {}", commit.content);
-
-        let log = tm.dispatch_with_approver("git_log", "{}", approve).unwrap();
-        assert!(!log.is_error);
-        assert!(log.content.contains("initial commit"));
-
-        let status = tm
-            .dispatch_with_approver("git_status", "{}", approve)
-            .unwrap();
-        assert!(!status.is_error);
-
-        // Force-push must be denied even though the approver would allow —
-        // proves the built-in rule reaches all the way through the tool
-        // dispatch layer, not just the GitEngine unit tests.
-        let force_push = tm
-            .dispatch_with_approver("git_push", r#"{"force":true}"#, approve)
-            .unwrap();
-        assert!(force_push.is_error);
-
-        // Hard reset likewise denied end to end.
-        let hard_reset = tm
-            .dispatch_with_approver("git_reset", r#"{"mode":"hard"}"#, approve)
-            .unwrap();
-        assert!(hard_reset.is_error);
-    }
-
-    #[test]
-    fn detect_test_command_maps_manifests() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::write(root.join("Cargo.toml"), "").unwrap();
-        assert_eq!(detect_test_command(root).as_deref(), Some("cargo test"));
-
-        std::fs::remove_file(root.join("Cargo.toml")).unwrap();
-        std::fs::write(root.join("go.mod"), "").unwrap();
-        assert_eq!(detect_test_command(root).as_deref(), Some("go test ./..."));
-
-        std::fs::remove_file(root.join("go.mod")).unwrap();
-        std::fs::write(root.join("pyproject.toml"), "").unwrap();
-        assert_eq!(
-            detect_test_command(root).as_deref(),
-            Some("python -m pytest -q")
-        );
-
-        std::fs::remove_file(root.join("pyproject.toml")).unwrap();
-        std::fs::write(root.join("package.json"), "{}").unwrap();
-        assert_eq!(detect_test_command(root).as_deref(), Some("npm test"));
-
-        std::fs::write(root.join("pnpm-lock.yaml"), "").unwrap();
-        assert_eq!(detect_test_command(root).as_deref(), Some("pnpm test"));
-
-        std::fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
-        std::fs::write(root.join("yarn.lock"), "").unwrap();
-        assert_eq!(detect_test_command(root).as_deref(), Some("yarn test"));
-    }
-
-    #[test]
-    fn detect_test_command_none_when_no_manifest() {
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(detect_test_command(tmp.path()), None);
-    }
-
-    #[test]
-    fn summarize_test_output_picks_verdict_lines() {
-        let out = "\n  Compiling zeus v0.1.0\n\nrunning 4 tests\n..s....\n\ntest result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n\nrunning 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
-        let summary = summarize_test_output(out);
-        assert!(summary.contains("test result: ok"), "{summary}");
-        assert!(summary.contains("4 passed"), "{summary}");
-        assert!(!summary.contains("running 4"), "{summary}");
-    }
-
-    #[test]
-    fn test_tool_runs_with_explicit_command() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let cmd = if cfg!(windows) {
-            r#"powershell -NoProfile -Command "Write-Output 'test result: ok. 1 passed; 0 failed'""#
-        } else {
-            // Quoted so the `;` survives the shell as literal text instead of
-            // splitting into a second (bogus) command.
-            "echo \"test result: ok. 1 passed; 0 failed\""
-        };
-        let args = serde_json::json!({ "command": cmd });
-        let r = tm
-            .dispatch_with_approver("test", &args.to_string(), approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("1 passed"), "{}", r.content);
-    }
-
-    #[test]
-    fn test_tool_without_command_reports_detection_failure() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let r = tm.dispatch_with_approver("test", "{}", approve).unwrap();
-        assert!(r.is_error, "{}", r.content);
-        assert!(r.content.contains("auto-detect"), "{}", r.content);
-    }
-
-    #[test]
-    fn browser_rejects_bad_url_and_blocks_in_plan_mode() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-
-        // A path-ish target isn't a web URL and must not be handed as-is to
-        // the opener (argument-injection guard — never spawn in this test).
-        let bad = tm
-            .dispatch_with_approver("browser", r#"{"url":"C:/Windows/System32"}"#, approve)
-            .unwrap();
-        assert!(bad.is_error, "{}", bad.content);
-
-        // Plan mode blocks it even for a plausible http URL.
-        tm.set_plan_mode(true);
-        let blocked = tm
-            .dispatch_with_approver("browser", r#"{"url":"http://localhost:5173"}"#, approve)
-            .unwrap();
-        assert!(blocked.is_error, "{}", blocked.content);
-        assert!(blocked.content.contains("Plan mode"), "{}", blocked.content);
-        tm.set_plan_mode(false);
-    }
-
-    #[test]
-    fn browser_rejects_file_scheme_and_bare_paths() {
-        // `file://` must not be accepted: it would let the opener walk the
-        // local filesystem instead of a web URL.
-        assert!(open_browser_url("file:///C:/Windows/System32").is_err());
-        assert!(open_browser_url("file:///etc/hosts").is_err());
-        // A dot-containing filesystem path must not pass the bare-host branch.
-        assert!(open_browser_url("C:/Users/me/notes.txt").is_err());
-        assert!(open_browser_url("../secret/config.toml").is_err());
-        // Legitimate web targets still open.
-        assert!(open_browser_url("http://localhost:5173").is_ok());
-        assert!(open_browser_url("https://example.com").is_ok());
-        assert!(open_browser_url("localhost:5173").is_ok());
-    }
-
-    #[test]
-    fn web_fetch_rejects_internal_targets() {
-        for url in [
-            "http://localhost",
-            "http://localhost:8080/path",
-            "http://127.0.0.1",
-            "http://127.0.0.2",   // any loopback, not just .0.1
-            "http://10.0.0.1",    // RFC1918
-            "http://172.16.0.5",  // RFC1918
-            "http://192.168.1.1", // RFC1918
-            "http://169.254.169.254/latest/meta-data/", // cloud metadata
-            "http://[::1]",
-            "http://[::ffff:127.0.0.1]",
-            "http://[::ffff:10.0.0.1]",
-            "http://metadata.google.internal",
-            "http://localhost.", // trailing dot
-            "https://127.0.0.1:8443",
-            "https://0.0.0.0",
-        ] {
-            assert!(
-                reject_web_target(url).is_some(),
-                "expected '{url}' to be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn web_fetch_blocks_hostnames_that_resolve_to_loopback() {
-        // `localhost` normally resolves to 127.0.0.1/::1 — covered by the
-        // literal list too, but this exercises the DNS-resolution path via a
-        // name that isn't on the literal blocklist but resolves internally.
-        if let Some(reason) = reject_web_target("http://localhost.") {
-            assert!(reason.contains("localhost"), "{reason}");
-        }
-    }
-
-    #[test]
-    fn web_fetch_allows_public_targets() {
-        for url in [
-            "http://example.com",
-            "https://example.com/docs",
-            "https://api.github.com/repos/foo/bar",
-            "http://193.0.0.1", // public-range IP
-            "https://8.8.8.8",  // public DNS
-        ] {
-            assert!(
-                reject_web_target(url).is_none(),
-                "unexpected block of '{url}'"
-            );
-        }
-    }
-
-    #[test]
-    fn current_time_tool_returns_a_parseable_datetime() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("proj");
-        let tm = tool_manager(&root);
-        let r = tm
-            .dispatch_with_approver("current_time", "{}", approve)
-            .unwrap();
-        assert!(!r.is_error, "{}", r.content);
-        // Format is "<date> — <weekday>, <month> <day>, <year>" with a UTC
-        // offset line — at minimum it must carry the current year.
-        assert!(
-            r.content.contains(&chrono::Local::now().year().to_string()),
-            "expected current year in: {}",
-            r.content
-        );
-        assert!(r.content.contains("UTC offset"), "{}", r.content);
-
-        // Plan mode must still allow it (read-only clock read).
-        tm.set_plan_mode(true);
-        let in_plan = tm
-            .dispatch_with_approver("current_time", "{}", approve)
-            .unwrap();
-        assert!(!in_plan.is_error, "{}", in_plan.content);
-    }
-
-    #[test]
-    fn current_time_is_listed_as_read_only() {
-        assert!(is_read_only_tool("current_time"));
-    }
-
-    /// The `PLATFORM_TOOLS` registry is the single source of truth: every
-    /// spec advertised to the model must be in it (dispatchable), and
-    /// everything in it must be advertised — so adding a platform tool in
-    /// one table but not the other is a test failure, not silent drift.
-    #[test]
-    fn platform_tools_registry_matches_specs_and_dispatch() {
-        let specs = platform_tool_specs();
-        let spec_names: Vec<&str> = specs.iter().map(|t| t.name.as_str()).collect();
-
-        let registry: Vec<&str> = PLATFORM_TOOLS.to_vec();
-        let mut spec_sorted = spec_names.clone();
-        let mut registry_sorted = registry.clone();
-        spec_sorted.sort_unstable();
-        registry_sorted.sort_unstable();
-
-        assert_eq!(
-            spec_sorted, registry_sorted,
-            "PLATFORM_TOOLS registry and platform_tool_specs() disagree on the \
-             platform tool list — keep them identical"
-        );
-
-        // Every registered name must actually be handled by `do_platform`'s
-        // inner match (an unknown name there falls through to UnknownTool).
-        // We can't reach `do_platform`'s private arms from here without a
-        // full manager + real CLI, so this asserts the structural property
-        // we can: dispatch_inner routes every registered name to do_platform
-        // rather than UnknownTool.
-        for name in &registry {
-            let tmp = TempDir::new().unwrap();
-            let tm = tool_manager(tmp.path());
-            let r = tm.dispatch_with_approver(name, "{}", approve).unwrap();
-            // A real platform call will fail on a missing CLI/auth — that's
-            // fine. What must never happen is UnknownTool (no handler).
-            assert!(
-                !r.content.contains("unknown tool"),
-                "{name} not dispatched by do_platform"
-            );
         }
     }
 }

@@ -14,3 +14,8 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "rag_benchmarks"
+harness = false

@@ -1,4 +1,46 @@
 //! zeus — database-free AI coding agent CLI.
+//!
+//! This is the main entry point for the Zeus CLI tool. It provides a
+//! comprehensive AI coding assistant that can:
+//!
+//! - **Chat** with various LLM providers (Anthropic, OpenAI, Ollama, llama.cpp, etc.)
+//! - **Agent mode** with full tool access (file ops, git, bash, web, etc.)
+//! - **Plan mode** for read-only research and proposal generation
+//! - **Auto mode** for autonomous plan-then-execute workflows
+//! - **Session management** — save, list, show, export, prune, label sessions
+//! - **Background tasks** — run long-lived processes with log capture
+//! - **Provider management** — switch providers, set API keys, list models
+//! - **Code intelligence** — symbol indexing, call graphs, rename proposals
+//! - **RAG** — retrieval-augmented generation over project source files
+//!
+//! ## Architecture
+//!
+//! The CLI is organized as a Rust workspace with these crates:
+//!
+//! - `zeus-cli`: This crate — the binary, TUI, REPL, and CLI commands
+//! - `zeus-agent`: Agent loop, tools, terminal execution, skills
+//! - `zeus-provider`: LLM provider abstraction (Anthropic, OpenAI, Ollama, etc.)
+//! - `zeus-fs`: File operations, search, git engine, platform tools
+//! - `zeus-lang`: Language detection and project scaffolding
+//! - `zeus-rag`: Retrieval-augmented generation (BM25 keyword search)
+//! - `zeus-config`: Settings and configuration management
+//! - `zeus-logging`: Structured logging
+//!
+//! ## Entry Points
+//!
+//! - **No subcommand + real terminal**: Launches the full TUI (`tui::run`)
+//! - **`zeus chat`**: One-shot chat with streaming output
+//! - **`zeus agent`**: One-shot agent turn with tool access
+//! - **`zeus sessions`**: Session management subcommands
+//! - **`zeus config`**: Configuration management
+//! - **`zeus doctor`**: Provider health checks
+//! - **`zeus update`**: Self-update mechanism
+//!
+//! ## Provider Resolution
+//!
+//! The CLI auto-detects local providers (Ollama, llama.cpp, LM Studio) when
+//! the configured default is unreachable. It can also auto-download and launch
+//! llama.cpp servers for local GGUF models.
 
 mod catalog;
 mod clipboard;
@@ -1504,7 +1546,12 @@ fn system_prompt(_config: &Config) -> Message {
              output, git history) that you cannot produce from an actual tool call available to \
              you, say you need to run the relevant tool rather than fabricating the answer.\n\
              5. When you are not certain, say so plainly. It is always better to admit a gap or \
-             run a tool than to produce a confident but wrong answer.",
+             run a tool than to produce a confident but wrong answer.\n\
+             \n\
+             MEMORY: When you make or observe an important decision (architectural choice, \
+             convention adoption, bug root-cause, performance insight), use memory_write to \
+             persist it. Decisions about 'why X over Y' and project-specific gotchas are \
+             especially valuable. Set global=true for insights useful across projects.",
         today = current_date(),
         time_now = current_time(),
     ))

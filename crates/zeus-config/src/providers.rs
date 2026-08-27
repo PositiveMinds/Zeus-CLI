@@ -465,6 +465,187 @@ prompt_cache = false
                 prompt_cache: false,
             },
         );
+        // --- New providers ---
+        providers.insert(
+            "charm".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://api.charm.sh/v1".into()),
+                api_key_env: Some("CHARM_API_KEY".into()),
+                default_model: Some("hyper-1".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "vercel".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://ai-gateway.vercel.com/v1".into()),
+                api_key_env: Some("VERCEL_AI_GATEWAY_KEY".into()),
+                default_model: Some("gpt-4o-mini".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "minimax".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://api.minimax.chat/v1".into()),
+                api_key_env: Some("MINIMAX_API_KEY".into()),
+                default_model: Some("MiniMax-Text-01".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "synthetic".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://api.synthetic.dev/v1".into()),
+                api_key_env: Some("SYNTHETIC_API_KEY".into()),
+                default_model: Some("synthetic-default".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "huggingface".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://api-inference.huggingface.co/v1".into()),
+                api_key_env: Some("HF_API_KEY".into()),
+                default_model: Some("meta-llama/Llama-3.3-70B-Instruct".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "ionet".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://api.io.net/v1".into()),
+                api_key_env: Some("IONET_API_KEY".into()),
+                default_model: Some("meta-llama/Llama-3.3-70B-Instruct".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "alibaba-sg".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".into()),
+                api_key_env: Some("ALIBABA_SG_API_KEY".into()),
+                default_model: Some("qwen-max".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "alibaba-us".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".into()),
+                api_key_env: Some("ALIBABA_US_API_KEY".into()),
+                default_model: Some("qwen-max".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "avian".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://api.avian.io/v1".into()),
+                api_key_env: Some("AVIAN_API_KEY".into()),
+                default_model: Some("gpt-4o-mini".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "opencodezen-go".into(),
+            ProviderConfig {
+                kind: "opencodezen".into(),
+                base_url: Some("https://opencode.ai/zen/v1".into()),
+                api_key_env: Some("OPENCODE_GO_API_KEY".into()),
+                default_model: Some("deepseek-v4-flash-free".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: true,
+            },
+        );
+        providers.insert(
+            "vertexai".into(),
+            ProviderConfig {
+                kind: "vertexai".into(),
+                base_url: None,
+                api_key_env: Some("GOOGLE_APPLICATION_CREDENTIALS".into()),
+                default_model: Some("gemini-2.0-flash".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "bedrock".into(),
+            ProviderConfig {
+                kind: "bedrock".into(),
+                base_url: None,
+                api_key_env: Some("AWS_ACCESS_KEY_ID".into()),
+                default_model: Some("anthropic.claude-3-5-sonnet-20241022-v2:0".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "azure-openai".into(),
+            ProviderConfig {
+                kind: "azure-openai".into(),
+                base_url: None,
+                api_key_env: Some("AZURE_OPENAI_API_KEY".into()),
+                default_model: Some("gpt-4o".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "moonshot".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://api.moonshot.cn/v1".into()),
+                api_key_env: Some("MOONSHOT_API_KEY".into()),
+                default_model: Some("moonshot-v1-auto".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
+        providers.insert(
+            "zai".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: Some("https://api.z.ai/v1".into()),
+                api_key_env: Some("ZAI_API_KEY".into()),
+                default_model: Some("zai-default".into()),
+                headers: HashMap::new(),
+                embeddings: false,
+                prompt_cache: false,
+            },
+        );
         Self { providers }
     }
 }

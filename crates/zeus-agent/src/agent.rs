@@ -1,12 +1,43 @@
 //! The Agent Loop: message history ⇄ tool calls ⇄ tool results, cancellable.
 //!
-//! Cycle (matches the blueprint's "The Agent Loop" section):
-//! 1. Append user message.
-//! 2. Compact context if near the model's window (see `context`).
-//! 3. Stream the provider's response.
-//! 4. Resolve any tool calls through the Tool Manager (permission-gated).
-//! 5. Repeat until a final answer with no pending tool calls, or cancelled.
-//! 6. Persist conversation state at the turn boundary.
+//! This module implements the core agent loop that drives the AI coding assistant.
+//! It ties together the LLM provider, tool execution, context management, and
+//! session persistence into a runnable per-turn cycle.
+//!
+//! ## Architecture
+//!
+//! The `Agent` struct is the central orchestrator:
+//! - Receives user messages and manages conversation state
+//! - Delegates to `ToolManager` for file operations, git, bash, etc.
+//! - Handles context window management via `ContextManager`
+//! - Supports plan mode (read-only), auto mode (plan+execute), and build mode
+//! - Manages cancellation via a watch channel for graceful interruption
+//!
+//! ## Turn Lifecycle
+//!
+//! A typical turn follows this cycle (matches the blueprint's "The Agent Loop"):
+//!
+//! 1. **User message** is appended to conversation history
+//! 2. **Repository context** is computed (stack fingerprint, relevant modules)
+//! 3. **Context compaction** if near the model's window limit
+//! 4. **Provider streaming** — tokens stream in as the model responds
+//! 5. **Tool dispatch** — tool calls are permission-gated and executed
+//! 6. **Loop** until a final answer with no pending tool calls, or cancelled
+//! 7. **Session persistence** at the turn boundary
+//!
+//! ## Modes
+//!
+//! - **Build**: Normal operation — model can read, write, and execute
+//! - **Plan**: Read-only research/proposal mode — no mutating tool calls allowed
+//! - **Auto**: Plan-then-execute — each request is broken into steps and executed
+//!
+//! ## Orchestration
+//!
+//! The `orchestrate` method handles multi-step plan execution:
+//! - Produces an ordered list of subtasks via a planning call
+//! - Executes each subtask as its own tool-using turn
+//! - Supports resume-from-plan (continue an approved plan across sessions)
+//! - Bounded parallelism for consecutive read-only steps
 
 use crate::context::{CompactResult, ContextManager};
 use crate::error::{AgentError, Result};
@@ -203,6 +234,28 @@ pub struct PlanStep {
     /// Optional specialist-agent id (from `MVP_PERSONAS`) to steer this step;
     /// `None` means run it with the generic coding agent.
     pub persona: Option<String>,
+    /// Step ids that must complete before this step can start.
+    pub depends_on: Vec<usize>,
+}
+
+/// Result of executing a single plan step, returned by the orchestrator's
+/// step execution loop.
+#[derive(Debug, Clone)]
+pub struct StepResult {
+    /// The step that was executed.
+    pub step: PlanStep,
+    /// Whether the step completed successfully.
+    pub success: bool,
+    /// The final text output from this step.
+    pub final_text: String,
+    /// Tokens consumed by this step.
+    pub usage: TokenUsage,
+    /// Wall-clock duration in milliseconds.
+    pub elapsed_ms: u64,
+    /// If the step failed, a short error summary.
+    pub error: Option<String>,
+    /// If the step signals a plan revision is needed, the reason.
+    pub needs_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -369,6 +422,13 @@ impl Agent {
         self.provider = provider;
     }
 
+    /// Update the context window size. Called after a model switch when the
+    /// new model's context window is known, so compaction thresholds stay
+    /// accurate.
+    pub fn set_context_window(&mut self, window: u32) {
+        self.context.window = window;
+    }
+
     /// Current context usage for a `/context`-style status line: actual
     /// token count against the model's window, via the same
     /// `count_tokens` call the automatic compaction check uses.
@@ -532,11 +592,43 @@ impl Agent {
         }
         let fp = self.repo.as_ref().expect("repo seeded above");
         let probe = fp.probe(request);
-        let relevance = if probe.hits.is_empty() {
+        let mut relevance = if probe.hits.is_empty() {
             String::new()
         } else {
             probe.render()
         };
+        // Content-based probe for higher recall (M3).
+        let content_hits = crate::analyze::probe_content(&root, request);
+        if !content_hits.is_empty() && relevance.is_empty() {
+            relevance = format!(
+                "files containing relevant terms:\n{}",
+                content_hits
+                    .iter()
+                    .take(10)
+                    .map(|f| format!("- {f}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        } else if !content_hits.is_empty() {
+            // Add content hits that weren't already in filename hits.
+            let existing: std::collections::HashSet<_> =
+                probe.hits.iter().flat_map(|h| h.files.iter()).collect();
+            let new_hits: Vec<&String> = content_hits
+                .iter()
+                .filter(|f| !existing.contains(*f))
+                .collect();
+            if !new_hits.is_empty() {
+                relevance.push_str(&format!(
+                    "\nadditionally found in file contents:\n{}",
+                    new_hits
+                        .iter()
+                        .take(10)
+                        .map(|f| format!("- {f}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+        }
         let banner = fp.banner_lines().join("\n");
         if !relevance.is_empty() {
             on_event(AgentEvent::RepoRelevanceUpdated {
@@ -549,6 +641,10 @@ impl Agent {
             out.push_str("\n\n");
             out.push_str(&rules);
         }
+        // Warn about potentially stale generated docs (M5).
+        if crate::project::docs_are_stale(&root) {
+            out.push_str("\n\nNote: architecture.md/conventions.md may be stale (project changed since last /orient).\n");
+        }
         let memory = crate::project::memory_context(&root, request);
         if !memory.is_empty() {
             out.push_str("\n\n");
@@ -556,12 +652,21 @@ impl Agent {
         }
         if relevance.is_empty() {
             out.push_str(
-                "\n\nNo obviously-relevant existing modules matched this request by name. \
+                "\n\nNo obviously-relevant existing modules matched this request by name or content. \
                  Verify with grep/glob before writing new files; if nothing exists, build from scratch.",
             );
         } else {
             out.push_str("\n\n");
             out.push_str(&relevance);
+        }
+        // Include key file snippets for grounding (M6) — only for
+        // non-trivial requests to avoid bloating small talk.
+        if request.len() > 20 {
+            let snippets = fp.key_file_snippets(&root, 3, 30);
+            if !snippets.is_empty() {
+                out.push_str("\n\nKey file snippets:");
+                out.push_str(&snippets);
+            }
         }
         out
     }
@@ -660,6 +765,8 @@ impl Agent {
             written.conventions =
                 crate::project::write_generated_doc(&root, crate::project::CONVENTIONS_DOC, &body);
         }
+        // Clear the stale marker after regenerating docs (M5).
+        crate::project::clear_docs_stale(&root);
         on_event(AgentEvent::OrientationSaved { docs: written });
 
         Ok(turn)
@@ -911,8 +1018,9 @@ impl Agent {
                                 .map(|s| PlanStep {
                                     id: s.id,
                                     description: s.description.clone(),
-                                    rationale: String::new(),
+                                    rationale: s.rationale.clone(),
                                     persona: s.persona.clone(),
+                                    depends_on: s.depends_on.clone(),
                                 })
                                 .collect::<Vec<PlanStep>>();
                             Some((existing, pending))
@@ -1045,68 +1153,60 @@ impl Agent {
 
         let mut summaries: Vec<String> = Vec::new();
         let mut prior_content = String::new();
+        const MAX_STEP_RETRIES: u32 = 2;
 
-        // Safe, bounded parallelism: consecutive *read-only* steps (personas
-        // that only inspect) may run as independent headless provider calls —
-        // they never mutate the shared workspace or conversation, so there's
-        // no edit race. File-mutating steps stay on the sequential `drive_turn`
-        // loop below. `max_parallel_read_steps` caps how many run at once;
-        // `1` reproduces the old fully-sequential behaviour.
+        // Dependency-aware execution: steps are processed in order, but
+        // steps whose dependencies aren't met yet are skipped and retried
+        // later. Consecutive read-only steps with met dependencies are
+        // batched for parallel execution.
         let parallel = self.options.max_parallel_read_steps.max(1);
-        let mut idx = 0usize;
         let steps_slice: Vec<PlanStep> = steps;
-        while idx < steps_slice.len() {
+        let mut executed: Vec<usize> = Vec::new();
+        let mut safety_counter = 0usize;
+
+        loop {
             if *self.cancel_rx.borrow() {
                 let summary = self.cancel_orchestration(goal, &summaries, &mut on_event)?;
                 return Ok((summary, total_usage));
             }
-            // Sweep forward over the run of consecutive read-only steps.
-            let mut run_end = idx;
-            while run_end < steps_slice.len() && is_read_only_step(&steps_slice[run_end]) {
-                run_end += 1;
-            }
-            let read_run = if run_end > idx && parallel > 1 {
-                (idx, run_end)
-            } else {
-                // Not a run (or parallelism off) — fall through to sequential.
-                (0, 0)
+
+            // Find next executable step: not yet executed, dependencies met,
+            // and not skipped (all retries exhausted + failed).
+            let next = steps_slice
+                .iter()
+                .find(|s| !executed.contains(&s.id) && plan.dependencies_met(s.id));
+            let Some(step) = next else {
+                break; // All steps executed or blocked
             };
 
-            if read_run.1 == 0 {
-                // Sequential step (mutating, or parallelism disabled).
-                let step = steps_slice[idx].clone();
-                on_event(AgentEvent::PlanStepStarted { step: step.clone() });
-                let step_prompt = orchestration_step_prompt(goal, &summaries, &step);
-                let persona_injected = if let Some(id) = &step.persona {
-                    prepend_persona_prompt(&mut self.state, id)
-                } else {
-                    false
-                };
-                self.state.messages.push(Message::user(step_prompt));
-                let result = self.drive_turn(&mut on_event, &mut approver).await?;
-                if persona_injected {
-                    self.state.messages.remove(0);
-                }
-                add_usage(&mut total_usage, &result.usage);
-                if result.cancelled {
-                    let summary = self.cancel_orchestration(goal, &summaries, &mut on_event)?;
-                    return Ok((summary, total_usage));
-                }
-                prior_content = result.final_text.clone();
-                summaries.push(step_summary(&step, &result.final_text));
-                let done_id = step.id;
-                on_event(AgentEvent::PlanStepDone {
-                    step,
-                    summary: result.final_text,
-                });
-                plan.mark_done(done_id);
-                self.write_task_plan(&plan)?;
-                idx += 1;
+            // Safety: prevent infinite loop if somehow stuck.
+            safety_counter += 1;
+            if safety_counter > steps_slice.len() * (MAX_STEP_RETRIES as usize + 1) + 10 {
+                warn!("orchestration safety counter triggered, breaking");
+                break;
+            }
+
+            // Sweep forward over consecutive read-only steps with met
+            // dependencies for parallel batching.
+            let start_id = step.id;
+            let start_idx = steps_slice.iter().position(|s| s.id == start_id).unwrap();
+            let mut run_end = start_idx;
+            while run_end < steps_slice.len()
+                && is_read_only_step(&steps_slice[run_end])
+                && plan.dependencies_met(steps_slice[run_end].id)
+                && !executed.contains(&steps_slice[run_end].id)
+            {
+                run_end += 1;
+            }
+            let read_run = if run_end > start_idx + 1 && parallel > 1 {
+                Some((start_idx, run_end))
             } else {
-                // Run the read-only batch concurrently (bounded). All steps in
-                // the run share the same completed-so-far snapshot and only
-                // read files mentally, so their model calls are independent.
-                let (start, end) = (read_run.0, read_run.1);
+                None
+            };
+
+            if let Some((start, end)) = read_run {
+                // Run the read-only batch concurrently (bounded).
+                // Fresh snapshot after each batch (C4 fix).
                 let tools = &self.tools;
                 let opt_model = self.options.model.clone();
                 let opt_temperature = self.options.temperature;
@@ -1124,7 +1224,8 @@ impl Agent {
                         let cancel = cancel.clone();
                         let base_snapshot = base_snapshot.clone();
                         async move {
-                            run_headless_step(
+                            let start = std::time::Instant::now();
+                            let res = run_headless_step(
                                 tools,
                                 provider,
                                 HeadlessSpec {
@@ -1137,7 +1238,9 @@ impl Agent {
                                 &base_snapshot,
                                 cancel,
                             )
-                            .await
+                            .await;
+                            let elapsed = start.elapsed().as_millis() as u64;
+                            res.map(|(text, cancelled, usage)| (text, cancelled, usage, elapsed))
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1147,35 +1250,48 @@ impl Agent {
                 for (step, res) in steps_slice[start..end].iter().zip(results) {
                     on_event(AgentEvent::PlanStepStarted { step: step.clone() });
                     match res {
-                        Ok((final_text, cancelled, step_usage)) => {
+                        Ok((final_text, cancelled, step_usage, elapsed_ms)) => {
                             add_usage(&mut total_usage, &step_usage);
                             if cancelled {
-                                // Later steps in this same `join_all` batch
-                                // may have "succeeded" only because they
-                                // raced ahead before the cancel signal
-                                // landed — treat the whole batch as cut
-                                // short rather than reporting some of it
-                                // done, since there's no meaningful order
-                                // among concurrent steps to say which ones
-                                // "really" finished first.
                                 batch_cancelled = true;
                                 break;
                             }
                             prior_content = final_text.clone();
                             summaries.push(step_summary(step, &final_text));
                             plan.mark_done(step.id);
+                            // Record metrics (L12)
+                            if let Some(ts) = plan.steps.iter_mut().find(|s| s.id == step.id) {
+                                ts.metrics = Some(crate::plans::StepMetrics {
+                                    elapsed_ms,
+                                    total_tokens: step_usage.total_tokens,
+                                    success: true,
+                                    error: None,
+                                });
+                            }
                             on_event(AgentEvent::PlanStepDone {
                                 step: step.clone(),
                                 summary: final_text,
                             });
+                            executed.push(step.id);
                         }
                         Err(e) => {
                             summaries.push(step_summary(step, &format!("(step failed: {e})")));
-                            plan.mark_done(step.id);
+                            plan.mark_failed(
+                                step.id,
+                                &e.to_string(),
+                                crate::plans::StepMetrics {
+                                    success: false,
+                                    error: Some(e.to_string()),
+                                    ..Default::default()
+                                },
+                            );
                             on_event(AgentEvent::PlanStepDone {
                                 step: step.clone(),
                                 summary: format!("(step failed: {e})"),
                             });
+                            executed.push(step.id);
+                            // Cascade: if this step failed, skip dependents
+                            // (they'll be reported as skipped in the summary)
                         }
                     }
                 }
@@ -1184,7 +1300,103 @@ impl Agent {
                     return Ok((summary, total_usage));
                 }
                 self.write_task_plan(&plan)?;
-                idx = end;
+            } else {
+                // Sequential step (mutating, or parallelism disabled).
+                // With retry support (C1).
+                let step = step.clone();
+                let mut last_error: Option<String> = None;
+                let mut retry_count = 0u32;
+
+                loop {
+                    if *self.cancel_rx.borrow() {
+                        let summary = self.cancel_orchestration(goal, &summaries, &mut on_event)?;
+                        return Ok((summary, total_usage));
+                    }
+
+                    on_event(AgentEvent::PlanStepStarted { step: step.clone() });
+                    let step_prompt = orchestration_step_prompt(goal, &summaries, &step);
+                    let persona_injected = if let Some(id) = &step.persona {
+                        prepend_persona_prompt(&mut self.state, id)
+                    } else {
+                        false
+                    };
+                    self.state.messages.push(Message::user(step_prompt));
+                    let step_start = std::time::Instant::now();
+                    let result = self.drive_turn(&mut on_event, &mut approver).await?;
+                    let elapsed_ms = step_start.elapsed().as_millis() as u64;
+                    if persona_injected {
+                        self.state.messages.remove(0);
+                    }
+                    add_usage(&mut total_usage, &result.usage);
+
+                    if result.cancelled {
+                        let summary = self.cancel_orchestration(goal, &summaries, &mut on_event)?;
+                        return Ok((summary, total_usage));
+                    }
+
+                    // Check if the step wants a plan revision (M10).
+                    let needs_revision = result.final_text.contains("NEEDS_REVISION:");
+                    if needs_revision {
+                        let reason = result
+                            .final_text
+                            .split("NEEDS_REVISION:")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        on_event(AgentEvent::PlanStepDone {
+                            step: step.clone(),
+                            summary: format!("step requests plan revision: {reason}"),
+                        });
+                        // Record the revision request and stop execution.
+                        summaries.push(step_summary(&step, &format!("NEEDS_REVISION: {reason}")));
+                        executed.push(step.id);
+                        plan.mark_done(step.id);
+                        self.write_task_plan(&plan)?;
+                        // Break out of retry loop and main loop.
+                        // The caller will see the NEEDS_REVISION in the summary
+                        // and can re-plan.
+                        break;
+                    }
+
+                    // Check for tool-call failure that might be retryable.
+                    let step_failed = result.tool_calls > 0 && result.final_text.is_empty();
+                    if step_failed && retry_count < MAX_STEP_RETRIES {
+                        retry_count += 1;
+                        last_error = Some("empty response after tool calls".to_string());
+                        // Remove the failed step's prompt from messages
+                        // before retrying.
+                        self.state.messages.pop();
+                        on_event(AgentEvent::PlanStepDone {
+                            step: step.clone(),
+                            summary: format!("retrying ({retry_count}/{MAX_STEP_RETRIES})..."),
+                        });
+                        continue;
+                    }
+
+                    // Step completed (success or exhausted retries).
+                    prior_content = result.final_text.clone();
+                    summaries.push(step_summary(&step, &result.final_text));
+                    let done_id = step.id;
+                    on_event(AgentEvent::PlanStepDone {
+                        step: step.clone(),
+                        summary: result.final_text,
+                    });
+                    // Record metrics (L12).
+                    if let Some(ts) = plan.steps.iter_mut().find(|s| s.id == done_id) {
+                        ts.retry_count = retry_count;
+                        ts.metrics = Some(crate::plans::StepMetrics {
+                            elapsed_ms,
+                            total_tokens: result.usage.total_tokens,
+                            success: !step_failed,
+                            error: if step_failed { last_error } else { None },
+                        });
+                    }
+                    plan.mark_done(done_id);
+                    self.write_task_plan(&plan)?;
+                    executed.push(done_id);
+                    break;
+                }
             }
         }
 
@@ -1501,79 +1713,51 @@ impl Agent {
     /// scraped from prose. Falls back to a single step (the whole goal) if
     /// the response isn't parseable.
     async fn plan_task(&mut self, goal: &str) -> Result<(Vec<PlanStep>, TokenUsage)> {
-        let response = self
+        // Use streaming for responsiveness — the user sees progress during
+        // the planning call instead of a long pause.
+        let request = ChatRequest {
+            model: self.options.model.clone(),
+            messages: vec![
+                Message::system(
+                    "You are a planning agent. Break the user's goal into 2-6 concrete, \
+                     ordered subtasks that a coding agent with file and shell access can \
+                     execute one at a time. For each subtask give a short `description` of \
+                     the action, a short `rationale` explaining why this approach and its \
+                     trade-offs (1-2 sentences), and optionally a `depends_on` array of \
+                     step numbers (1-indexed) that must complete first. Respond with ONLY \
+                     a JSON array of objects, no prose, no markdown fences. Example: \
+                     [{\"description\": \"Read package.json\", \"rationale\": \"Confirms the \
+                     dependency list before editing.\", \"depends_on\": []}]",
+                ),
+                Message::user(goal),
+            ],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(1024),
+            cancel: Some(self.cancel_rx.clone()),
+        };
+
+        let mut stream = self
             .provider
-            .chat(ChatRequest {
-                model: self.options.model.clone(),
-                messages: vec![
-                    Message::system(
-                        "You are a planning agent. Break the user's goal into 2-6 concrete, \
-                         ordered subtasks that a coding agent with file and shell access can \
-                         execute one at a time. For each subtask give a short `description` of \
-                         the action and a short `rationale` explaining why this approach and \
-                         its trade-offs (1-2 sentences). Respond with ONLY a JSON array of \
-                         objects, no prose, no markdown fences. Example: \
-                         [{\"description\": \"Read package.json\", \"rationale\": \"Confirms the \
-                         dependency list before editing.\"}]",
-                    ),
-                    Message::user(goal),
-                ],
-                tools: Vec::new(),
-                temperature: None,
-                max_tokens: Some(1024),
-                cancel: Some(self.cancel_rx.clone()),
-            })
+            .stream(request)
             .await
             .map_err(AgentError::Provider)?;
-        let usage = response.usage.clone();
 
-        let text = response.message.content;
-        // Tolerate both the object form `[{description, rationale}]` and the
-        // older plain-string form `["read x"]`.
-        let parsed = serde_json::from_str::<Vec<serde_json::Value>>(text.trim())
-            .ok()
-            .filter(|v| !v.is_empty());
-        let fallback = || {
-            vec![PlanStep {
-                id: 1,
-                description: goal.to_string(),
-                rationale: String::new(),
-                persona: recommend_persona(goal).map(|p| p.id.to_string()),
-            }]
-        };
-        let steps = match parsed {
-            Some(items) => {
-                let steps: Vec<PlanStep> = items
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i, v)| {
-                        let description = v
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .map(str::to_string)
-                            .or_else(|| v.as_str().map(str::to_string));
-                        let description = description?;
-                        let rationale = v
-                            .get("rationale")
-                            .and_then(|r| r.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        Some(PlanStep {
-                            id: i + 1,
-                            description: description.clone(),
-                            rationale,
-                            persona: recommend_persona(&description).map(|p| p.id.to_string()),
-                        })
-                    })
-                    .collect();
-                if steps.is_empty() {
-                    fallback()
-                } else {
-                    steps
+        let mut text = String::new();
+        let mut usage = TokenUsage::default();
+        while let Some(ev) = stream.next().await {
+            match ev.map_err(AgentError::Provider)? {
+                StreamEvent::TextDelta { text: t } => text.push_str(&t),
+                StreamEvent::Done { usage: u, .. } => {
+                    usage = u;
                 }
+                _ => {}
             }
-            None => fallback(),
-        };
+        }
+
+        // Robust JSON extraction: try to find a JSON array even if wrapped
+        // in markdown fences or prefixed with prose.
+        let steps = parse_plan_json(&text, goal);
         Ok((steps, usage))
     }
 
@@ -2321,13 +2505,24 @@ impl Agent {
 /// Returns true if the persona was resolved and prepended (the caller then
 /// removes index 0 after the turn). Unknown ids are a no-op so a stale plan
 /// can't break execution.
+/// Inject a persona system prompt into the conversation. Unlike the old
+/// naive `insert(0, ...)`, this finds the correct insertion point: after
+/// any existing leading system messages (project survey, instructions, etc.)
+/// but before the first user message. This preserves the conversation
+/// structure that models expect.
 fn prepend_persona_prompt(state: &mut super::session::ConversationState, id: &str) -> bool {
     let Some(persona) = persona_by_id(id) else {
         return false;
     };
+    // Find the first non-system message to insert before it.
+    let insert_idx = state
+        .messages
+        .iter()
+        .position(|m| m.role != Role::System)
+        .unwrap_or(state.messages.len());
     state
         .messages
-        .insert(0, Message::system(persona.system_prompt()));
+        .insert(insert_idx, Message::system(persona.system_prompt()));
     true
 }
 
@@ -2600,6 +2795,96 @@ fn split_orientation_docs(text: &str) -> (Option<String>, Option<String>) {
         extract(text, "[ARCH]", "[/ARCH]"),
         extract(text, "[CONV]", "[/CONV]"),
     )
+}
+
+/// Robustly parse a plan JSON array from model output. Handles:
+/// - Clean JSON arrays: `[{...}, {...}]`
+/// - Markdown-fenced JSON: ` ```json\n[...]\n``` `
+/// - Prose-prefixed JSON: text before the `[`
+/// - Plain string arrays: `["step 1", "step 2"]`
+/// - Fallback: single step = the whole goal
+fn parse_plan_json(text: &str, goal: &str) -> Vec<PlanStep> {
+    let fallback = || {
+        vec![PlanStep {
+            id: 1,
+            description: goal.to_string(),
+            rationale: String::new(),
+            persona: recommend_persona(goal).map(|p| p.id.to_string()),
+            depends_on: Vec::new(),
+        }]
+    };
+
+    // Try to extract JSON from markdown fences first.
+    let json_text = extract_json_from_fences(text).unwrap_or_else(|| text.trim());
+
+    // Try parsing as JSON array.
+    let parsed = serde_json::from_str::<Vec<serde_json::Value>>(json_text)
+        .ok()
+        .filter(|v| !v.is_empty());
+
+    let items = match parsed {
+        Some(items) => items,
+        None => return fallback(),
+    };
+
+    let steps: Vec<PlanStep> = items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            let description = v
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string)
+                .or_else(|| v.as_str().map(str::to_string));
+            let description = description?;
+            let rationale = v
+                .get("rationale")
+                .and_then(|r| r.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let depends_on = v
+                .get("depends_on")
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(PlanStep {
+                id: i + 1,
+                description: description.clone(),
+                rationale,
+                persona: recommend_persona(&description).map(|p| p.id.to_string()),
+                depends_on,
+            })
+        })
+        .collect();
+
+    if steps.is_empty() {
+        fallback()
+    } else {
+        steps
+    }
+}
+
+/// Extract JSON content from markdown code fences.
+fn extract_json_from_fences(text: &str) -> Option<&str> {
+    let start_markers = ["```json", "```JSON", "```"];
+    for marker in &start_markers {
+        if let Some(start) = text.find(marker) {
+            let after_marker = start + marker.len();
+            // Skip optional newline after marker
+            let content_start = text[after_marker..]
+                .find('\n')
+                .map(|p| after_marker + p + 1)
+                .unwrap_or(after_marker);
+            if let Some(end) = text[content_start..].find("```") {
+                return Some(text[content_start..content_start + end].trim());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3325,6 +3610,7 @@ mod tests {
                 description: "old approach".into(),
                 rationale: "first".into(),
                 persona: None,
+                depends_on: Vec::new(),
             }],
             "",
             false,
@@ -3434,6 +3720,7 @@ mod tests {
             description: "read a.txt".into(),
             rationale: "grounding".into(),
             persona: None,
+            depends_on: Vec::new(),
         };
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (text, cancelled, _usage) = run_headless_step(
@@ -3490,12 +3777,20 @@ mod tests {
                     description: "first".into(),
                     persona: None,
                     done: true,
+                    rationale: String::new(),
+                    depends_on: Vec::new(),
+                    retry_count: 0,
+                    metrics: None,
                 },
                 crate::plans::TaskStep {
                     id: 2,
                     description: "second".into(),
                     persona: None,
                     done: false,
+                    rationale: String::new(),
+                    depends_on: Vec::new(),
+                    retry_count: 0,
+                    metrics: None,
                 },
             ],
             notes: String::new(),
@@ -3561,6 +3856,10 @@ mod tests {
                 description: "old stale step".into(),
                 persona: None,
                 done: false,
+                rationale: String::new(),
+                depends_on: Vec::new(),
+                retry_count: 0,
+                metrics: None,
             }],
             notes: String::new(),
         };

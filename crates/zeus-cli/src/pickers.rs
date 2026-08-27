@@ -193,8 +193,16 @@ pub(crate) fn group_models_by_family(
 /// see `apply_provider_picker_choice`/`persist_key_and_switch`'s auto-chain
 /// into the model picker), so opening this list needs no network probe at
 /// all and is instant regardless of how many providers are configured.
-pub(crate) const POPULAR_PROVIDERS: [&str; 4] =
-    ["opencodezen", "openrouter", "anthropic", "openai"];
+pub(crate) const POPULAR_PROVIDERS: [&str; 8] = [
+    "opencodezen",
+    "openrouter",
+    "anthropic",
+    "openai",
+    "gemini",
+    "groq",
+    "cerebras",
+    "deepseek",
+];
 
 /// A short, provider-specific descriptor shown next to its name — the
 /// reference product bakes in strings like "(Recommended)"/"(API key)"
@@ -202,9 +210,11 @@ pub(crate) const POPULAR_PROVIDERS: [&str; 4] =
 /// to their `kind`.
 pub(crate) fn provider_short_desc(name: &str, kind: &str) -> String {
     match name {
-        "opencodezen" => "(Recommended)".to_string(),
+        "opencodezen" | "opencodezen-go" => "(Recommended)".to_string(),
         "openrouter" | "anthropic" | "openai" | "deepseek" | "mistral" | "groq" | "together"
-        | "fireworks" => "(API key)".to_string(),
+        | "fireworks" | "charm" | "vercel" | "minimax" | "synthetic" | "huggingface" | "ionet"
+        | "alibaba-sg" | "alibaba-us" | "avian" | "vertexai" | "bedrock" | "azure-openai"
+        | "moonshot" | "zai" => "(API key)".to_string(),
         "ollama" | "lmstudio" | "llamacpp" => "(local)".to_string(),
         _ => format!("({kind})"),
     }

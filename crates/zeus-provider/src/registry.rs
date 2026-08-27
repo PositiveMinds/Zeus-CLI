@@ -1,9 +1,12 @@
 //! Build a concrete provider from config.
 
 use crate::anthropic::AnthropicProvider;
+use crate::azure_openai::AzureOpenAiProvider;
+use crate::bedrock::BedrockProvider;
 use crate::error::{ProviderError, Result};
 use crate::ollama::OllamaProvider;
 use crate::openai_compat::OpenAiCompatProvider;
+use crate::vertex_ai::VertexAiProvider;
 use crate::ModelProvider;
 use std::collections::HashMap;
 use std::env;
@@ -123,6 +126,71 @@ pub fn create_from_config(name: &str, cfg: &ProviderConfig) -> Result<ProviderHa
             };
             info!(provider = name, %base_url, "using anthropic provider");
             Ok(Arc::new(provider))
+        }
+        "azure-openai" => {
+            let base_url = cfg
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://YOUR_RESOURCE.openai.azure.com".to_string());
+            let key = resolve_api_key(cfg, name)?;
+            let mut p = AzureOpenAiProvider::new(name, &base_url);
+            if let Some(k) = key {
+                p = p.with_api_key(k);
+            }
+            // Allow configuring api-version and deployment via headers or extra config
+            if let Some(version) = cfg.headers.get("x-api-version") {
+                p = p.with_api_version(version);
+            }
+            if let Some(deployment) = cfg.headers.get("x-deployment") {
+                p = p.with_deployment(deployment);
+            }
+            p = p.with_headers(resolve_headers(cfg));
+            info!(provider = name, %base_url, "using Azure OpenAI provider");
+            Ok(Arc::new(p))
+        }
+        "vertexai" => {
+            let project_id = cfg
+                .headers
+                .get("x-gcp-project-id")
+                .cloned()
+                .or_else(|| env::var("GOOGLE_CLOUD_PROJECT").ok())
+                .unwrap_or_default();
+            let location = cfg
+                .headers
+                .get("x-gcp-location")
+                .cloned()
+                .or_else(|| env::var("GOOGLE_CLOUD_REGION").ok())
+                .unwrap_or_else(|| "us-central1".to_string());
+            let mut p = VertexAiProvider::new(name, &project_id, &location);
+            // Try to get access token from env
+            if let Ok(token) = env::var("VERTEX_AI_ACCESS_TOKEN") {
+                p = p.with_access_token(token);
+            }
+            p = p.with_headers(resolve_headers(cfg));
+            info!(provider = name, %project_id, %location, "using Vertex AI provider");
+            Ok(Arc::new(p))
+        }
+        "bedrock" => {
+            let region = cfg
+                .headers
+                .get("x-aws-region")
+                .cloned()
+                .or_else(|| env::var("AWS_REGION").ok())
+                .unwrap_or_else(|| "us-east-1".to_string());
+            let mut p = BedrockProvider::new(name, &region);
+            // Try to get credentials from env
+            if let Ok(key) = env::var("AWS_ACCESS_KEY_ID") {
+                p = p.with_access_key(key);
+            }
+            if let Ok(key) = env::var("AWS_SECRET_ACCESS_KEY") {
+                p = p.with_secret_key(key);
+            }
+            if let Ok(token) = env::var("AWS_SESSION_TOKEN") {
+                p = p.with_session_token(token);
+            }
+            p = p.with_headers(resolve_headers(cfg));
+            info!(provider = name, %region, "using AWS Bedrock provider");
+            Ok(Arc::new(p))
         }
         other => Err(ProviderError::UnsupportedKind(other.to_string())),
     }

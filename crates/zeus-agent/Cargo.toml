@@ -33,6 +33,9 @@ pdf-extract = "0.7"
 base64 = "0.22"
 portable-pty = "0.9.0"
 libloading = "0.9.0"
+dirs = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

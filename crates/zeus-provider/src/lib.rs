@@ -1,5 +1,14 @@
 //! Provider-agnostic LLM interface.
 //!
+//! This crate provides a unified abstraction over various LLM providers:
+//! - **Anthropic** (Claude models)
+//! - **OpenAI-compatible** (OpenAI, OpenRouter, custom endpoints)
+//! - **Ollama** (local model serving)
+//! - **llama.cpp** (local GGUF models via llama-server)
+//! - **Unconfigured** (placeholder when no provider is set up)
+//!
+//! ## Core Trait
+//!
 //! ```rust,ignore
 //! trait ModelProvider {
 //!     async fn chat();
@@ -10,8 +19,32 @@
 //!     fn supports_prompt_cache() -> bool;
 //! }
 //! ```
+//!
+//! ## Provider Selection
+//!
+//! - `create_provider(name, config)`: Create a provider by name
+//! - `create_default(name, config)`: Create with fallback logic
+//! - `detect_local_provider(config)`: Auto-detect running local servers
+//! - `is_provider_reachable(config, timeout)`: Check if provider is accessible
+//!
+//! ## Local Models
+//!
+//! - `scan_system_models()`: Find GGUF/safetensors files on disk
+//! - `resolve_local_model()`: Map model name to download entry
+//! - `download_hf_file()`: Resumable download from Hugging Face
+//! - `serve()`: Auto-download llama-server + model, start local server
+//!
+//! ## Error Handling
+//!
+//! All provider operations return `Result<T, ProviderError>`:
+//! - `Http { status, message }`: HTTP-level failures
+//! - `Stream(e)`: Streaming errors
+//! - `NoApiKey`: Missing API key configuration
+//! - `ModelNotFound`: Requested model not available
 
 mod anthropic;
+mod azure_openai;
+mod bedrock;
 mod detect;
 mod download;
 mod error;
@@ -24,6 +57,7 @@ mod registry;
 mod retry;
 mod types;
 mod unconfigured;
+mod vertex_ai;
 
 pub use anthropic::AnthropicProvider;
 pub use detect::{detect_local_provider, is_provider_reachable, is_reachable};

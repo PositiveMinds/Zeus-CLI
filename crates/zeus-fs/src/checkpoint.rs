@@ -210,6 +210,73 @@ impl CheckpointStore {
         Ok(restored)
     }
 
+    /// Restore a single file from its snapshot. Used by bulk_edit rollback.
+    pub fn restore_file(&self, path: &Path, project_root: &Path) -> Result<()> {
+        let rel = path
+            .strip_prefix(project_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // Search all turn directories for the most recent snapshot of this file.
+        if !self.root.exists() {
+            return Ok(());
+        }
+        let mut latest_snap: Option<FileSnapshot> = None;
+        for entry in std::fs::read_dir(&self.root).map_err(|e| FsError::io(&self.root, e))? {
+            let entry = entry.map_err(FsError::IoSimple)?;
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let snaps = self
+                .load_snapshots(&entry.file_name().to_string_lossy())
+                .unwrap_or_default();
+            for snap in snaps {
+                let snap_path = match &snap {
+                    FileSnapshot::Content { path, .. } => path.clone(),
+                    FileSnapshot::DidNotExist { path } => path.clone(),
+                    FileSnapshot::Renamed { to, .. } => to.clone(),
+                };
+                if snap_path == rel {
+                    latest_snap = Some(snap);
+                }
+            }
+        }
+
+        if let Some(snap) = latest_snap {
+            match &snap {
+                FileSnapshot::Content {
+                    path, content_b64, ..
+                } => {
+                    let full = project_root.join(path);
+                    if let Some(parent) = full.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| FsError::io(parent, e))?;
+                    }
+                    let bytes = base64_decode(content_b64).map_err(FsError::Checkpoint)?;
+                    std::fs::write(&full, bytes).map_err(|e| FsError::io(&full, e))?;
+                }
+                FileSnapshot::DidNotExist { path } => {
+                    let full = project_root.join(path);
+                    if full.exists() {
+                        std::fs::remove_file(&full).map_err(|e| FsError::io(&full, e))?;
+                    }
+                }
+                FileSnapshot::Renamed { from, to } => {
+                    let from_full = project_root.join(from);
+                    let to_full = project_root.join(to);
+                    if to_full.exists() {
+                        if let Some(parent) = from_full.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| FsError::io(parent, e))?;
+                        }
+                        std::fs::rename(&to_full, &from_full)
+                            .map_err(|e| FsError::io(&to_full, e))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn list_turns(&self) -> Result<Vec<CheckpointSummary>> {
         if !self.root.exists() {
             return Ok(Vec::new());

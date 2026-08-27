@@ -23,6 +23,136 @@ use ratatui::Frame;
 use zeus_agent::SessionSummary;
 use zeus_fs::{ApprovalDecision, PermissionRequest};
 
+/// Highlight file paths in a text string with cyan underlined styling.
+/// Recognizes common path patterns: relative paths (src/foo.rs), absolute
+/// paths (/usr/bin/foo), and paths with line numbers (src/foo.rs:42).
+fn highlight_file_paths(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        // Try to find a file path pattern
+        if let Some(idx) = find_path_start(remaining) {
+            // Add text before the path
+            if idx > 0 {
+                spans.push(Span::styled(
+                    remaining[..idx].to_string(),
+                    theme::text().add_modifier(Modifier::BOLD),
+                ));
+            }
+            remaining = &remaining[idx..];
+
+            // Extract the path
+            let path_len = extract_path_len(remaining);
+            let path = &remaining[..path_len];
+
+            // Highlight the path
+            spans.push(Span::styled(
+                path.to_string(),
+                theme::cyan().add_modifier(Modifier::UNDERLINED),
+            ));
+
+            remaining = &remaining[path_len..];
+        } else {
+            // No more paths, add the rest
+            spans.push(Span::styled(
+                remaining.to_string(),
+                theme::text().add_modifier(Modifier::BOLD),
+            ));
+            break;
+        }
+    }
+
+    spans
+}
+
+/// Find the start index of a potential file path in the text.
+fn find_path_start(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    for i in 0..bytes.len() {
+        // Look for path-like patterns:
+        // - Starts with a letter, digit, dot, or slash
+        // - Contains a slash (Unix path) or backslash (Windows path)
+        // - Has a file extension or is a directory pattern
+        if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.' || bytes[i] == b'/' {
+            // Check if this looks like the start of a path
+            if looks_like_path_start(&text[i..]) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Check if text at current position looks like the start of a file path.
+fn looks_like_path_start(text: &str) -> bool {
+    // Must contain a slash or backslash to be a path
+    if !text.contains('/') && !text.contains('\\') {
+        return false;
+    }
+
+    // Check for common path indicators
+    let lower = text.to_lowercase();
+    lower.starts_with("src/")
+        || lower.starts_with("./")
+        || lower.starts_with("../")
+        || lower.starts_with("/")
+        || lower.contains(".rs")
+        || lower.contains(".py")
+        || lower.contains(".js")
+        || lower.contains(".ts")
+        || lower.contains(".go")
+        || lower.contains(".java")
+        || lower.contains(".c")
+        || lower.contains(".cpp")
+        || lower.contains(".h")
+        || lower.contains(".md")
+        || lower.contains(".toml")
+        || lower.contains(".json")
+        || lower.contains(".yaml")
+        || lower.contains(".yml")
+}
+
+/// Extract the length of a file path starting at the current position.
+fn extract_path_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut len = 0;
+
+    // Path characters: alphanumeric, dot, slash, backslash, dash, underscore, tilde
+    while len < bytes.len() {
+        let c = bytes[len];
+        if c.is_ascii_alphanumeric()
+            || c == b'.'
+            || c == b'/'
+            || c == b'\\'
+            || c == b'-'
+            || c == b'_'
+            || c == b'~'
+            || c == b':'
+        {
+            // Stop at space or punctuation that's not part of a path
+            if c == b' ' || c == b',' || c == b';' || c == b')' || c == b']' || c == b'>' {
+                break;
+            }
+            len += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Trim trailing punctuation that might not be part of the path
+    while len > 0
+        && matches!(
+            bytes[len - 1],
+            b'.' | b',' | b';' | b':' | b')' | b']' | b'>'
+        )
+    {
+        len -= 1;
+    }
+
+    len
+}
+
 /// A pending permission ask, bridged out of the spawned turn task. The reply
 /// is a oneshot so a modal ask can be answered at most once; dropping the
 /// sender (turn cancelled, app closing) resolves the waiting approver as a
@@ -141,6 +271,22 @@ pub(crate) fn provider_blurb(name: &str) -> (&'static str, Option<&'static str>)
         "cerebras" => ("Extremely fast inference on open models, via Cerebras hardware.", Some("https://cloud.cerebras.ai")),
         "deepinfra" => ("A wide catalog of open models hosted by DeepInfra.", Some("https://deepinfra.com/dash/api_keys")),
         "novita" => ("A wide catalog of open models hosted by Novita AI.", Some("https://novita.ai/settings/key-management")),
+        // New providers
+        "charm" => ("Charm Hyper — fast, affordable AI inference.", Some("https://charm.sh")),
+        "vercel" => ("Vercel AI Gateway — unified access to multiple providers.", Some("https://vercel.com/docs/ai-gateway")),
+        "minimax" => ("MiniMax — powerful multimodal AI models.", Some("https://api.minimax.chat")),
+        "synthetic" => ("Synthetic — AI inference platform.", Some("https://synthetic.dev")),
+        "huggingface" => ("Hugging Face Inference — access thousands of open models.", Some("https://huggingface.co/settings/tokens")),
+        "ionet" => ("io.net — decentralized GPU network for AI inference.", Some("https://io.net")),
+        "alibaba-sg" => ("Alibaba Cloud (Singapore) — Qwen models via DashScope.", Some("https://dashscope.console.aliyun.com")),
+        "alibaba-us" => ("Alibaba Cloud (United States) — Qwen models via DashScope.", Some("https://dashscope.console.aliyun.com")),
+        "avian" => ("Avian — AI inference platform.", Some("https://avian.io")),
+        "opencodezen-go" => ("OpenCode Zen & Go — curated coding models.", Some("https://opencode.ai/zen")),
+        "vertexai" => ("Google Cloud Vertex AI — Gemini models on GCP.", Some("https://console.cloud.google.com/vertex-ai")),
+        "bedrock" => ("Amazon Bedrock — Claude and other models on AWS.", Some("https://console.aws.amazon.com/bedrock")),
+        "azure-openai" => ("Azure OpenAI — GPT models on Microsoft Azure.", Some("https://portal.azure.com")),
+        "moonshot" => ("Moonshot AI — Kimi models.", Some("https://platform.moonshot.cn")),
+        "zai" => ("Z.ai — AI inference platform.", Some("https://z.ai")),
         _ => ("Paste your API key below to connect this provider.", None),
     }
 }
@@ -325,7 +471,10 @@ pub(crate) fn render_session_picker(
     let items: Vec<ListItem> = filtered
         .iter()
         .map(|s| {
-            let preview = if s.last_user.is_empty() {
+            // Show label if set, otherwise show the last user message as preview
+            let preview = if let Some(label) = &s.label {
+                label.clone()
+            } else if s.last_user.is_empty() {
                 "(no user message yet)".to_string()
             } else {
                 s.last_user.clone()
@@ -333,8 +482,13 @@ pub(crate) fn render_session_picker(
             let head = format!("{}  {} msg  ", s.id, s.message_count);
             let room = inner_w.saturating_sub(char_count(&head));
             let preview: String = preview.chars().take(room).collect();
+            let id_style = if s.label.is_some() {
+                theme::text().add_modifier(Modifier::BOLD | Modifier::ITALIC)
+            } else {
+                theme::text().add_modifier(Modifier::BOLD)
+            };
             ListItem::new(Line::from(vec![
-                Span::styled(s.id.clone(), theme::text().add_modifier(Modifier::BOLD)),
+                Span::styled(s.id.clone(), id_style),
                 Span::styled(format!("  {} msg  ", s.message_count), theme::dim()),
                 Span::styled(preview, theme::faint()),
             ]))
@@ -352,7 +506,8 @@ pub(crate) fn render_session_picker(
 /// files into the composer as quoted paths. Directories render with a
 /// trailing `/` and bold; Enter descends or inserts, ←/Backspace goes up,
 /// ctrl+h toggles hidden files. Files already staged in `.agent/uploads/`
-/// carry a `✓`; file sizes appear right-aligned.
+/// carry a `✓`; file sizes appear right-aligned. Type-to-filter narrows
+/// entries by name (case-insensitive substring).
 pub(crate) fn render_file_picker(
     f: &mut Frame,
     area: Rect,
@@ -360,11 +515,12 @@ pub(crate) fn render_file_picker(
     entries: &[FileEntry],
     selected: usize,
     show_hidden: bool,
+    search: &str,
 ) -> Rect {
     let width = area.width.saturating_sub(6).clamp(48, 96);
-    let height = (entries.len() as u16 + 6)
+    let height = (entries.len() as u16 + 7)
         .min(PICKER_MAX_H)
-        .clamp(10, area.height.saturating_sub(4).max(10));
+        .clamp(11, area.height.saturating_sub(4).max(11));
     let popup = centered_rect(width, height, area);
 
     let inner = Popup::new(popup)
@@ -378,14 +534,34 @@ pub(crate) fn render_file_picker(
         ]))
         .bottom(
             Line::from(Span::styled(
-                " ↑/↓ move · enter open dir / insert file · ← back · ctrl+h hidden · esc close ",
+                " type to filter · ↑/↓ move · enter open dir / insert file · ← back · ctrl+h hidden · esc close ",
                 theme::dim(),
             ))
             .alignment(Alignment::Center),
         )
         .render(f);
 
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+    // Search bar
+    let search_line = if search.is_empty() {
+        Line::from(vec![
+            Span::styled("▸ ", theme::violet()),
+            Span::styled("Type to filter files…", placeholder_style()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("▸ ", theme::violet()),
+            Span::styled(search.to_string(), theme::text()),
+            Span::styled(format!("  ({} matches)", entries.len()), theme::dim()),
+        ])
+    };
+    f.render_widget(Paragraph::new(search_line), rows[0]);
+
     let head = Line::from(vec![
         Span::styled("▸ ", theme::violet()),
         Span::styled(
@@ -400,9 +576,9 @@ pub(crate) fn render_file_picker(
             theme::dim(),
         ),
     ]);
-    f.render_widget(Paragraph::new(head), rows[0]);
+    f.render_widget(Paragraph::new(head), rows[1]);
 
-    let list_area = rows[1];
+    let list_area = rows[2];
     let name_width = (list_area.width as usize).saturating_sub(10).max(6);
     let items: Vec<ListItem> = entries
         .iter()
@@ -651,13 +827,9 @@ pub(crate) fn render_approval_modal(
         Constraint::Min(0),
     ])
     .split(inner);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("Allow {}?", req.description),
-            theme::text().add_modifier(Modifier::BOLD),
-        ))),
-        rows[0],
-    );
+    // Highlight file paths in the description with cyan underlined text
+    let desc_spans = highlight_file_paths(&format!("Allow {}?", req.description));
+    f.render_widget(Paragraph::new(Line::from(desc_spans)), rows[0]);
 
     // Clamp the counter the key handler nudged to the real line count, then
     // show a scrolled window of the preview (↑/↓, pgup/pgdn) instead of only
@@ -881,7 +1053,7 @@ pub(crate) fn render_model_picker(
                     cost_per_million_tokens(provider, &model.id)
                 {
                     meta_parts.push(format!(
-                        "${}/${}",
+                        "${}/{}",
                         fmt_price(prompt_rate),
                         fmt_price(completion_rate)
                     ));

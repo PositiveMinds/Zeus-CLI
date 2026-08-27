@@ -27,7 +27,7 @@ mod terminal;
 mod tools;
 mod workflows;
 
-pub use agent::{Agent, AgentEvent, AgentOptions, ContextUsage, PlanStep, TurnResult};
+pub use agent::{Agent, AgentEvent, AgentOptions, ContextUsage, PlanStep, StepResult, TurnResult};
 pub use analyze::{analyze_repo, GitReport, ProbeHit, ProbeReport, RepoFile, RepoFingerprint};
 pub use background::{BackgroundTask, BackgroundTaskRegistry, TaskStatus};
 pub use commands::{ExpandResult, SlashCommands};
@@ -40,7 +40,7 @@ pub use personas::{
     load_custom_personas, persona_by_id, personas_by_department, recommend_persona,
     recommend_reviewer, Persona, ALL_PERSONAS,
 };
-pub use plans::{TaskPlan, TaskStep};
+pub use plans::{StepMetrics, TaskPlan, TaskStep};
 pub use plugin::{load_all as load_all_plugins, LoadedPlugin, PluginCallResult};
 pub use project::load_or_analyze;
 pub use session::{

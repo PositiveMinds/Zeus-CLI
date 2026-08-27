@@ -3,7 +3,7 @@
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
@@ -14,9 +14,11 @@ pub struct FileStamp {
 }
 
 /// Tracks files the agent has Read this session / turn.
+/// Uses `RwLock` so concurrent reads don't block each other; only
+/// `record` and `clear` take a write lock.
 #[derive(Debug, Default)]
 pub struct ReadTracker {
-    inner: Mutex<HashMap<PathBuf, FileStamp>>,
+    inner: RwLock<HashMap<PathBuf, FileStamp>>,
 }
 
 impl ReadTracker {
@@ -25,19 +27,22 @@ impl ReadTracker {
     }
 
     pub fn record(&self, path: &Path, stamp: FileStamp) {
-        self.inner.lock().unwrap().insert(path.to_path_buf(), stamp);
+        self.inner
+            .write()
+            .unwrap()
+            .insert(path.to_path_buf(), stamp);
     }
 
     pub fn get(&self, path: &Path) -> Option<FileStamp> {
-        self.inner.lock().unwrap().get(path).cloned()
+        self.inner.read().unwrap().get(path).cloned()
     }
 
     pub fn has_read(&self, path: &Path) -> bool {
-        self.inner.lock().unwrap().contains_key(path)
+        self.inner.read().unwrap().contains_key(path)
     }
 
     pub fn clear(&self) {
-        self.inner.lock().unwrap().clear();
+        self.inner.write().unwrap().clear();
     }
 }
 

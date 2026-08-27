@@ -1,16 +1,27 @@
 //! File operations: read/write/edit/delete/rename/copy/move/bulk-edit.
 
 use crate::checkpoint::CheckpointStore;
-use crate::diff::preview_diff;
+use crate::diff::{edit_range_preview, preview_diff};
 use crate::error::{FsError, Result};
 use crate::pathutil::{display_rel, normalize_lexically, path_kind, resolve_in_project, PathKind};
 use crate::permission::{ApprovalDecision, PermissionGate, PermissionRequest};
 use crate::staleness::{is_fresh, stamp_file, ReadTracker};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 use tracing::info;
 
 const BULK_PREVIEW_CAP: usize = 20;
 const DELETE_DIR_PREVIEW_CAP: usize = 20;
+/// Default maximum file size for write operations (10 MB).
+const DEFAULT_MAX_WRITE_BYTES: u64 = 10 * 1024 * 1024;
+/// File extensions that are known to be binary (used as first-pass filter).
+const BINARY_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "pdf", "zip", "gz", "tar", "bz2", "xz",
+    "7z", "exe", "dll", "so", "o", "dylib", "wasm", "bin", "mp3", "mp4", "avi", "mov", "mkv",
+    "flac", "wav", "ttf", "otf", "woff", "woff2",
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct ReadOptions {
@@ -73,7 +84,11 @@ pub struct FileEngine {
     /// Active turn id for checkpoint grouping.
     pub turn_id: String,
     /// Paths written this session (write asks less aggressively for re-touches).
-    session_touched: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    session_touched: Mutex<std::collections::HashSet<PathBuf>>,
+    /// Per-path locks to prevent concurrent writes to the same file.
+    file_locks: Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+    /// Maximum file size for writes in bytes. None = unlimited.
+    pub max_write_bytes: Option<u64>,
 }
 
 impl FileEngine {
@@ -89,8 +104,27 @@ impl FileEngine {
             checkpoints,
             reads: ReadTracker::new(),
             turn_id: turn_id.into(),
-            session_touched: std::sync::Mutex::new(std::collections::HashSet::new()),
+            session_touched: Mutex::new(std::collections::HashSet::new()),
+            file_locks: Mutex::new(HashMap::new()),
+            max_write_bytes: Some(DEFAULT_MAX_WRITE_BYTES),
         }
+    }
+
+    /// Acquire a per-path lock. Blocks if another operation on the same path
+    /// is in progress. The lock is held until the returned guard is dropped.
+    fn lock_path(&self, path: &Path) -> std::sync::MutexGuard<'static, ()> {
+        // Get or create the per-path lock.
+        let arc = {
+            let mut locks = self.file_locks.lock().unwrap();
+            locks
+                .entry(path.to_path_buf())
+                .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+                .clone()
+        };
+        // Convert Arc to &'static to extend the guard's lifetime past this
+        // function. The Arc in `file_locks` keeps the inner Mutex alive.
+        let static_ref: &'static std::sync::Mutex<()> = unsafe { &*std::sync::Arc::into_raw(arc) };
+        static_ref.lock().unwrap()
     }
 
     pub fn set_turn(&mut self, turn_id: impl Into<String>) {
@@ -114,6 +148,7 @@ impl FileEngine {
     }
 
     /// Read a text file with optional line offset/limit. Line numbers are 1-based in output.
+    /// Returns a header with file metadata (size, last modified) before the content.
     pub fn read(&self, user_path: &Path, opts: ReadOptions) -> Result<ReadResult> {
         let path = self.resolve(user_path)?;
         self.gate.enforce_strict(&PermissionRequest {
@@ -134,8 +169,9 @@ impl FileEngine {
             )));
         }
 
+        let metadata = std::fs::metadata(&path).map_err(|e| FsError::io(&path, e))?;
         let bytes = std::fs::read(&path).map_err(|e| FsError::io(&path, e))?;
-        if looks_binary(&bytes) {
+        if looks_binary(&bytes) || is_binary_extension(&path) {
             return Err(FsError::BinaryFile(path));
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -146,10 +182,35 @@ impl FileEngine {
             .limit
             .map(|l| (start + l).min(total_lines))
             .unwrap_or(total_lines);
-        let mut out = String::new();
+
+        // Build header with file metadata.
+        let size = metadata.len();
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| format!("{}s ago", d.as_secs()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let size_str = if size > 1024 * 1024 {
+            format!("{:.1}MB", size as f64 / (1024.0 * 1024.0))
+        } else if size > 1024 {
+            format!("{:.1}KB", size as f64 / 1024.0)
+        } else {
+            format!("{size}B")
+        };
+
+        let mut out = format!("  [{size_str}, modified {mtime}]\n");
         for (i, line) in lines[start..end].iter().enumerate() {
             // 1-based line numbers
             out.push_str(&format!("{:>6}→{}\n", start + i + 1, line));
+        }
+        if end < total_lines {
+            out.push_str(&format!(
+                "  [lines {}–{} of {}]\n",
+                end + 1,
+                total_lines,
+                total_lines
+            ));
         }
 
         let stamp = stamp_file(&path).map_err(|e| FsError::io(&path, e))?;
@@ -176,6 +237,29 @@ impl FileEngine {
         let path = self.resolve(user_path)?;
         let exists = path.exists();
 
+        // File size limit check.
+        let content_bytes = content.len() as u64;
+        if let Some(max) = self.max_write_bytes {
+            if content_bytes > max {
+                return Err(FsError::Other(format!(
+                    "content too large: {} bytes (max {} bytes)",
+                    content_bytes, max
+                )));
+            }
+        }
+
+        // Symlink detection (M4).
+        if exists {
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                if meta.file_type().is_symlink() {
+                    return Err(FsError::Other(format!(
+                        "{} is a symlink — read/edit/delete the target directly, or use rename to move the link itself",
+                        display_rel(&self.project_root, &path)
+                    )));
+                }
+            }
+        }
+
         if exists && !self.reads.has_read(&path) && !self.was_touched(&path) {
             return Err(FsError::MustReadFirst(path));
         }
@@ -190,13 +274,29 @@ impl FileEngine {
             return Err(FsError::NotFound(path));
         }
 
+        // Check for new parent directories that will be created (M9).
+        let new_dirs = if !exists {
+            find_new_parent_dirs(&path, &self.project_root)
+        } else {
+            Vec::new()
+        };
+
         let mut approver = approver;
-        // Ask outside files already touched this session.
-        let desc = if exists {
+        let mut desc = if exists {
             format!("overwrite {}", display_rel(&self.project_root, &path))
         } else {
             format!("create {}", display_rel(&self.project_root, &path))
         };
+        if !new_dirs.is_empty() {
+            desc.push_str(&format!(
+                " (will create dirs: {})",
+                new_dirs
+                    .iter()
+                    .map(|d| display_rel(&self.project_root, d))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         // Best-effort diff preview: skip silently if the existing file can't
         // be read as text (binary, permissions) rather than blocking the op.
         let preview = if exists {
@@ -218,12 +318,46 @@ impl FileEngine {
             &mut approver,
         )?;
 
+        // Per-path lock (C2).
+        let _guard = self.lock_path(&path);
+
         self.checkpoints
             .snapshot_before(&self.turn_id, &path, &self.project_root)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| FsError::io(parent, e))?;
         }
-        std::fs::write(&path, content).map_err(|e| FsError::io(&path, e))?;
+
+        // Atomic write (C1): write to temp file, fsync, rename.
+        let tmp_path = path.with_file_name(format!(
+            ".zeus-tmp-{}-{}",
+            std::process::id(),
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::write(&tmp_path, content).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            FsError::io(&path, e)
+        })?;
+        // Fsync the temp file to ensure data is on disk.
+        #[cfg(unix)]
+        {
+            if let Ok(f) = std::fs::File::open(&tmp_path) {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::fsync(f.as_raw_fd());
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Ok(f) = std::fs::File::open(&tmp_path) {
+                let _ = f.sync_all();
+            }
+        }
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            FsError::io(&path, e)
+        })?;
+
         let stamp = stamp_file(&path).map_err(|e| FsError::io(&path, e))?;
         self.reads.record(&path, stamp);
         self.mark_touched(&path);
@@ -239,6 +373,17 @@ impl FileEngine {
         if !path.exists() {
             return Err(FsError::NotFound(path));
         }
+
+        // Symlink detection (M4).
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                return Err(FsError::Other(format!(
+                    "{} is a symlink — edit the target file directly",
+                    display_rel(&self.project_root, &path)
+                )));
+            }
+        }
+
         if !self.reads.has_read(&path) {
             return Err(FsError::MustReadFirst(path));
         }
@@ -263,6 +408,9 @@ impl FileEngine {
             original.replacen(&opts.old_string, &opts.new_string, 1)
         };
 
+        // Use edit_range_preview for targeted edits (L13).
+        let preview = edit_range_preview(&original, &new_content, &opts.old_string);
+
         let mut approver = approver;
         self.gate.enforce(
             &PermissionRequest {
@@ -274,11 +422,14 @@ impl FileEngine {
                     display_rel(&self.project_root, &path),
                     count
                 ),
-                preview: Some(preview_diff(&original, &new_content)),
+                preview: Some(preview),
                 ..Default::default()
             },
             &mut approver,
         )?;
+
+        // Per-path lock (C2).
+        let _guard = self.lock_path(&path);
 
         self.checkpoints
             .snapshot_before(&self.turn_id, &path, &self.project_root)?;
@@ -296,6 +447,18 @@ impl FileEngine {
         let path = self.resolve(user_path)?;
         if !path.exists() {
             return Err(FsError::NotFound(path));
+        }
+
+        // Symlink detection (M4) — warn about deleting symlinks vs targets.
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&path).unwrap_or_default();
+                return Err(FsError::Other(format!(
+                    "{} is a symlink to '{}' — delete the target directly, or use rename to remove the link",
+                    display_rel(&self.project_root, &path),
+                    target.display()
+                )));
+            }
         }
 
         let (desc, preview) = if path.is_dir() {
@@ -356,6 +519,16 @@ impl FileEngine {
         let from_p = self.resolve(from)?;
         if !from_p.exists() {
             return Err(FsError::NotFound(from_p));
+        }
+
+        // Symlink detection (M4).
+        if let Ok(meta) = std::fs::symlink_metadata(&from_p) {
+            if meta.file_type().is_symlink() {
+                return Err(FsError::Other(format!(
+                    "{} is a symlink — rename the link itself, not the target. Use rename to move the symlink.",
+                    display_rel(&self.project_root, &from_p)
+                )));
+            }
         }
 
         // Compute the lexical (non-canonicalized) destination first. On a
@@ -580,6 +753,9 @@ impl FileEngine {
     }
 
     /// Apply bulk edit as one transaction (all-or-nothing): snapshot all first, then apply.
+    /// Apply bulk edit atomically: all files succeed or all are rolled back.
+    /// Snapshots all files first, applies edits, and on any failure restores
+    /// every already-modified file from its snapshot.
     pub fn bulk_edit_apply<F>(&self, plan: &BulkEditPlan, approver: F) -> Result<BulkEditResult>
     where
         F: FnMut(&PermissionRequest) -> ApprovalDecision,
@@ -616,14 +792,15 @@ impl FileEngine {
             &mut approver,
         )?;
 
-        // Snapshot all first.
+        // Snapshot all first (for rollback).
         for f in &plan.files {
             self.checkpoints
                 .snapshot_before(&self.turn_id, f, &self.project_root)?;
         }
 
-        let mut modified = Vec::new();
-        let mut skipped = Vec::new();
+        // Apply edits, tracking successes for rollback on failure.
+        let mut modified: Vec<PathBuf> = Vec::new();
+
         for f in &plan.files {
             match apply_edit_file(f, &plan.old_string, &plan.new_string, plan.replace_all) {
                 Ok(_) => {
@@ -633,10 +810,27 @@ impl FileEngine {
                     self.mark_touched(f);
                     modified.push(f.clone());
                 }
-                Err(e) => skipped.push((f.clone(), e.to_string())),
+                Err(e) => {
+                    // Rollback all already-modified files.
+                    for rollback_path in &modified {
+                        let _ = self
+                            .checkpoints
+                            .restore_file(rollback_path, &self.project_root);
+                    }
+                    return Err(FsError::Other(format!(
+                        "bulk edit failed on {}: {} — {} file(s) rolled back",
+                        display_rel(&self.project_root, f),
+                        e,
+                        modified.len()
+                    )));
+                }
             }
         }
-        Ok(BulkEditResult { modified, skipped })
+
+        Ok(BulkEditResult {
+            modified,
+            skipped: Vec::new(),
+        })
     }
 
     pub fn path_kind_of(&self, user_path: &Path) -> Result<PathKind> {
@@ -735,46 +929,37 @@ impl FileEngine {
 
     fn listdir_tree(&self, path: &Path) -> Result<String> {
         const MAX_ENTRIES: usize = 500;
+        // Use ignore::WalkBuilder to respect .gitignore patterns (M8).
+        let walker = ignore::WalkBuilder::new(path)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .hidden(false) // Show hidden files but respect gitignore
+            .build();
         let mut out = String::new();
         let mut count = 0usize;
-        self.walk_tree(path, 0, &mut out, &mut count, MAX_ENTRIES)?;
-        if count >= MAX_ENTRIES {
-            out.push_str("\n… (listing truncated)");
-        }
-        Ok(out)
-    }
-
-    fn walk_tree(
-        &self,
-        path: &Path,
-        depth: usize,
-        out: &mut String,
-        count: &mut usize,
-        max: usize,
-    ) -> Result<()> {
-        let indent = "  ".repeat(depth);
-        let rd = std::fs::read_dir(path).map_err(|e| FsError::io(path, e))?;
-        let mut entries: Vec<(bool, String)> = Vec::new();
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Ok(ft) = entry.file_type() {
-                entries.push((ft.is_dir(), name));
+        let root_depth = path.components().count();
+        for entry in walker.flatten() {
+            if count >= MAX_ENTRIES {
+                out.push_str("\n… (listing truncated)");
+                break;
             }
-        }
-        entries.sort_by(|a, b| (b.0, a.1.to_lowercase()).cmp(&(a.0, b.1.to_lowercase())));
-        for (is_dir, name) in entries {
-            if *count >= max {
-                return Ok(());
+            // Skip the root directory itself.
+            if entry.path() == path {
+                continue;
             }
-            *count += 1;
+            let depth = entry.path().components().count() - root_depth;
+            let name = entry.file_name().to_string_lossy();
+            let indent = "  ".repeat(depth.saturating_sub(1));
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
             if is_dir {
                 out.push_str(&format!("{indent}{name}/\n"));
-                self.walk_tree(&path.join(&name), depth + 1, out, count, max)?;
             } else {
                 out.push_str(&format!("{indent}{name}\n"));
             }
+            count += 1;
         }
-        Ok(())
+        Ok(out)
     }
 }
 
@@ -849,6 +1034,31 @@ fn file_contains(path: &Path, needle: &str) -> Result<bool> {
         return Ok(false);
     }
     Ok(String::from_utf8_lossy(&bytes).contains(needle))
+}
+
+/// Check if a path has a known binary file extension.
+fn is_binary_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| BINARY_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Find parent directories of `path` that don't exist yet, relative to
+/// `project_root`. Used to preview directory creation in write approval.
+fn find_new_parent_dirs(path: &Path, project_root: &Path) -> Vec<PathBuf> {
+    let mut new_dirs = Vec::new();
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        if parent == project_root || parent.starts_with(project_root) {
+            break;
+        }
+        if !parent.exists() {
+            new_dirs.insert(0, parent.to_path_buf());
+        }
+        current = parent.parent();
+    }
+    new_dirs
 }
 
 fn looks_binary(bytes: &[u8]) -> bool {

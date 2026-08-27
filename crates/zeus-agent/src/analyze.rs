@@ -165,6 +165,8 @@ pub struct GitReport {
     pub staged: usize,
     pub untracked: usize,
     pub conflicts: usize,
+    /// Recent commit messages (last 5) for context (L8).
+    pub recent_commits: Vec<String>,
 }
 
 impl GitReport {
@@ -176,6 +178,7 @@ impl GitReport {
             staged: 0,
             untracked: 0,
             conflicts: 0,
+            recent_commits: Vec::new(),
         }
     }
     pub fn clean(&self) -> bool {
@@ -191,10 +194,22 @@ impl GitReport {
         } else {
             format!("{n} uncommitted change(s)")
         };
-        if self.branch.is_empty() {
+        let branch_part = if self.branch.is_empty() {
             state
         } else {
             format!("{} {}", self.branch, state)
+        };
+        if self.recent_commits.is_empty() {
+            branch_part
+        } else {
+            let commits = self
+                .recent_commits
+                .iter()
+                .take(3)
+                .map(|c| format!("  {c}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{branch_part}\nrecent commits:\n{commits}")
         }
     }
 }
@@ -337,6 +352,51 @@ impl RepoFingerprint {
     /// Map a request onto existing files. Filename-level signal only.
     pub fn probe(&self, request: &str) -> ProbeReport {
         probe_files(&self.files, request)
+    }
+
+    /// Select key files and return their first N lines as context snippets.
+    /// Prioritizes entry points and main type definitions.
+    pub fn key_file_snippets(&self, root: &Path, max_files: usize, max_lines: usize) -> String {
+        let mut candidates: Vec<&RepoFile> = self
+            .files
+            .iter()
+            .filter(|f| !f.is_config && !f.is_test)
+            .collect();
+        // Prioritize entry points.
+        candidates.sort_by(|a, b| {
+            let a_entry = self
+                .entry_points
+                .iter()
+                .any(|e| a.rel.to_string_lossy().contains(e));
+            let b_entry = self
+                .entry_points
+                .iter()
+                .any(|e| b.rel.to_string_lossy().contains(e));
+            b_entry.cmp(&a_entry)
+        });
+        let mut out = String::new();
+        let mut shown = 0;
+        for f in candidates.iter().take(max_files * 3) {
+            if shown >= max_files {
+                break;
+            }
+            let path = root.join(&f.rel);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let lines: Vec<&str> = text.lines().take(max_lines).collect();
+            if lines.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("\n--- {} ---\n", f.rel.to_string_lossy()));
+            for line in &lines {
+                out.push_str(line);
+                out.push('\n');
+            }
+            shown += 1;
+        }
+        out
     }
 }
 
@@ -666,7 +726,17 @@ fn probe_files(files: &[RepoFile], request: &str) -> ProbeReport {
         });
     }
 
-    // Rank by hit count; keep one per label.
+    // Rank by hit count + directory relevance; keep one per label.
+    // Boost matches where the directory name matches the subject (M7).
+    for hit in &mut hits {
+        let label_lower = hit.label.to_lowercase();
+        for (dir, count) in &mut hit.dir_hits {
+            let dir_lower = dir.to_lowercase();
+            if dir_lower.contains(&label_lower) {
+                *count *= 2; // Double the count for directory matches.
+            }
+        }
+    }
     hits.sort_by_key(|h| std::cmp::Reverse(h.count()));
     let mut seen = BTreeMap::new();
     let mut uniq: Vec<ProbeHit> = Vec::new();
@@ -677,6 +747,64 @@ fn probe_files(files: &[RepoFile], request: &str) -> ProbeReport {
         }
     }
     ProbeReport { hits: uniq }
+}
+
+/// Content-based probe: grep for search terms in file contents.
+/// Returns files that contain the terms, limited to avoid scanning huge repos.
+/// This complements the filename-based probe with higher recall.
+pub fn probe_content(root: &Path, request: &str) -> Vec<String> {
+    let subjects = subjects_for(request);
+    if subjects.is_empty() {
+        return Vec::new();
+    }
+    // Collect all unique search terms.
+    let terms: Vec<String> = subjects
+        .iter()
+        .flat_map(|s| s.terms.iter().cloned())
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let terms_lower: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
+    let mut hits = Vec::new();
+    let mut count = 0usize;
+    // Walk source files, skip binary/ignored.
+    for entry in ignore::WalkBuilder::new(root)
+        .git_ignore(true)
+        .hidden(false)
+        .build()
+        .flatten()
+    {
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        // Skip large files.
+        if std::fs::metadata(path)
+            .map(|m| m.len() > 512 * 1024)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let text_lower = text.to_lowercase();
+        if terms_lower.iter().any(|t| text_lower.contains(t.as_str())) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            hits.push(rel);
+            count += 1;
+            if count >= 30 {
+                break;
+            }
+        }
+    }
+    hits
 }
 
 /// Recursively collect files, skipping ignored dirs and capping depth/amount
@@ -1350,6 +1478,14 @@ fn git_report(root: &Path) -> GitReport {
                 g.staged += 1;
             }
         }
+    }
+    // Capture recent commit messages (L8).
+    if let Some(log) = git_capture(root, &["log", "--oneline", "-5", "--no-decorate"]) {
+        g.recent_commits = log
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
     }
     g
 }

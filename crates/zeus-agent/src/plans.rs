@@ -26,6 +26,39 @@ pub struct TaskStep {
     /// Filled by the orchestrator once the step has been executed.
     #[serde(default)]
     pub done: bool,
+    /// Rationale from the planning pass — why this approach and its trade-offs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale: String,
+    /// Step ids that must complete before this step can start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<usize>,
+    /// Number of times the orchestrator retried this step after failure.
+    #[serde(default)]
+    pub retry_count: u32,
+    /// Per-step execution metrics, filled after the step completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<StepMetrics>,
+}
+
+/// Execution metrics for a completed plan step.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StepMetrics {
+    /// Wall-clock duration in milliseconds.
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// Total tokens consumed across all provider calls for this step.
+    #[serde(default)]
+    pub total_tokens: u32,
+    /// Whether the step completed successfully (false = failed after retries).
+    #[serde(default = "default_true")]
+    pub success: bool,
+    /// If the step failed, a short error summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The persisted plan document (`.agent/tasks.json`).
@@ -58,6 +91,10 @@ impl TaskPlan {
                     description: s.description.clone(),
                     persona: s.persona.clone(),
                     done: false,
+                    rationale: s.rationale.clone(),
+                    depends_on: s.depends_on.clone(),
+                    retry_count: 0,
+                    metrics: None,
                 })
                 .collect(),
             notes: notes.to_string(),
@@ -97,6 +134,43 @@ impl TaskPlan {
         }
     }
 
+    /// Mark the step with the given id as failed with metrics. Unknown ids
+    /// are ignored.
+    pub fn mark_failed(&mut self, id: usize, error: &str, metrics: StepMetrics) {
+        for step in &mut self.steps {
+            if step.id == id {
+                step.done = true;
+                step.metrics = Some(StepMetrics {
+                    success: false,
+                    error: Some(error.to_string()),
+                    ..metrics
+                });
+            }
+        }
+    }
+
+    /// Check if any step that this step depends on is not done.
+    pub fn dependencies_met(&self, step_id: usize) -> bool {
+        let Some(step) = self.steps.iter().find(|s| s.id == step_id) else {
+            return true;
+        };
+        step.depends_on.iter().all(|dep_id| {
+            self.steps
+                .iter()
+                .find(|s| s.id == *dep_id)
+                .is_none_or(|s| s.done)
+        })
+    }
+
+    /// Get step ids that are pending and have all dependencies met.
+    pub fn ready_steps(&self) -> Vec<usize> {
+        self.steps
+            .iter()
+            .filter(|s| !s.done && self.dependencies_met(s.id))
+            .map(|s| s.id)
+            .collect()
+    }
+
     /// How many steps have been completed.
     pub fn completed(&self) -> usize {
         self.steps.iter().filter(|s| s.done).count()
@@ -113,14 +187,30 @@ impl TaskPlan {
         ));
         for step in &self.steps {
             let state = if step.done { "[x]" } else { "[ ]" };
+            let retry = if step.retry_count > 0 {
+                format!("  (retry {})", step.retry_count)
+            } else {
+                String::new()
+            };
+            let timing = step
+                .metrics
+                .as_ref()
+                .filter(|m| m.elapsed_ms > 0)
+                .map(|m| format!("  ({}ms)", m.elapsed_ms))
+                .unwrap_or_default();
+            let persona = step
+                .persona
+                .as_ref()
+                .map(|p| format!("  [{p}]"))
+                .unwrap_or_default();
+            let deps = if step.depends_on.is_empty() {
+                String::new()
+            } else {
+                format!("  <- {:?}", step.depends_on)
+            };
             out.push_str(&format!(
-                "{state} {}. {}{}\n",
-                step.id,
-                step.description,
-                step.persona
-                    .as_ref()
-                    .map(|p| format!("  [{p}]"))
-                    .unwrap_or_default()
+                "{state} {}. {}{persona}{retry}{timing}{deps}\n",
+                step.id, step.description,
             ));
         }
         out
@@ -154,12 +244,14 @@ mod tests {
                 description: "read the manifest".into(),
                 rationale: "need to see what's declared".into(),
                 persona: Some("qa".into()),
+                depends_on: Vec::new(),
             },
             PlanStep {
                 id: 2,
                 description: "add the missing dep".into(),
                 rationale: "build fails without it".into(),
                 persona: None,
+                depends_on: vec![1],
             },
         ];
         let plan = TaskPlan::from_steps("ship the feature", &steps, "research notes", false);
@@ -174,6 +266,7 @@ mod tests {
         assert_eq!(loaded.steps.len(), 2);
         assert_eq!(loaded.steps[0].description, "read the manifest");
         assert_eq!(loaded.steps[1].persona, None);
+        assert_eq!(loaded.steps[1].depends_on, vec![1]);
         assert_eq!(loaded.completed(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -193,18 +286,21 @@ mod tests {
                 description: "a".into(),
                 rationale: "one".into(),
                 persona: None,
+                depends_on: Vec::new(),
             },
             PlanStep {
                 id: 2,
                 description: "b".into(),
                 rationale: "two".into(),
                 persona: None,
+                depends_on: Vec::new(),
             },
             PlanStep {
                 id: 3,
                 description: "c".into(),
                 rationale: "three".into(),
                 persona: None,
+                depends_on: Vec::new(),
             },
         ];
         let mut plan = TaskPlan::from_steps("g", &steps, "", false);
@@ -226,12 +322,14 @@ mod tests {
                 description: "read the manifest".into(),
                 rationale: "need to see what's declared".into(),
                 persona: Some("qa".into()),
+                depends_on: Vec::new(),
             },
             PlanStep {
                 id: 2,
                 description: "add the missing dep".into(),
                 rationale: "build fails without it".into(),
                 persona: None,
+                depends_on: Vec::new(),
             },
         ];
         let mut plan = TaskPlan::from_steps("ship it", &steps, "", false);
@@ -257,6 +355,7 @@ mod tests {
                     description: d.to_string(),
                     rationale: "r".into(),
                     persona: None,
+                    depends_on: Vec::new(),
                 })
                 .collect();
             TaskPlan::from_steps(goal, &steps, "", false)
