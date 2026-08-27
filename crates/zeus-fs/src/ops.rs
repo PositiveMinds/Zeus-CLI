@@ -338,20 +338,8 @@ impl FileEngine {
             FsError::io(&path, e)
         })?;
         // Fsync the temp file to ensure data is on disk.
-        #[cfg(unix)]
-        {
-            if let Ok(f) = std::fs::File::open(&tmp_path) {
-                use std::os::unix::io::AsRawFd;
-                unsafe {
-                    libc::fsync(f.as_raw_fd());
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            if let Ok(f) = std::fs::File::open(&tmp_path) {
-                let _ = f.sync_all();
-            }
+        if let Ok(f) = std::fs::File::open(&tmp_path) {
+            let _ = f.sync_all();
         }
         std::fs::rename(&tmp_path, &path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp_path);
