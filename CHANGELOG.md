@@ -5,6 +5,28 @@ for the newest release before asking to install it; the full history lives in
 this file. Versions follow `major.minor.patch`; each entry covers the
 user-visible changes since the previous release.
 
+## 0.2.0
+
+- **New providers**: Azure OpenAI, Vertex AI, AWS Bedrock, OpenRouter,
+  and Moonshot — with native auth (API key, OAuth2, SigV4) and
+  config-only passthrough.
+- **Orchestration overhaul**: dependency-aware step scheduling, retry
+  with rollback, streaming plan generation, scored persona matching,
+  and mid-execution revision signals.
+- **File ops hardening**: atomic writes (temp+rename), per-path locking,
+  symlink detection, file size limits, `.gitignore` respect in
+  `listdir`, directory creation preview, and bulk-edit rollback.
+- **Improved diffs**: context lines, original line numbers, hunk-based
+  output, and edit range preview.
+- **Context awareness**: content-based file probing, key file snippets,
+  global memory (`~/.zeus/memory/`), stale-docs warning, recent git
+  commits, and probe directory weighting.
+- **UX/UI polish**: clipboard flash confirmation, undo/redo feedback,
+  `Ctrl+O` hint in empty state, context window fix on model switch.
+- **Internal**: `ReadTracker` upgraded from `Mutex` to `RwLock` for
+  concurrent reads.
+
+
 ## 0.1.10
 
 - **Sessions housekeeping**: `zeus sessions remove|rm <id>`, `prune

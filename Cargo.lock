@@ -3928,7 +3928,7 @@ dependencies = [
 
 [[package]]
 name = "zeus-agent"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3962,7 +3962,7 @@ dependencies = [
 
 [[package]]
 name = "zeus-cli"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "anstyle",
  "anyhow",
@@ -3994,7 +3994,7 @@ dependencies = [
 
 [[package]]
 name = "zeus-config"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "serde",
@@ -4007,14 +4007,14 @@ dependencies = [
 
 [[package]]
 name = "zeus-example-plugin"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "zeus-fs"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "base64",
  "chrono",
@@ -4046,14 +4046,14 @@ dependencies = [
 
 [[package]]
 name = "zeus-lang"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "zeus-logging"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "tempfile",
@@ -4064,7 +4064,7 @@ dependencies = [
 
 [[package]]
 name = "zeus-provider"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -4086,7 +4086,7 @@ dependencies = [
 
 [[package]]
 name = "zeus-rag"
-version = "0.1.10"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "serde",
