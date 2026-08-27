@@ -5703,7 +5703,7 @@ async fn run_app<B: Backend>(
             }
             Some(ev) = input_rx.recv() => {
                 match ev {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                         handle_key(key, &mut state, &mut agent_slot, &mut turn_handle, &mut cancel_tx, &ui_tx, config, yes).await?;
                     }
                     Event::Paste(text) => {
